@@ -1,0 +1,22 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.cache_task*.pt
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Datasets
+data/
+*.tar.gz
+*.gz
+
+# Large binary checkpoints (prevent exceeding GitHub 100MB limit)
+*.pth
+*.pt
+experiments_archive/*.pth
+experiments_archive/*.pt
+experiments_archive/*.pth.tar

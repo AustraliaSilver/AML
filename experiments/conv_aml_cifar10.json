@@ -1,0 +1,76 @@
+{
+  "dataset": "cifar10",
+  "seeds": 2,
+  "methods": {
+    "ConvAML": {
+      "test_acc_mean": 0.518,
+      "test_acc_std": 0.0007071067811865482,
+      "P_mean": 315105.9375,
+      "P_std": 56716.50458888709,
+      "time_mean": 776.3014030456543,
+      "all_test_accs": [
+        0.5175,
+        0.5185
+      ],
+      "all_Ps": [
+        275001.3125,
+        355210.5625
+      ],
+      "avg_L": 3.568359375,
+      "avg_entropy": 1.3048490285873413,
+      "avg_prototypes_used": 4.0
+    },
+    "ConvAML_No_O": {
+      "test_acc_mean": 0.5165,
+      "test_acc_std": 0.005656854249492385,
+      "P_mean": 312948.25,
+      "P_std": 23.20194125768359,
+      "time_mean": 1294.5332590341568
+    },
+    "SmallCNN": {
+      "test_acc_mean": 0.5285,
+      "test_acc_std": 0.0007071067811865482,
+      "P_mean": 144842.0,
+      "P_std": 0.0,
+      "time_mean": 8.54952359199524,
+      "all_test_accs": [
+        0.528,
+        0.529
+      ],
+      "all_Ps": [
+        144842,
+        144842
+      ]
+    },
+    "FixedMLP": {
+      "test_acc_mean": 0.40925,
+      "test_acc_std": 0.0017677669529663704,
+      "P_mean": 201482.0,
+      "P_std": 0.0,
+      "time_mean": 3.763778805732727,
+      "all_test_accs": [
+        0.4105,
+        0.408
+      ],
+      "all_Ps": [
+        201482,
+        201482
+      ]
+    },
+    "ResNetBlock": {
+      "test_acc_mean": 0.5285,
+      "test_acc_std": 0.018384776310850254,
+      "P_mean": 78154.0,
+      "P_std": 0.0,
+      "time_mean": 19.785974621772766,
+      "all_test_accs": [
+        0.5155,
+        0.5415
+      ],
+      "all_Ps": [
+        78154,
+        78154
+      ]
+    }
+  }
+}

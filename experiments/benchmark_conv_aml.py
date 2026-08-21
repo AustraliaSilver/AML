@@ -1,0 +1,310 @@
+"""
+Phase 3 Benchmark: ConvAML (Convolutional Architecture Mode Learning) vs Baselines on Raw Image Datasets
+Directly evaluates ConvAML on spatial image datasets (MNIST, Fashion-MNIST, CIFAR-10) without PCA feature reduction.
+"""
+
+import sys, os, json, time, argparse, warnings
+warnings.filterwarnings("ignore")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy import stats
+
+from mgn import ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer, compute_aml_efficiency
+from experiments.benchmark_datasets import get_dataset
+from experiments.benchmark_baselines import SmallCNN, FixedMLP, ResNetBlockBaseline, train_torch
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device: {DEVICE}")
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+def make_conv_aml(input_dim, output_dim, in_channels):
+    num_p = 2
+    lp = 0.0
+    # Cấu trúc khổng lồ: L=4, D=128 => p_allow tăng vọt để chứa mạng siêu to
+    p_allow = 562186.0 if in_channels == 3 else 506762.0
+    gen = ModelGenerator(
+        input_dim=input_dim, output_dim=output_dim,
+        max_layers=4, max_dim=128, dim_choices=(32, 64, 96, 128),
+        latent_dim=64, noise_dim=64, num_prototypes=4,
+        use_conv=True, in_channels=in_channels
+    )
+    exec_ = TaskNetwork()
+    loss = MetaLoss(lambda_p=lp, lambda_c=1e-9, lambda_m=0,
+                    lambda_balance=1.0, lambda_stability=1e-6, lambda_design=0,
+                    lambda_eff=0.2, p_allowance=p_allow)
+    return gen, exec_, loss
+
+def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, test_y, epochs=100, batch_size=64, device=DEVICE):
+    t0 = time.time()
+    trainer = MetaTrainer(gen, exec_, loss, lr=5e-4, device=device)
+    trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size)
+    elapsed = time.time() - t0
+    gen.eval()
+    with torch.no_grad():
+        def eval_conv_acc(x_tensor, y_tensor):
+            correct, total = 0, 0
+            for i in range(0, len(x_tensor), 256):
+                xb = x_tensor[i:i+256].to(device)
+                yb = y_tensor[i:i+256].to(device)
+                m = gen(xb)
+                correct += (exec_(xb, m).argmax(-1) == yb).sum().item()
+                total += len(yb)
+            return correct / total if total > 0 else 0.0
+
+        test_acc = eval_conv_acc(test_x, test_y)
+        train_acc = eval_conv_acc(train_x, train_y)
+        
+        sample_x = test_x[:512].to(device)
+        sample_m = gen(sample_x)
+        P = sample_m.structure.effective_params_formula().mean().item()
+        L = sample_m.structure.num_layers.mean().item()
+        D = sample_m.structure.hidden_dim.mean().item()
+        S = gen(train_x[:10].to(DEVICE), tau=0.1, noise_scale=0.0)
+        pi = F.softmax(gen.prototype_selector(gen.encoder(train_x[:10].view(10, -1).to(DEVICE))), dim=-1)
+        entropy = -(pi.mean(0) * torch.log(pi.mean(0) + 1e-8)).sum().item()
+        n_used = (pi.mean(0) > 0.01).sum().item()
+        
+        # Calculate ResNet block mode probability
+        resnet_pct = 0.0
+        vit_pct = 0.0
+        if getattr(S.structure, "block_mode", None) is not None:
+            resnet_pct = S.structure.block_mode[:, :, 1].mean().item() * 100.0
+            if S.structure.block_mode.shape[-1] > 2:
+                vit_pct = S.structure.block_mode[:, :, 2].mean().item() * 100.0
+        
+    return {
+        "test_acc": test_acc, "train_acc": train_acc, "P": P, "L": L, "D": D,
+        "entropy": entropy, "prototypes_used": n_used, "resnet_pct": resnet_pct, "vit_pct": vit_pct, "time": elapsed
+    }
+
+def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, fast=False, full=False, disable_vit=False, fixed_arch=False, only_baselines=False):
+    print(f"\n{'='*70}")
+    print(f"ConvAML Benchmark: {dataset_name} (seeds={seeds}, full={full}, disable_vit={disable_vit}, fixed_arch={fixed_arch})")
+    print(f"{'='*70}")
+    sys.stdout.flush()
+
+    if full:
+        max_train = None
+        max_test = None
+        epochs = 12
+    else:
+        max_train = 1200 if fast else (3000 if quick else 5000)
+        max_test = 400 if fast else (1000 if quick else 2000)
+        epochs = 25 if fast else (60 if quick else 120)
+
+    import argparse
+    # Check if a custom epochs value was passed globally
+    if hasattr(args, "epochs") and args.epochs is not None:
+        epochs = args.epochs
+
+    data = get_dataset(dataset_name, max_train=max_train, max_test=max_test)
+    in_channels = 3 if dataset_name == "cifar10" else 1
+    print(f"  Dataset: {dataset_name} | Input Dim: {data['input_dim']} ({in_channels} channels) | Output: {data['output_dim']}")
+    print(f"  Train samples: {data['n_train']} | Test samples: {data['n_test']}")
+    sys.stdout.flush()
+
+    results = {"dataset": dataset_name, "seeds": seeds, "methods": {}}
+
+    if not only_baselines:
+        # 1. ConvAML
+        print(f"\n--- ConvAML ({'GPU' if DEVICE=='cuda' else 'CPU'}, {seeds} seeds) ---")
+        sys.stdout.flush()
+        conv_list = []
+        for seed in range(seeds):
+            set_seed(42 + seed)
+            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
+            
+            if disable_vit:
+                gen.disable_vit = True
+                
+            if fixed_arch:
+                for p in gen.prototype_selector.parameters(): p.requires_grad = False
+                for p in gen.structure_delta.parameters(): p.requires_grad = False
+                for p in gen.block_mode_head.parameters(): p.requires_grad = False
+                
+            n_train = len(data["train_x"])
+            n_val = int(n_train * 0.2)
+            indices = torch.randperm(n_train)
+            train_idx = indices[:-n_val]
+            val_idx = indices[-n_val:]
+            
+            trx = data["train_x"][train_idx]
+            try_ = data["train_y"][train_idx]
+            vx = data["train_x"][val_idx]
+            vy = data["train_y"][val_idx]
+                
+            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs)
+            conv_list.append(res)
+            print(f"  [ConvAML Seed {seed}] Test Acc={res['test_acc']:.4f} | P_eff={int(res['P'])} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | ViT={res.get('vit_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={int(res['time'])}s")
+            sys.stdout.flush()
+
+        results["methods"]["ConvAML"] = {
+            "test_acc_mean": float(np.mean([r["test_acc"] for r in conv_list])),
+            "test_acc_std": float(np.std([r["test_acc"] for r in conv_list], ddof=1)) if seeds > 1 else 0.0,
+            "P_mean": float(np.mean([r["P"] for r in conv_list])),
+            "P_std": float(np.std([r["P"] for r in conv_list], ddof=1)) if seeds > 1 else 0.0,
+            "time_mean": float(np.mean([r["time"] for r in conv_list])),
+            "all_test_accs": [r["test_acc"] for r in conv_list],
+            "all_Ps": [r["P"] for r in conv_list],
+            "avg_L": float(np.mean([r.get("L", 0.0) for r in conv_list])),
+            "avg_entropy": float(np.mean([r.get("entropy", 0.0) for r in conv_list])),
+            "avg_prototypes_used": float(np.mean([r.get("prototypes_used", 0) for r in conv_list])),
+        }
+
+        # ConvAML No O
+        print(f"\n--- ConvAML (No O) (CPU, {seeds} seeds) ---")
+        sys.stdout.flush()
+        conv_no_o_list = []
+        for seed in range(seeds):
+            set_seed(42 + seed)
+            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
+            loss.lambda_eff = 0.0
+            
+            if disable_vit:
+                gen.disable_vit = True
+                
+            if fixed_arch:
+                for p in gen.prototype_selector.parameters(): p.requires_grad = False
+                for p in gen.structure_delta.parameters(): p.requires_grad = False
+                for p in gen.block_mode_head.parameters(): p.requires_grad = False
+            
+            n_train = len(data["train_x"])
+            n_val = int(n_train * 0.2)
+            indices = torch.randperm(n_train)
+            train_idx = indices[:-n_val]
+            val_idx = indices[-n_val:]
+            trx = data["train_x"][train_idx]
+            try_ = data["train_y"][train_idx]
+            vx = data["train_x"][val_idx]
+            vy = data["train_y"][val_idx]
+                
+            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs)
+            conv_no_o_list.append(res)
+            print(f"  [ConvAML No O Seed {seed}] Test Acc={res['test_acc']:.4f} | P_eff={res['P']:.0f} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={res['time']:.0f}s")
+            sys.stdout.flush()
+
+        results["methods"]["ConvAML_No_O"] = {
+            "test_acc_mean": float(np.mean([r["test_acc"] for r in conv_no_o_list])),
+            "test_acc_std": float(np.std([r["test_acc"] for r in conv_no_o_list], ddof=1)) if seeds > 1 else 0.0,
+            "P_mean": float(np.mean([r["P"] for r in conv_no_o_list])),
+            "P_std": float(np.std([r["P"] for r in conv_no_o_list], ddof=1)) if seeds > 1 else 0.0,
+            "time_mean": float(np.mean([r["time"] for r in conv_no_o_list])),
+        }
+
+    # 2. SmallCNN Baseline
+    print(f"\n--- SmallCNN Baseline (Raw Image CNN, {seeds} seeds) ---")
+    sys.stdout.flush()
+    cnn_list = []
+    for seed in range(seeds):
+        set_seed(42 + seed)
+        cnn = SmallCNN(in_channels, data["input_dim"], data["output_dim"])
+        res = train_torch(cnn, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
+        cnn_list.append(res)
+        print(f"  [SmallCNN Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
+        sys.stdout.flush()
+
+    results["methods"]["SmallCNN"] = {
+        "test_acc_mean": float(np.mean([r["test_acc"] for r in cnn_list])),
+        "test_acc_std": float(np.std([r["test_acc"] for r in cnn_list], ddof=1)) if seeds > 1 else 0.0,
+        "P_mean": float(np.mean([r["P"] for r in cnn_list])),
+        "P_std": float(np.std([r["P"] for r in cnn_list], ddof=1)) if seeds > 1 else 0.0,
+        "time_mean": float(np.mean([r["time"] for r in cnn_list])),
+        "all_test_accs": [r["test_acc"] for r in cnn_list],
+        "all_Ps": [r["P"] for r in cnn_list],
+    }
+
+    # 3. Dense MLP Baseline
+    print(f"\n--- FixedMLP Baseline (L=2, D=64, {seeds} seeds) ---")
+    sys.stdout.flush()
+    mlp_list = []
+    for seed in range(seeds):
+        set_seed(42 + seed)
+        mlp = FixedMLP(data["input_dim"], 64, 2, data["output_dim"])
+        res = train_torch(mlp, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
+        mlp_list.append(res)
+        print(f"  [FixedMLP Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
+        sys.stdout.flush()
+
+    results["methods"]["FixedMLP"] = {
+        "test_acc_mean": float(np.mean([r["test_acc"] for r in mlp_list])),
+        "test_acc_std": float(np.std([r["test_acc"] for r in mlp_list], ddof=1)) if seeds > 1 else 0.0,
+        "P_mean": float(np.mean([r["P"] for r in mlp_list])),
+        "P_std": float(np.std([r["P"] for r in mlp_list], ddof=1)) if seeds > 1 else 0.0,
+        "time_mean": float(np.mean([r["time"] for r in mlp_list])),
+        "all_test_accs": [r["test_acc"] for r in mlp_list],
+        "all_Ps": [r["P"] for r in mlp_list],
+    }
+
+    # 4. ResNet Block Baseline (ResNet-8)
+    print(f"\n--- ResNetBlock Baseline (ResNet-8, {seeds} seeds) ---")
+    sys.stdout.flush()
+    resnet_list = []
+    for seed in range(seeds):
+        set_seed(42 + seed)
+        resnet = ResNetBlockBaseline(in_channels, data["input_dim"], data["output_dim"], base_channels=32)
+        res = train_torch(resnet, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
+        resnet_list.append(res)
+        print(f"  [ResNetBlock Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
+        sys.stdout.flush()
+
+    results["methods"]["ResNetBlock"] = {
+        "test_acc_mean": float(np.mean([r["test_acc"] for r in resnet_list])),
+        "test_acc_std": float(np.std([r["test_acc"] for r in resnet_list], ddof=1)) if seeds > 1 else 0.0,
+        "P_mean": float(np.mean([r["P"] for r in resnet_list])),
+        "P_std": float(np.std([r["P"] for r in resnet_list], ddof=1)) if seeds > 1 else 0.0,
+        "time_mean": float(np.mean([r["time"] for r in resnet_list])),
+        "all_test_accs": [r["test_acc"] for r in resnet_list],
+        "all_Ps": [r["P"] for r in resnet_list],
+    }
+
+    return results
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--datasets", type=str, default="fashion_mnist")
+    parser.add_argument("--seeds", type=int, default=2)
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--fast", action="store_true")
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--disable-vit", action="store_true")
+    parser.add_argument("--fixed-arch", action="store_true")
+    parser.add_argument("--only-baselines", action="store_true")
+    args = parser.parse_args()
+
+    ds_names = [d.strip() for d in args.datasets.split(",")]
+    all_res = []
+    for ds in ds_names:
+        r = run_conv_aml_benchmark(ds, seeds=args.seeds, quick=args.quick, fast=args.fast, full=args.full, disable_vit=args.disable_vit, fixed_arch=args.fixed_arch, only_baselines=args.only_baselines)
+        all_res.append(r)
+        with open(f"experiments/conv_aml_{ds}.json", "w") as f:
+            json.dump(r, f, indent=2)
+
+    with open("experiments/conv_aml_all.json", "w") as f:
+        json.dump(all_res, f, indent=2)
+
+    print("\n" + "=" * 70)
+    print("ConvAML Benchmark Summary Table")
+    print("=" * 70)
+    for r in all_res:
+        ds = r["dataset"]
+        print(f"\nDataset: {ds}")
+        print(f"  {'Method':<14} {'Test Acc (mean±std)':<24} {'Params (P_eff)':<16} {'Efficiency*':<14}")
+        print(f"  {'-'*14} {'-'*24} {'-'*16} {'-'*14}")
+        for method, m in r["methods"].items():
+            ta = m["test_acc_mean"]
+            ts = m.get("test_acc_std", 0.0)
+            pm = m["P_mean"]
+            p_allow = 110986.0 if ds in ("mnist", "fashion_mnist") else 148426.0
+            eff = compute_aml_efficiency(ta, p_allow, pm)
+            print(f"  {method:<14} {ta:.4f}±{ts:.4f}          {pm:>8.0f}        {eff:.5f}")
+    print("\n* Balanced Efficiency = [a / log10(p^2/q)] * (p/q)^(a * |a log10 a|) (where p is baseline parameter allowance)")
