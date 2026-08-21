@@ -5,7 +5,11 @@ import torch.nn.functional as F
 class HtSResidualBlock(nn.Module):
     """
     Lightweight Child Residual Block receiving dynamic kernels synthesized on-the-fly.
-    Contains zero static convolution weights; only GroupNorm and 1x1 shortcut parameters.
+    
+    Structure:
+    - Main Convolutional Path (3x3): 100% dynamic, generated on-the-fly from HtS Basis.
+    - Transition Shortcut Path (1x1): Lightweight static projection used only when downsampling (stride > 1 or in_d != out_d).
+    - Normalization: GroupNorm parameters.
     """
     def __init__(self, in_d, out_d, stride=1):
         super().__init__()

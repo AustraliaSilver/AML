@@ -5,35 +5,47 @@ from ..models.losses import compute_layer_aware_diversity_loss
 
 class ContinualTrainer:
     """
-    Continual Learning Trainer orchestrator for HtS Hypernetwork.
-    Executes sequential task training with Co-evolutionary Streaming Replay and Regularization.
+    Continual Learning Trainer with State-Preserving Optimizer,
+    Streaming Co-evolutionary Replay, and Portable CPU/CUDA Autocast.
     """
     def __init__(self, model, device=None, lr=1.5e-3, weight_decay=3e-4, 
-                 lambda_ent=0.015, lambda_use=0.10, lambda_ort=0.05):
+                 lambda_ent=0.015, lambda_use=0.10, lambda_ort=0.05,
+                 preserve_optimizer_state=True):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
         self.criterion = nn.CrossEntropyLoss(label_smoothing=0.03)
-        self.scaler = torch.amp.GradScaler('cuda')
+        
+        self.use_amp = (self.device.type == 'cuda')
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         
         self.lr = lr
         self.weight_decay = weight_decay
         self.lambda_ent = lambda_ent
         self.lambda_use = lambda_use
         self.lambda_ort = lambda_ort
+        self.preserve_optimizer_state = preserve_optimizer_state
+        
+        # Persistent optimizer across task sequences
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-    def train_task(self, current_task, train_loader, epochs=10, replay_loaders=None, replay_weights=None):
+    def train_task(self, current_task, train_loader, epochs=10, replay_loaders=None, replay_weights=None, lr=None):
         """
-        Trains on current_task while optionally interleaving replay data from past tasks.
+        Trains on current_task with optional replay from past task loaders.
         """
         replay_loaders = replay_loaders or {}
         replay_weights = replay_weights or {}
+        task_lr = lr or self.lr
         
-        opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
-        
+        if not self.preserve_optimizer_state:
+            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=task_lr, weight_decay=self.weight_decay)
+        else:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = task_lr
+                
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=1e-5)
         replay_iters = {task: iter(loader) for task, loader in replay_loaders.items()}
         
-        print(f"\n[START TRAINING] Task: {current_task.upper()} ({epochs} Epochs) | Replay Tasks: {list(replay_loaders.keys())}")
+        print(f"\n[START TRAINING] Task: {current_task.upper()} ({epochs} Epochs) | Interleaved Replay: {list(replay_loaders.keys())}")
         
         for ep in range(1, epochs + 1):
             self.model.train()
@@ -42,10 +54,10 @@ class ContinualTrainer:
             
             for x, y in train_loader:
                 x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-                opt.zero_grad()
+                self.optimizer.zero_grad()
                 
-                with torch.amp.autocast('cuda'):
-                    # 1. Main task loss
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    # 1. Primary task loss
                     logits, alphas = self.model(x, task=current_task, tau=tau)
                     loss_main = self.criterion(logits, y)
                     l_ent, l_use, l_ort = compute_layer_aware_diversity_loss(alphas, self.model, K=self.model.K)
@@ -65,9 +77,13 @@ class ContinualTrainer:
                         loss_r = self.criterion(logits_r, y_r)
                         total_loss += r_weight * loss_r
 
-                self.scaler.scale(total_loss).backward()
-                self.scaler.step(opt)
-                self.scaler.update()
+                if self.use_amp:
+                    self.scaler.scale(total_loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+                    self.optimizer.step()
                 
             sch.step()
             print(f"  * Epoch {ep:2d}/{epochs:2d} ({time.time()-t0:4.1f}s) completed.")

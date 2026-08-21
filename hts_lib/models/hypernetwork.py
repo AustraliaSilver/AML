@@ -78,16 +78,24 @@ class HtSContinualModel(nn.Module):
         Dynamically registers a new domain/task with its own native stem and classification head.
         """
         if task_name not in self.stems:
-            self.stems[task_name] = nn.Sequential(
+            # Determine existing device and dtype
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            
+            stem = nn.Sequential(
                 nn.Conv2d(in_channels, self.d1, 3, stride=2, padding=1, bias=False),
                 nn.GroupNorm(4, self.d1),
                 nn.GELU()
-            )
-            self.heads[task_name] = nn.Sequential(
+            ).to(device=device, dtype=dtype)
+            
+            head = nn.Sequential(
                 nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
                 nn.Dropout(0.1),
                 nn.Linear(self.d3, num_classes)
-            )
+            ).to(device=device, dtype=dtype)
+            
+            self.stems[task_name] = stem
+            self.heads[task_name] = head
             self.supported_tasks.append(task_name)
 
     def forward(self, x, task="cifar", tau=0.8):

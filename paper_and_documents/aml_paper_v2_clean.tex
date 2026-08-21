@@ -2410,8 +2410,8 @@ class TaskNetwork(nn.Module):
                 else:
                     h = gate_c * h_active + (1.0 - gate_c) * h_expand
 
-            # Max pooling at the end
-            h_pool = F.adaptive_avg_pool2d(h, (7, 7)).reshape(batch, -1)
+            # Adaptive pooling at the end (4x4 = 16 spatial elements matching 16 * max_dim head)
+            h_pool = F.adaptive_avg_pool2d(h, (4, 4)).reshape(batch, -1)
             h_pool = F.layer_norm(h_pool, [h_pool.shape[-1]])
             h_pool = F.dropout(h_pool, p=0.3, training=self.training)
             

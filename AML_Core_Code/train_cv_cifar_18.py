@@ -1,173 +1,380 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import time
 import os
-from torch.utils.checkpoint import checkpoint
+import sys
 
-CONV_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}\
-    .get(os.environ.get("AML_CONV_DTYPE", "bf16"), torch.bfloat16)
+cuda_toolkit_bin = r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin'
+if os.path.isdir(cuda_toolkit_bin):
+    os.add_dll_directory(cuda_toolkit_bin)
+torch_lib = r'C:\Users\hunga\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\lib'
+if os.path.isdir(torch_lib):
+    os.add_dll_directory(torch_lib)
+
+import torch._inductor.codecache as _cc
+import pathlib as _pathlib
+_orig_write_atomic = _cc.write_atomic
+def _patched_write_atomic(path, data, **kwargs):
+    try:
+        _orig_write_atomic(path, data, **kwargs)
+    except FileExistsError:
+        _pathlib.Path(path).unlink(missing_ok=True)
+        _orig_write_atomic(path, data, **kwargs)
+_cc.write_atomic = _patched_write_atomic
+
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mgn.generator import ModelGenerator
+import mgn.accel.functions as aml_ops
+
+try:
+    import mgn.accel._C as _C
+    _C_available = True
+except ImportError:
+    _C_available = False
+
+try:
+    from mgn.accel.fused_autograd import FusedPipelineFunction
+    _fused_autograd_available = True
+except ImportError:
+    _fused_autograd_available = False
+
+
+def get_prototype_layout(max_layers, max_dim, num_classes):
+    offsets = []
+    layer_info = []
+    idx = 0
+    in_c = 3
+    for i in range(max_layers):
+        out_c = max_dim
+        w_size = out_c * in_c * 9
+        b_size = out_c
+        w_start, w_end = idx, idx + w_size
+        idx += w_size
+        b_start, b_end = idx, idx + b_size
+        idx += b_size
+        
+        layer_info.append((w_start, w_end, b_start, b_end, in_c, out_c))
+        offsets.append((w_start, w_end, b_start, b_end, in_c))
+        
+        in_c = out_c
+            
+        attn_dim = max_dim // 4
+        idx += (3 * attn_dim) * max_dim * 1 + 3 * attn_dim
+        idx += max_dim * attn_dim * 1 + max_dim
+        
+    wo_offset = idx
+    bo_offset = idx + (16 * max_dim) * num_classes
+    total_dim = bo_offset + num_classes
+    return total_dim, offsets, layer_info, wo_offset, bo_offset
 
 class AcceleratedCVNetwork(nn.Module):
-    def __init__(self, max_layers=6, max_dim=64, num_classes=10, in_channels=3):
+    def __init__(self, max_layers=6, max_dim=64, num_classes=10):
         super().__init__()
         self.max_layers = max_layers
         self.max_dim = max_dim
         self.num_classes = num_classes
-        self.in_channels = in_channels
         self.pool = nn.AdaptiveAvgPool2d((4, 4))
-        self.eager = True
-        self._shared_hit = 0
-        self._total_calls = 0
-
-        ad = max(1, max_dim // 4)
-        self.mlp_net = nn.ModuleList(
-            nn.Sequential(
-                nn.Conv2d(max_dim, max_dim * 2, 1), nn.GELU(),
-                nn.Conv2d(max_dim * 2, max_dim, 1),
-            ) for _ in range(max_layers)
-)
-        self.vit_qkv = nn.ModuleList(
-            nn.Conv2d(max_dim, 3 * ad, 1) for _ in range(max_layers)
-        )
-        self.vit_proj = nn.ModuleList(
-            nn.Conv2d(ad, max_dim, 1) for _ in range(max_layers)
-        )
-        self.vit_pnorm = nn.ModuleList(
-            nn.GroupNorm(1, max_dim) for _ in range(max_layers)
-        )
-        from AML_Core_Code.train_cv_cifar_18 import get_prototype_layout
-        self.total_dim, self.offsets, self._layer_info, self.wo_offset, self.bo_offset = get_prototype_layout(self.max_layers, self.max_dim, self.num_classes, in_channels=self.in_channels)
+        
+        # Build layer offsets for exactly 18 layers
+        # Using 64 channels for layer 1..6, 128 for 7..12, 128 for 13..18 to keep size manageable.
+        # Wait, max_dim is the max dimension allowed. We just set in_channels and out_channels to max_dim everywhere for simplicity!
+        self.total_dim, self.offsets, self._layer_info, self.wo_offset, self.bo_offset = get_prototype_layout(self.max_layers, self.max_dim, self.num_classes)
+        
         self._build_slices()
 
     def _build_slices(self):
         total_end = self.bo_offset + self.num_classes
         self.register_buffer('_proto_end', torch.tensor(total_end), persistent=False)
+
         self._layer_info = []
         for i in range(self.max_layers):
             w_start, w_end, b_start, b_end, in_c = self.offsets[i]
             C_out = self.max_dim
             self._layer_info.append((w_start, w_end, b_start, b_end, in_c, C_out))
 
-    def _forward_layer(self, h, W_mix, b_mix, shared_conv, gate_c, dim_mask_c, bm_i, i, use_mlp, use_vit, use_resnet, use_plain):
-        B = h.shape[0]
-        C_out = W_mix.shape[1]
-        in_c = W_mix.shape[2]
-        if CONV_DTYPE == torch.float32:
-            if shared_conv:
-                h_conv = F.conv2d(h, W_mix[0], b_mix.view(-1), padding=1)
-            else:
-                h_conv = F.conv2d(h, W_mix, b_mix, groups=B, padding=1)
+    def forward(self, x, prototypes, pi, model_structure):
+        S = model_structure
+        B = x.shape[0]
+        H, W = x.shape[2], x.shape[3]
+
+        if _C_available and x.is_cuda:
+            w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
+            b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
+            C_ins = [self.offsets[i][4] for i in range(self.max_layers)]
+            C_outs = [self.max_dim] * self.max_layers
+            Hs = [H]
+            Ws = [W]
+            for i in range(1, self.max_layers):
+                if i == 5 or i == 11:
+                    Hs.append(H // 2)
+                    Ws.append(W // 2)
+                    H = H // 2
+                    W = W // 2
+                else:
+                    Hs.append(Hs[-1])
+                    Ws.append(Ws[-1])
+            bm = S.block_mode.float() if S.block_mode is not None else torch.ones(B, self.max_layers, 2, device=x.device, dtype=torch.float32) * 0.5
+            with torch.amp.autocast("cuda", enabled=False):
+                if _fused_autograd_available:
+                    h = FusedPipelineFunction.apply(
+                        x.float(), prototypes.float(), pi.float(),
+                        S.layer_gates.float(), S.dim_masks.float(), bm.float(),
+                        w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
+                    )
+                else:
+                    h = _C.fused_forward(
+                        x.float(), prototypes.float(), pi.float(),
+                        S.layer_gates.float(), S.dim_masks.float(), bm.float(),
+                        w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
+                    )
         else:
-            if shared_conv:
-                W_bf16 = W_mix.reshape(C_out, in_c, 3, 3).to(CONV_DTYPE)
-                h_conv = F.conv2d(h.to(CONV_DTYPE), W_bf16, b_mix.reshape(-1).to(CONV_DTYPE), padding=1).to(torch.float32).view(B, C_out, h.shape[2], h.shape[3])
-            else:
-                h_bf16 = h.reshape(1, B * in_c, h.shape[2], h.shape[3]).to(CONV_DTYPE)
-                W_bf16 = W_mix.reshape(B * C_out, in_c, 3, 3).to(CONV_DTYPE)
-                b_bf16 = b_mix.reshape(-1).to(CONV_DTYPE)
-                h_conv = F.conv2d(h_bf16, W_bf16, b_bf16, groups=B, padding=1).to(torch.float32).view(B, C_out, h.shape[2], h.shape[3])
+            h = x
+            for i in range(self.max_layers):
+                w_start, w_end, b_start, b_end, in_c, C_out = self._layer_info[i]
 
-        h_norm = F.group_norm(h_conv, num_groups=1)
-        h_plain = F.relu(h_norm) * dim_mask_c
-        h_expand = h_plain if i == 0 else h * dim_mask_c
+                h_conv = aml_ops.fused_dynamic_conv2d(h, prototypes, pi, w_start, b_start)
 
-        h_active = torch.zeros_like(h_plain)
-        if use_plain:
-            h_active = h_active + bm_i[:, 0].view(-1, 1, 1, 1) * h_plain
-        if use_resnet:
-            h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
-            h_active = h_active + bm_i[:, 1].view(-1, 1, 1, 1) * h_resnet
-        if use_vit:
-            ad = max(1, self.max_dim // 4)
-            hh, ww = h_norm.shape[2], h_norm.shape[3]
-            tv = F.adaptive_avg_pool2d(h_norm, (4, 4)) if hh > 4 else h_norm
-            qkv = self.vit_qkv[i](tv).view(B, 3, ad, -1)
-            Q, K, V = qkv[:, 0].transpose(1, 2), qkv[:, 1], qkv[:, 2].transpose(1, 2)
-            att = F.softmax(torch.bmm(Q, K) / math.sqrt(ad), dim=-1)
-            t = torch.bmm(att, V).transpose(1, 2).reshape(B, ad, tv.shape[2], tv.shape[3])
-            if hh > 4: t = F.interpolate(t, size=(hh, ww), mode="bilinear", align_corners=False)
-            h_vit = F.relu(h_expand + h_norm + self.vit_pnorm[i](self.vit_proj[i](t))) * dim_mask_c
-            h_active = h_active + bm_i[:, 2].view(-1, 1, 1, 1) * h_vit
-        if use_mlp:
-            h_mlp = F.relu(self.mlp_net[i](h_norm)) * dim_mask_c
-            h_active = h_active + bm_i[:, 3].view(-1, 1, 1, 1) * h_mlp
+                gate_c = S.layer_gates[:, i:i+1].view(-1, 1, 1, 1)
+                dim_mask_c = S.dim_masks[:, i].view(-1, S.dim_masks.shape[-1], 1, 1)
 
-        if i == 0:
-            h_out = h_active
-        else:
-            h_out = gate_c * h_active + (1.0 - gate_c) * h_expand
+                h_norm = F.group_norm(h_conv, num_groups=1)
+                h_plain = F.relu(h_norm) * dim_mask_c
+                h_expand = h_plain if i == 0 else h * dim_mask_c
 
-        return h_out
+                g_plain = S.block_mode[:, i, 0].view(-1, 1, 1, 1) if S.block_mode is not None else 1.0
+                g_resnet = S.block_mode[:, i, 1].view(-1, 1, 1, 1) if S.block_mode is not None else 0.0
 
-    def forward(self, x, prototypes, pi, model_structure, delta=None):
-        S, B = model_structure, x.shape[0]
-        h = x
-        # Fix 1: batches whose entire pi is identical share one conv kernel (groups=1)
-        shared_conv = False
-        if os.environ.get("AML_NO_SHARED") != "1":
-            try:
-                shared_conv = bool((pi[1:] == pi[:1]).all().item())
-            except Exception:
-                shared_conv = False
-        if hasattr(self, '_shared_hit') and shared_conv:
-            self._shared_hit += 1
-        if hasattr(self, '_total_calls'):
-            self._total_calls += 1
-        for i in range(self.max_layers):
-            w_start, w_end, _, b_end, in_c, C_out = self._layer_info[i]
-            gate_c = S.layer_gates[:, i:i+1].view(-1, 1, 1, 1)
-            dim_mask_c = S.dim_masks[:, i].view(-1, S.dim_masks.shape[-1], 1, 1)
-            bm_i = S.block_mode[:, i, :] if S.block_mode is not None else torch.zeros(B, 4, device=x.device)
+                h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
+                h_active = g_plain * h_plain + g_resnet * h_resnet
 
-            # Fix 2: one fused GEMM over [W | b] per layer (numerically identical to 2 mm's)
-            proto_slice = prototypes[:, w_start:b_end]
-            W_out_all = (pi[:1] if shared_conv else pi) @ proto_slice
-            if delta is not None:
-                W_out_all = W_out_all + (delta[:1] if shared_conv else delta)[:, w_start:b_end]
-            W_conv = W_out_all[:, :w_end - w_start].view(B if not shared_conv else 1, C_out, in_c, 3, 3)
-            b_conv = W_out_all[:, w_end - w_start:]
+                if i == 0:
+                    h = h_active
+                else:
+                    h = gate_c * h_active + (1.0 - gate_c) * h_expand
 
-            # Fix 3: run only the block modes actually present in the batch
-            # (AML_NO_UNIQUE=1 disables the prune and runs all 4 experts).
-            if os.environ.get("AML_NO_UNIQUE") == "1":
-                use_plain, use_resnet, use_vit, use_mlp = True, True, True, True
-            else:
-                uniq_i = torch.unique(bm_i.argmax(dim=-1)).tolist()
-                use_plain, use_resnet, use_vit, use_mlp = (0 in uniq_i), (1 in uniq_i), (2 in uniq_i), (3 in uniq_i)
+                if i == 5 or i == 11:
+                    h = F.max_pool2d(h, kernel_size=2, stride=2)
+                    H, W = H // 2, W // 2
 
-            if os.environ.get("AML_NO_CKPT") == "1":
-                h = self._forward_layer(h, W_conv, b_conv, shared_conv, gate_c, dim_mask_c, bm_i, i, use_mlp, use_vit, use_resnet, use_plain)
-            else:
-                h = checkpoint(self._forward_layer, h, W_conv, b_conv, shared_conv, gate_c, dim_mask_c, bm_i, i, use_mlp, use_vit, use_resnet, use_plain, use_reentrant=False)
+        h_pool = self.pool(h).reshape(B, -1)
+        h_pool = F.layer_norm(h_pool, [h_pool.shape[-1]])
+        h_pool = F.dropout(h_pool, p=0.2, training=self.training)
 
-            if i == 5 or i == 11:
-                h = F.max_pool2d(h, kernel_size=2, stride=2)
-
-        h_pool = F.dropout(F.layer_norm(self.pool(h).reshape(B, -1), [self.max_dim * 16]), p=0.2, training=self.training)
         W_out = torch.mm(pi, prototypes[:, self.wo_offset:self.bo_offset]).view(B, self.num_classes, 16 * self.max_dim)
         b_out = torch.mm(pi, prototypes[:, self.bo_offset:self.bo_offset + self.num_classes]).view(B, self.num_classes)
-        if delta is not None:
-            W_out = W_out + delta[:, self.wo_offset:self.bo_offset].view(B, self.num_classes, 16 * self.max_dim)
-            b_out = b_out + delta[:, self.bo_offset:self.bo_offset + self.num_classes]
-        return torch.bmm(W_out, h_pool.unsqueeze(2)).squeeze(2) + b_out
 
-def get_prototype_layout(max_layers, max_dim, num_classes, in_channels=3):
-    total_dim = 0
-    offsets = []
-    in_c = in_channels
-    for i in range(max_layers):
-        C_out = max_dim
-        per_oc = in_c * 9
-        w_start = total_dim
-        w_end = w_start + C_out * per_oc
-        b_start = w_end
-        b_end = b_start + C_out
-        offsets.append((w_start, w_end, b_start, b_end, in_c))
-        total_dim = b_end
-        in_c = C_out
-    wo_offset = total_dim
-    total_dim += num_classes * (max_dim * 16)
-    bo_offset = total_dim
-    total_dim += num_classes
-    return total_dim, offsets, [], wo_offset, bo_offset
+        out = torch.bmm(W_out, h_pool.unsqueeze(2)).squeeze(2) + b_out
+        return out
+
+
+class VisionModelGenerator(ModelGenerator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vision_encoder = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1), nn.GroupNorm(1, 16), nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.GroupNorm(1, 32), nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.GroupNorm(1, 64), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(64, self.latent_dim),
+            nn.ReLU()
+        )
+        self.encoder = nn.Identity()
+
+    def forward(self, x, tau=1.0, noise_scale=1.0):
+        z_vision = self.vision_encoder(x)
+        self._cached_z = z_vision
+        return super().forward(z_vision, tau=tau, noise_scale=noise_scale)
+
+
+class ConvAML_CIFAR(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gen = VisionModelGenerator(
+            input_dim=3 * 32 * 32,
+            output_dim=10,
+            max_layers=6,
+            max_dim=128,
+            dim_choices=(64, 96, 128),
+            latent_dim=64,
+            noise_dim=64,
+            num_prototypes=12,
+            use_conv=True,
+            in_channels=3
+        )
+
+        self.exec_ = AcceleratedCVNetwork(max_layers=6, max_dim=128, num_classes=10)
+
+        total_proto_params = self.gen.prototype_lib.proto_weights.shape[1]
+        self.num_hts_proto = 8
+
+        self.hts_memory = nn.Parameter(torch.randn(self.num_hts_proto, total_proto_params) * 0.02)
+
+        self.hts_router = nn.Sequential(
+            nn.Linear(self.gen.latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.num_hts_proto)
+        )
+
+        self.memory_correction = nn.Sequential(
+            nn.Linear(10, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 10)
+        )
+        self.memory_gate = nn.Parameter(torch.tensor(-1.0))
+
+    def forward(self, x):
+        model = self.gen(x)
+        pi_aml = F.gumbel_softmax(model.pi_logits, tau=1.0, hard=False)
+
+        z = self.gen._cached_z
+        pi_hts = F.softmax(self.hts_router(z), dim=-1)
+
+        mixed_prototypes = torch.cat([self.gen.prototype_lib.proto_weights, self.hts_memory], dim=0)
+        mixed_pi = torch.cat([pi_aml, pi_hts], dim=-1)
+
+        mixed_prototypes = mixed_prototypes.to(mixed_pi.dtype)
+
+        out_aml = self.exec_(x, mixed_prototypes, mixed_pi, model.structure)
+
+        gate = torch.sigmoid(self.memory_gate)
+        correction = self.memory_correction(out_aml.detach())
+        out = out_aml + gate * correction
+
+        return out, model.structure
+
+
+def train_cifar():
+    torch.backends.cuda.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_amp = device == "cuda"
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda") if use_amp and amp_dtype == torch.float16 else None
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3 if device == "cuda" else 0
+    print(f"GPU: {gpu_name} | VRAM: {gpu_mem:.1f}GB | AMP: {use_amp} | cuDNN.benchmark: ON", flush=True)
+
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
+    print(f"Loading CIFAR10 from {os.path.abspath(data_root)}...", flush=True)
+    trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_train)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True, drop_last=True)
+
+    testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=False, transform=transform_test)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=1, pin_memory=True, persistent_workers=True)
+    print("Dataset loaded. Initializing model...", flush=True)
+
+    model = ConvAML_CIFAR().to(device)
+
+    model = torch.compile(model, mode='reduce-overhead')
+    print("Model compiled with torch.compile (reduce-overhead)", flush=True)
+
+    gen_params = [p for p in model.gen.parameters() if p.requires_grad]
+    hts_params = [p for p in (list(model.hts_router.parameters()) + [model.hts_memory] + list(model.memory_correction.parameters()) + [model.memory_gate]) if p.requires_grad]
+
+    optimizer_gen = optim.AdamW(gen_params, lr=1e-4, weight_decay=1e-4)
+    optimizer_hts = optim.AdamW(hts_params, lr=5e-4, weight_decay=1e-4)
+
+    epochs = 10
+    scheduler_gen = optim.lr_scheduler.CosineAnnealingLR(optimizer_gen, T_max=epochs)
+    scheduler_hts = optim.lr_scheduler.CosineAnnealingLR(optimizer_hts, T_max=epochs)
+
+    criterion = nn.CrossEntropyLoss()
+
+    best_acc = 0.0
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        start_time = time.time()
+        for inputs, labels in trainloader:
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer_gen.zero_grad(set_to_none=True)
+            optimizer_hts.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                outputs, structure = model(inputs)
+                loss = criterion(outputs, labels)
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer_gen)
+                scaler.unscale_(optimizer_hts)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer_gen)
+                scaler.step(optimizer_hts)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer_gen.step()
+                optimizer_hts.step()
+
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+        epoch_time = time.time() - start_time
+        train_acc = 100. * correct / total
+
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        with torch.no_grad():
+            for inputs, labels in testloader:
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    outputs, _ = model(inputs)
+                _, predicted = outputs.max(1)
+                test_total += labels.size(0)
+                test_correct += predicted.eq(labels).sum().item()
+
+        test_acc = 100. * test_correct / test_total
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save(model.state_dict(), "aml_core_best.pth")
+
+        mem_gate = torch.sigmoid(model.memory_gate).item()
+        mem_norm = model.hts_memory.norm().item()
+        print(f"Epoch [{epoch+1:02d}/{epochs}] | {epoch_time:.1f}s ({total/epoch_time:.0f} img/s) | Loss: {total_loss/len(trainloader):.4f} | Train: {train_acc:.2f}% | Test: {test_acc:.2f}% | MemGate: {mem_gate:.3f} | MemNorm: {mem_norm:.4f}", flush=True)
+
+        scheduler_gen.step()
+        scheduler_hts.step()
+
+    print(f"=== BEST ACCURACY: {best_acc:.2f}% ===")
+
+if __name__ == "__main__":
+    train_cifar()

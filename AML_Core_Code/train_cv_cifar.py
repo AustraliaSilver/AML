@@ -89,62 +89,34 @@ class AcceleratedCVNetwork(nn.Module):
         B = x.shape[0]
         H, W = x.shape[2], x.shape[3]
 
-        if _C_available and x.is_cuda:
-            w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
-            b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
-            C_ins = [self.offsets[i][4] for i in range(self.max_layers)]
-            C_outs = [self.max_dim] * self.max_layers
-            Hs = [H]
-            Ws = [W]
-            for i in range(1, self.max_layers):
-                if i == 3:
-                    Hs.append(H // 2)
-                    Ws.append(W // 2)
-                else:
-                    Hs.append(Hs[-1])
-                    Ws.append(Ws[-1])
-            bm = S.block_mode.float() if S.block_mode is not None else torch.ones(B, self.max_layers, 2, device=x.device, dtype=torch.float32) * 0.5
-            with torch.amp.autocast("cuda", enabled=False):
-                if _fused_autograd_available:
-                    h = FusedPipelineFunction.apply(
-                        x.float(), prototypes.float(), pi.float(),
-                        S.layer_gates.float(), S.dim_masks.float(), bm.float(),
-                        w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
-                    )
-                else:
-                    h = _C.fused_forward(
-                        x.float(), prototypes.float(), pi.float(),
-                        S.layer_gates.float(), S.dim_masks.float(), bm.float(),
-                        w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
-                    )
-        else:
-            h = x
-            for i in range(self.max_layers):
-                w_start, w_end, b_start, b_end, in_c, C_out = self._layer_info[i]
+        # Robust dynamic execution path
+        h = x
+        for i in range(self.max_layers):
+            w_start, w_end, b_start, b_end, in_c, C_out = self._layer_info[i]
 
-                h_conv = aml_ops.fused_dynamic_conv2d(h, prototypes, pi, w_start, b_start)
+            h_conv = aml_ops.fused_dynamic_conv2d(h, prototypes, pi, w_start, b_start)
 
-                gate_c = S.layer_gates[:, i:i+1].view(-1, 1, 1, 1)
-                dim_mask_c = S.dim_masks[:, i].view(-1, S.dim_masks.shape[-1], 1, 1)
+            gate_c = S.layer_gates[:, i:i+1].view(-1, 1, 1, 1)
+            dim_mask_c = S.dim_masks[:, i].view(-1, S.dim_masks.shape[-1], 1, 1)
 
-                h_norm = F.group_norm(h_conv, num_groups=1)
-                h_plain = F.relu(h_norm) * dim_mask_c
-                h_expand = h_plain if i == 0 else h * dim_mask_c
+            h_norm = F.group_norm(h_conv, num_groups=1)
+            h_plain = F.relu(h_norm) * dim_mask_c
+            h_expand = h_plain if i == 0 else h * dim_mask_c
 
-                g_plain = S.block_mode[:, i, 0].view(-1, 1, 1, 1) if S.block_mode is not None else 1.0
-                g_resnet = S.block_mode[:, i, 1].view(-1, 1, 1, 1) if S.block_mode is not None else 0.0
+            g_plain = S.block_mode[:, i, 0].view(-1, 1, 1, 1) if S.block_mode is not None else 1.0
+            g_resnet = S.block_mode[:, i, 1].view(-1, 1, 1, 1) if S.block_mode is not None else 0.0
 
-                h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
-                h_active = g_plain * h_plain + g_resnet * h_resnet
+            h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
+            h_active = g_plain * h_plain + g_resnet * h_resnet
 
-                if i == 0:
-                    h = h_active
-                else:
-                    h = gate_c * h_active + (1.0 - gate_c) * h_expand
+            if i == 0:
+                h = h_active
+            else:
+                h = gate_c * h_active + (1.0 - gate_c) * h_expand
 
-                if i == 2:
-                    h = F.max_pool2d(h, kernel_size=2, stride=2)
-                    H, W = H // 2, W // 2
+            if i == 2:
+                h = F.max_pool2d(h, kernel_size=2, stride=2)
+                H, W = H // 2, W // 2
 
         h_pool = self.pool(h).reshape(B, -1)
         h_pool = F.layer_norm(h_pool, [h_pool.shape[-1]])
@@ -267,16 +239,14 @@ def train_cifar():
     data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
     print(f"Loading CIFAR10 from {os.path.abspath(data_root)}...", flush=True)
     trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_train)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True, drop_last=True)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
 
     testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=False, transform=transform_test)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=1, pin_memory=True, persistent_workers=True)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
     print("Dataset loaded. Initializing model...", flush=True)
 
     model = ConvAML_CIFAR().to(device)
-
-    model = torch.compile(model, mode='reduce-overhead')
-    print("Model compiled with torch.compile (reduce-overhead)", flush=True)
+    print("Model initialized in pure PyTorch eager mode.", flush=True)
 
     gen_params = [p for p in model.gen.parameters() if p.requires_grad]
     hts_params = [p for p in (list(model.hts_router.parameters()) + [model.hts_memory] + list(model.memory_correction.parameters()) + [model.memory_gate]) if p.requires_grad]

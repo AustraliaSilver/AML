@@ -10,6 +10,7 @@ from .models.blocks import HtSResidualBlock
 from .models.hypernetwork import HtSContinualModel
 from .models.losses import compute_layer_aware_diversity_loss
 from .data.loaders import get_continual_dataloaders
+from .data.memory import EpisodicMemoryBuffer
 from .training.trainer import ContinualTrainer
 from .evaluation.evaluator import ContinualEvaluator
 
@@ -20,6 +21,7 @@ __all__ = [
     "HtSContinualModel",
     "compute_layer_aware_diversity_loss",
     "get_continual_dataloaders",
+    "EpisodicMemoryBuffer",
     "ContinualTrainer",
     "ContinualEvaluator"
 ]

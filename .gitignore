@@ -3,14 +3,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 .cache_task*.pt
+*.egg-info/
+build/
+dist/
 
 # Virtual environments
 venv/
 env/
 ENV/
 
-# Datasets
-data/
+# Datasets (only root /data directory)
+/data/
 *.tar.gz
 *.gz
 
@@ -20,3 +23,5 @@ data/
 experiments_archive/*.pth
 experiments_archive/*.pt
 experiments_archive/*.pth.tar
+AML_Core_Code/*.pth
+AML_Core_Code/*.pt

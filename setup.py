@@ -1,10 +1,10 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="hts-lib",
-    version="1.0.0",
-    description="Dynamic Hypernetwork with Dual-Residual Basis & Multi-Domain Continual Learning",
-    author="Google DeepMind pair programming with User",
+    name="aml-framework",
+    version="2.0.0",
+    description="Architecture Mode Learning (AML) Framework: Meta-Generators (MGN) & Continual Hypernetworks (HtS)",
+    author="AustraliaSilver / DeepMind Pair Programming",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[

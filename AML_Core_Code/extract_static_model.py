@@ -83,8 +83,11 @@ def extract_child(mother_model, x_dummy):
     with torch.no_grad():
         # 1. Chạy mạng mẹ để lấy pi và cấu trúc (Tĩnh hóa)
         gen = mother_model.gen
-        x_flat = x_dummy.view(x_dummy.shape[0], -1)
-        z = gen.encoder(x_flat)
+        if hasattr(gen, 'vision_encoder'):
+            z = gen.vision_encoder(x_dummy)
+        else:
+            x_flat = x_dummy.view(x_dummy.shape[0], -1)
+            z = gen.encoder(x_flat)
         pi_logits = gen.prototype_selector(z)
         
         # Bỏ qua nhiễu, lấy hard argmax hoặc trung bình. Ở đây lấy soft trung bình của batch
