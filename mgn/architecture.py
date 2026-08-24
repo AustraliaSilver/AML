@@ -82,12 +82,9 @@ class ModelStructure:
         if getattr(self, "use_conv", False):
             c1 = getattr(self, "in_channels", 1) * D_mean * 9 + D_mean
             c2 = torch.clamp(L - 1.0, min=0.0) * (D_mean * D_mean * 9 + D_mean)
-            attn_dim = torch.clamp(D_mean / 4.0, min=1.0)
-            vit_gate = self.block_mode[:, :, 2].sum(dim=-1) if (hasattr(self, "block_mode") and self.block_mode is not None and self.block_mode.shape[-1] > 2) else L
-            t1 = vit_gate * (3 * attn_dim * D_mean + 3 * attn_dim)
-            t2 = vit_gate * (D_mean * attn_dim + D_mean)
-            out = (49 * D_mean) * self.output_dim + self.output_dim
-            return c1 + c2 + t1 + t2 + out
+            # Classifier consumes 16*D features (AdaptiveAvgPool2d((4,4)))
+            out = (16 * D_mean) * self.output_dim + self.output_dim
+            return c1 + c2 + out
         else:
             weights = self.input_dim * D_mean + (L - 1) * D_mean * D_mean + D_mean * self.output_dim
             bias = L * D_mean + self.output_dim
@@ -98,7 +95,14 @@ class ModelStructure:
         D = self.hidden_dim
         D_mean = D.mean(dim=-1) if D.dim() > 1 else D
         if getattr(self, "use_conv", False):
-            return 784 * D_mean * getattr(self, "in_channels", 1) * 9 + 196 * (2 * D_mean) * D_mean * 9 + 16 * (2 * D_mean) * (2 * D_mean) + (2 * D_mean) * self.output_dim
+            # CIFAR-32 input, max-pool after layers 5 and 11:
+            # stage spatial sizes 32^2 / 16^2 / 8^2
+            sp = (torch.clamp(L, max=5.0) * 1024.0
+                  + torch.clamp(L - 5.0, min=0.0, max=6.0) * 256.0
+                  + torch.clamp(L - 11.0, min=0.0) * 64.0)
+            conv_flops = 9.0 * D_mean * D_mean * sp
+            head_flops = (16.0 * D_mean) * self.output_dim
+            return conv_flops + head_flops
         return self.input_dim * D_mean + (L - 1) * D_mean * D_mean + D_mean * self.output_dim
 
     def memory_bytes(self) -> torch.Tensor:

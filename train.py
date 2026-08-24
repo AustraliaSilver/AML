@@ -19,7 +19,7 @@ from mgn.architecture import ModelStructure, GeneratedModel
 from mgn.losses import MetaLoss
 
 class ConvAML_CIFAR_TrueDynamic(nn.Module):
-    def __init__(self, K=32, latent_dim=128, max_layers=18, max_dim=64):
+    def __init__(self, K=32, latent_dim=128, max_layers=18, max_dim=64, norm_mode="gn1"):
         super().__init__()
         self.K = K
         self.max_layers = max_layers
@@ -39,36 +39,39 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
             nn.Linear(256, 256), nn.BatchNorm1d(256), nn.GELU(),
             nn.Linear(256, K)
         )
-        
+
         self.structure_delta = nn.Linear(latent_dim, max_layers + (max_layers * max_dim))
-        self.block_mode_head = nn.Linear(latent_dim, max_layers * 3)
+        # 2 executable block modes: Plain / ResNet (ViT head removed: it was
+        # never executed by any executor path and silently zeroed layers)
+        self.block_mode_head = nn.Linear(latent_dim, max_layers * 2)
         nn.init.constant_(self.structure_delta.weight, 0.0)
         nn.init.constant_(self.structure_delta.bias, 0.0)
         nn.init.constant_(self.block_mode_head.weight, 0.0)
         nn.init.constant_(self.block_mode_head.bias, 0.0)
         with torch.no_grad():
-            self.block_mode_head.bias.data.view(max_layers, 3)[:, 1] = 2.0
-            self.block_mode_head.bias.data.view(max_layers, 3)[:, 2] = 1.0
+            # ResNet-heavy init: keeps residual paths dominant during warmup.
+            # Balanced (0.5) init was tested and destabilized training: Plain
+            # rewrites (relu(GN(conv(h)))) destroyed signal -> post-unfreeze
+            # the router overshot into one-hot prototypes (-12% acc).
+            self.block_mode_head.bias.data.view(max_layers, 2)[:, 1] = 2.0
 
         weight_dim = 0
         for i in range(max_layers):
             in_c = 3 if i == 0 else max_dim
             weight_dim += max_dim * in_c * 9 + max_dim
-            attn_dim = max_dim // 4
-            weight_dim += (3 * attn_dim) * max_dim + 3 * attn_dim
-            weight_dim += max_dim * attn_dim + max_dim
         weight_dim += (16 * max_dim) * 10 + 10
         self._init_prototypes()
-        
-        self.exec_ = AcceleratedCVNetwork(max_layers=max_layers, max_dim=max_dim, num_classes=10)
+
+        self.exec_ = AcceleratedCVNetwork(max_layers=max_layers, max_dim=max_dim, num_classes=10,
+                                          norm_mode=norm_mode)
 
     def _init_prototypes(self):
         import math
         import torch.nn as nn
-        
+
         weight_dim, offsets, layer_info, wo_offset, bo_offset = get_prototype_layout(self.max_layers, self.max_dim, 10)
         self.proto_weights = nn.Parameter(torch.zeros(self.K, weight_dim))
-        
+
         # We can just use a global kaiming uniform for simplicity, or zero out biases if we want to be strict.
         # For simplicity and correctness with the new layout, a global init is sufficient and less error-prone.
         nn.init.kaiming_uniform_(self.proto_weights, a=math.sqrt(5))
@@ -76,32 +79,43 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
     def caf_attention(self, features):
         return torch.softmax(features, dim=-1).clamp(min=1e-8)
 
-    def forward(self, x, tau=1.0):
+    def forward(self, x, tau=1.0, struct_override=None, pi_mask=None):
         B = x.shape[0]; device = x.device
         z = self.vision_encoder(x)
-        pi = self.caf_attention(self.prototype_selector(z))
-        
+        sel_logits = self.prototype_selector(z)
+        if pi_mask is not None:
+            # Routing isolation: a domain may only mix prototype rows it owns
+            sel_logits = sel_logits.float().masked_fill(~pi_mask, float("-inf"))
+        pi = self.caf_attention(sel_logits)
+
         delta = self.structure_delta(z)
         layer_logits = delta[:, :self.max_layers] + 2.0
         layer_soft = torch.sigmoid(layer_logits)
         if self.training:
             layer_soft = layer_soft + 0.1 * torch.randn_like(layer_soft)
         layer_soft = torch.clamp(layer_soft, 1e-4, 1.0)
-        layer_gates = (layer_soft > 0.5).float().detach() + layer_soft - layer_soft.detach()
-        
+
         dim_logits = delta[:, self.max_layers:].view(B, self.max_layers, self.max_dim)
         d_logit = dim_logits.mean(dim=-1, keepdim=True) + 2.0
         dim_fractions = torch.sigmoid(d_logit)
-        
+
         d_lengths = torch.clamp(dim_fractions * self.max_dim, min=24.0)
         arange = torch.arange(self.max_dim, device=device).float().view(1, 1, self.max_dim)
         dim_masks = torch.sigmoid(10.0 * (d_lengths - arange))
 
-        bm_logits = self.block_mode_head(z).view(B, self.max_layers, 3)
-        block_mode = F.gumbel_softmax(bm_logits, tau=tau, hard=True, dim=-1)
-            
+        bm_logits = self.block_mode_head(z).view(B, self.max_layers, 2)
+
+        if struct_override is not None:
+            # Continual mode: use the per-domain stored structure slot
+            layer_gates, block_mode = struct_override
+            layer_gates = layer_gates.to(device=device, dtype=torch.float32)
+            block_mode = block_mode.to(device=device, dtype=torch.float32)
+        else:
+            layer_gates = (layer_soft > 0.5).float().detach() + layer_soft - layer_soft.detach()
+            block_mode = F.gumbel_softmax(bm_logits, tau=tau, hard=True, dim=-1)
+
         dim_weights = d_lengths / self.max_dim
-        
+
         struct = ModelStructure(
             layer_gates=layer_gates,
             dim_weights=dim_weights,
@@ -111,12 +125,13 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
             use_conv=True, in_channels=3, max_layers=self.max_layers, max_dim=self.max_dim,
             dim_choices=(self.max_dim,), output_dim=10
         )
-        
+
         out = self.exec_(x, self.proto_weights, pi, struct)
         diag = {
             "layer_soft": layer_soft,
             "bm_logits": bm_logits,
             "d_lengths": d_lengths,
+            "z": z,
         }
         return out, struct, pi, diag
 
@@ -148,6 +163,7 @@ def get_args():
     parser.add_argument('--max-dim', type=int, default=64)
     parser.add_argument('--max-layers', type=int, default=18)
     parser.add_argument('--p-allowance', type=float, default=1.5e6)
+    parser.add_argument('--workers', type=int, default=3)
     parser.add_argument('--out', type=str, default='aml_core_best.pth')
     return parser.parse_args()
 
@@ -157,7 +173,14 @@ def main():
     _prevent_sleep()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.backends.cudnn.benchmark = True
-    
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # AMP: bf16 preferred (Ampere+), fp16 with GradScaler as fallback
+    use_amp = device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.amp.GradScaler('cuda') if (use_amp and amp_dtype == torch.float16) else None
+
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -168,33 +191,49 @@ def main():
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-    
+
     data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
     if args.dataset == 'cifar10':
         trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform_train)
         testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
-    
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    
+
+    trainloader = torch.utils.data.DataLoader(
+        trainset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0,
+        drop_last=True, prefetch_factor=4 if args.workers > 0 else None)
+    testloader = torch.utils.data.DataLoader(
+        testset, batch_size=max(args.batch_size, 256), shuffle=False,
+        num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
+
     model = ConvAML_CIFAR_TrueDynamic(K=args.K, max_dim=args.max_dim, max_layers=args.max_layers).to(device)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    # Architecture parameters get their own optimizer fed by a VALIDATION
+    # split of each batch (first-order DARTS bi-level approximation).
+    # Rationale: the train-loss gradient systematically penalizes gated
+    # branches early (untrained deep features look like noise), which
+    # collapsed all depth gates within one epoch. The generalization
+    # signal rewards capacity and keeps depth selection meaningful.
+    arch_names = ("structure_delta", "block_mode_head")
+    arch_params = [p for n, p in model.named_parameters() if any(k in n for k in arch_names)]
+    other_params = [p for n, p in model.named_parameters() if not any(k in n for k in arch_names)]
+    optimizer = optim.AdamW(other_params, lr=args.lr, weight_decay=1e-4)
+    optimizer_arch = optim.AdamW(arch_params, lr=args.lr * 0.2, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
+    scheduler_arch = optim.lr_scheduler.CosineAnnealingLR(optimizer_arch, T_max=args.epochs)
+
     print(f"========== TRAINING {args.max_layers}-LAYER TRUE AML DYNAMIC ==========")
     meta_loss_fn = MetaLoss(
-        lambda_eff=0.0, 
-        lambda_p=0.0, 
+        lambda_eff=0.0,
+        lambda_p=0.0,
         p_allowance=args.p_allowance
     ).to(device)
-    
+
     best_acc = 0.0
     for epoch in range(args.epochs):
         model.train()
         total_loss, total_eff = 0, 0
         t0 = time.time()
-        
+
         # WARMUP + EFFICIENCY/REGULARIZATION SCHEDULE
         if epoch < 5:
             current_lambda_eff = 0.0
@@ -202,85 +241,170 @@ def main():
             w_gate = 0.0
             w_bm = 0.0
             w_dim = 0.0
-        elif epoch < 10:
-            current_lambda_eff = 0.0
-            tau = 0.8
-            w_gate = 0.02
-            w_bm = 0.02
-            w_dim = 0.01
-        elif epoch < 15:
-            current_lambda_eff = 0.01
-            tau = 0.5
-            w_gate = 0.05
-            w_bm = 0.05
-            w_dim = 0.05
+            w_pi = 0.0
+            # Dense supernet warmup: freeze architecture heads so gates stay
+            # open (init logits +2 -> sigmoid ~0.88) while weights learn.
+            for p in arch_params:
+                p.requires_grad_(False)
         else:
-            current_lambda_eff = 0.05
-            tau = 0.2
-            w_gate = 0.1
-            w_bm = 0.1
-            w_dim = 0.1
-            
+            if epoch == 5:
+                for p in arch_params:
+                    p.requires_grad_(True)
+                print("  [arch] unfroze structure_delta / block_mode_head")
+            if epoch < 10:
+                current_lambda_eff = 0.0
+                tau = 0.8
+                w_gate = 0.02
+                w_bm = 0.02
+                w_dim = 0.01
+                # pi sharpening tested: on homogeneous CIFAR-10 the task
+                # gradient fights it and it cost accuracy (runs #6/#7).
+                # Kept available but off by default.
+                w_pi = 0.0
+            elif epoch < 15:
+                current_lambda_eff = 0.01
+                tau = 0.5
+                w_gate = 0.05
+                w_bm = 0.05
+                w_dim = 0.05
+                w_pi = 0.0
+            else:
+                current_lambda_eff = 0.05
+                tau = 0.2
+                w_gate = 0.1
+                w_bm = 0.1
+                w_dim = 0.1
+                w_pi = 0.005
+
         meta_loss_fn.lambda_eff = current_lambda_eff
-        
+
         for inputs, targets in trainloader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            
-            outputs, struct, pi, diag = model(inputs, tau=tau)
-            gen_model = GeneratedModel(structure=struct, weights={}, pi_logits=pi)
-            
-            loss_dict = meta_loss_fn(
-                logits_train=outputs, targets_train=targets,
-                logits_val=None, targets_val=None,
-                model=gen_model, epoch_progress=epoch/args.epochs
-            )
-            
-            loss = loss_dict["loss"]
-            if w_gate > 0.0 or w_bm > 0.0 or w_dim > 0.0:
-                layer_soft = diag["layer_soft"].clamp(1e-6, 1.0 - 1e-6)
-                ent_gate = -(layer_soft * torch.log(layer_soft) + (1.0 - layer_soft) * torch.log(1.0 - layer_soft)).mean()
-                p_bm = F.softmax(diag["bm_logits"], dim=-1).clamp(1e-6, 1.0)
-                ent_bm = -(p_bm * torch.log(p_bm)).sum(dim=-1).mean()
-                dim_floor = F.relu(0.4 * model.max_dim - diag["d_lengths"].mean()).mean()
-                reg = -w_gate * ent_gate - w_bm * ent_bm + w_dim * dim_floor
-                loss = loss + reg
-            loss.backward()
-            optimizer.step()
-            
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            optimizer_arch.zero_grad(set_to_none=True)
+
+            # Second half of the batch is held out as the validation signal
+            # for the architecture step below.
+            n_v = inputs.size(0) // 2
+
+            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                outputs, struct, pi, diag = model(inputs, tau=tau)
+                gen_model = GeneratedModel(structure=struct, weights={}, pi_logits=pi)
+
+                loss_dict = meta_loss_fn(
+                    logits_train=outputs.float(), targets_train=targets,
+                    logits_val=None, targets_val=None,
+                    model=gen_model, epoch_progress=epoch/args.epochs
+                )
+
+                loss = loss_dict["loss"]
+                if w_gate > 0.0 or w_bm > 0.0 or w_dim > 0.0 or w_pi > 0.0:
+                    # fp32 + log1p: in bf16, (1 - 1e-6) rounds to 1.0, so a
+                    # saturated gate (soft == 1.0 after noise/clamp) would give
+                    # log(0) = -inf and 0 * -inf = NaN, poisoning all weights.
+                    layer_soft = diag["layer_soft"].float().clamp(1e-6, 1.0 - 1e-6)
+                    ent_gate = -(layer_soft * torch.log(layer_soft)
+                                 + (1.0 - layer_soft) * torch.log1p(-layer_soft)).mean()
+                    p_bm = F.softmax(diag["bm_logits"].float(), dim=-1).clamp(1e-6, 1.0 - 1e-6)
+                    ent_bm = -(p_bm * torch.log(p_bm)).sum(dim=-1).mean()
+                    dim_floor = F.relu(0.4 * model.max_dim - diag["d_lengths"].float().mean()).mean()
+                    reg = -w_gate * ent_gate - w_bm * ent_bm + w_dim * dim_floor
+
+                    if w_pi > 0.0:
+                        # Per-sample specialization: sharpen each sample's
+                        # prototype routing (low per-sample entropy) while
+                        # keeping overall usage spread across prototypes
+                        # (high usage entropy) -> samples pick DIFFERENT
+                        # prototypes instead of all converging to uniform.
+                        pi_f = pi.float()
+                        ent_pi = -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).mean()
+                        usage = pi_f.mean(0)
+                        ent_usage = -(usage * torch.log(usage.clamp(min=1e-9))).sum()
+                        reg = reg + w_pi * (ent_pi - ent_usage)
+
+                    loss = loss + reg
+
+            if not torch.isfinite(loss):
+                print(f"  [warn] non-finite loss at epoch {epoch+1}, skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_arch.zero_grad(set_to_none=True)
+                continue
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(other_params, 5.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(other_params, 5.0)
+                optimizer.step()
+
+            # ---- Architecture step: pure validation signal (DARTS-style) ----
+            if epoch >= 5:
+                optimizer_arch.zero_grad(set_to_none=True)
+                with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                    outputs_v, _, _, _ = model(inputs[n_v:], tau=tau)
+                    loss_arch = F.cross_entropy(outputs_v.float(), targets[n_v:], label_smoothing=0.1)
+
+                if torch.isfinite(loss_arch):
+                    if scaler is not None:
+                        scaler.scale(loss_arch).backward()
+                        scaler.unscale_(optimizer_arch)
+                        torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
+                        scaler.step(optimizer_arch)
+                        scaler.update()
+                    else:
+                        loss_arch.backward()
+                        torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
+                        optimizer_arch.step()
+
             total_loss += loss_dict["task_loss"].item() * inputs.size(0)
             total_eff += loss_dict.get("efficiency_cost", torch.tensor(0.0)).item() * inputs.size(0)
-            
+
         scheduler.step()
+        scheduler_arch.step()
         train_loss = total_loss / len(trainset)
-        
+
         model.eval()
         correct, eff_params_sum = 0, 0
-        bm_sums = torch.zeros(model.max_layers, 3, device=device) # [max_layers, 3]
+        bm_sums = torch.zeros(model.max_layers, 2, device=device) # [max_layers, 2]
+        pi_ent_sum, pi_ent_n = 0.0, 0
+        gate_soft_list = []
         with torch.no_grad():
             for inputs, targets in testloader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs, struct, _, _ = model(inputs, tau=0.1)
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                    outputs, struct, pi_eval, diag_eval = model(inputs, tau=0.1)
                 correct += (outputs.argmax(-1) == targets).sum().item()
                 eff_params_sum += struct.effective_params_formula().sum().item()
                 bm_sums += struct.block_mode.sum(dim=0)
-                
+                pi_f = pi_eval.float()
+                pi_ent_sum += -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).sum().item()
+                pi_ent_n += pi_f.shape[0]
+                gate_soft_list.append(diag_eval["layer_soft"].float())
+
         test_acc = correct / len(testset)
         avg_eff_params = eff_params_sum / len(testset)
-        
+        pi_H = pi_ent_sum / max(pi_ent_n, 1)
+        gate_std = torch.cat(gate_soft_list, dim=0).std(0).mean().item()
+
         if test_acc > best_acc:
             best_acc = test_acc
             torch.save(model.state_dict(), args.out)
             print(f"  [*] Saved new best model to {args.out} (Acc: {test_acc*100:.2f}%)")
-        
-        print(f"Epoch {epoch+1:2d}/{args.epochs} | {time.time()-t0:5.1f}s | Task Loss: {train_loss:.4f} | Test Acc: {test_acc*100:.2f}% | Avg Used Params: {avg_eff_params/1e6:.2f}M | Tau: {tau:.1f} | Lambda: {current_lambda_eff:.4f} | Reg(g/b/d): {w_gate:.2f}/{w_bm:.2f}/{w_dim:.3f}")
-        
+
+        print(f"Epoch {epoch+1:2d}/{args.epochs} | {time.time()-t0:5.1f}s | Task Loss: {train_loss:.4f} | Test Acc: {test_acc*100:.2f}% | Avg Used Params: {avg_eff_params/1e6:.2f}M | pi_H: {pi_H:.3f}/{math.log(args.K):.3f} | gate_std: {gate_std:.4f} | Tau: {tau:.1f}")
+
         bm_avg = bm_sums / len(testset)
-        print("  -> Block Mode Distribution (Plain / ResNet / ViT) per Layer:")
-        for i in range(model.max_layers):
-            p, r, v = bm_avg[i].tolist()
-            print(f"     Layer {i+1}: {p*100:5.1f}% | {r*100:5.1f}% | {v*100:5.1f}%")
+        dist_str = " | ".join(
+            f"L{i+1}:{bm_avg[i,0]*100:4.0f}/{bm_avg[i,1]*100:4.0f}"
+            for i in range(model.max_layers)
+        )
+        print(f"  -> Plain/ResNet% per layer: {dist_str}")
 
 if __name__ == '__main__':
-    print("WARNING: Eager path currently only supports Plain/ResNet block mode. ViT block is ignored in fallback.")
     main()

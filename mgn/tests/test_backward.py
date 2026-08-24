@@ -11,7 +11,7 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import mgn.accel
+import mgn.accel as aml_accel
 
 
 def reference_backward(X, prototypes, pi, w_offset, b_offset, C_in, C_out, grad_Y):
@@ -30,8 +30,8 @@ def reference_backward(X, prototypes, pi, w_offset, b_offset, C_in, C_out, grad_
     w_conv = w_direct[:, w_offset:w_offset + C_out * per_oc_weight]
     b_conv = w_direct[:, b_offset:b_offset + C_out]
 
-    w_flat = w_conv.view(B * C_out, C_in, 3, 3)
-    b_flat = b_conv.view(B * C_out)
+    w_flat = w_conv.reshape(B * C_out, C_in, 3, 3)
+    b_flat = b_conv.reshape(B * C_out)
 
     X_flat = X_ref.view(1, B * C_in, H, W)
     Y = F.conv2d(X_flat, w_flat, b_flat, groups=B, padding=1)

@@ -42,23 +42,6 @@ class PrototypeLibrary(nn.Module):
                         idx += w1_numel
                         self.proto_weights.data[k, idx:idx + max_dim] = 0.0
                         idx += max_dim
-                        
-                        attn_dim = max_dim // 4
-                        w_qkv_numel = (3 * attn_dim) * max_dim * 1
-                        w_qkv = torch.empty(3 * attn_dim, max_dim, 1, 1)
-                        nn.init.kaiming_uniform_(w_qkv, a=math.sqrt(5))
-                        self.proto_weights.data[k, idx:idx + w_qkv_numel] = w_qkv.flatten()
-                        idx += w_qkv_numel
-                        self.proto_weights.data[k, idx:idx + 3 * attn_dim] = 0.0
-                        idx += 3 * attn_dim
-                        
-                        w_proj_numel = max_dim * attn_dim * 1
-                        w_proj = torch.empty(max_dim, attn_dim, 1, 1)
-                        nn.init.kaiming_uniform_(w_proj, a=math.sqrt(5))
-                        self.proto_weights.data[k, idx:idx + w_proj_numel] = w_proj.flatten()
-                        idx += w_proj_numel
-                        self.proto_weights.data[k, idx:idx + max_dim] = 0.0
-                        idx += max_dim
 
                     wo_numel = (16 * max_dim) * output_dim
                     wo = torch.empty(output_dim, 16 * max_dim)
@@ -141,9 +124,6 @@ class ModelGenerator(nn.Module):
             for i in range(max_layers):
                 in_c = in_channels if i == 0 else max_dim
                 weight_out += max_dim * in_c * 9 + max_dim
-                attn_dim = max_dim // 4
-                weight_out += (3 * attn_dim) * max_dim * 1 + 3 * attn_dim
-                weight_out += max_dim * attn_dim * 1 + max_dim
             weight_out += (16 * max_dim) * output_dim + output_dim
         else:
             weight_out = (
@@ -166,15 +146,16 @@ class ModelGenerator(nn.Module):
         )
 
         self.structure_delta = nn.Linear(latent_dim, max_layers + (max_layers * len(dim_choices)) + 1)
-        self.block_mode_head = nn.Linear(latent_dim, max_layers * 3)
+        # 2 executable block modes: Plain / ResNet
+        self.block_mode_head = nn.Linear(latent_dim, max_layers * 2)
         if self.use_conv:
             nn.init.constant_(self.structure_delta.weight, 0.0)
             nn.init.constant_(self.structure_delta.bias, 0.0)
             nn.init.constant_(self.block_mode_head.weight, 0.0)
             nn.init.constant_(self.block_mode_head.bias, 0.0)
             with torch.no_grad():
-                self.block_mode_head.bias.data.view(max_layers, 3)[:, 1] = 2.0
-                self.block_mode_head.bias.data.view(max_layers, 3)[:, 2] = 1.0
+                # ResNet-heavy init (see train.py note)
+                self.block_mode_head.bias.data.view(max_layers, 2)[:, 1] = 2.0
         self.weight_delta = nn.Linear(latent_dim, weight_out)
         if self.use_conv:
             self.weight_delta.requires_grad_(False)
@@ -231,7 +212,7 @@ class ModelGenerator(nn.Module):
         dim_masks = torch.sigmoid(10.0 * (d_lengths - arange))
 
         if self.use_conv:
-            block_logits = self.block_mode_head(z).view(-1, self.max_layers, 3)
+            block_logits = self.block_mode_head(z).view(-1, self.max_layers, 2)
             block_mode = F.gumbel_softmax(block_logits, tau=tau, hard=True)
         else:
             block_mode = None

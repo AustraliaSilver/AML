@@ -836,7 +836,12 @@ class ConvAML_CIFAR_direct(nn.Module):
             b_conv = weights[:, w_dim:].view(B, self.max_dim)
             idx += 1
 
-            h_conv = F.conv2d(h, W_conv, b_conv, padding=1)
+            h_conv = F.conv2d(
+                h.reshape(1, B * in_c, h.shape[2], h.shape[3]),
+                W_conv.reshape(B * self.max_dim, in_c, 3, 3),
+                b_conv.reshape(-1),
+                padding=1, groups=B,
+            ).view(B, self.max_dim, h.shape[2], h.shape[3])
             h = F.group_norm(h_conv, self.max_dim)
             h = F.relu(h)
             if i == 2:

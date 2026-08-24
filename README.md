@@ -24,7 +24,7 @@ The AML framework unifies two complementary engines:
     ├── Gumbel-Softmax Continuous Routing                           ├── B_shared Base + sum(alpha_i * B_priv_i)
     │   - Dynamic Depth Gates L(x)                                  ├── Layer-Aware Diversity & Orthogonality
     │   - Dynamic Channel Width Masks D(x)                          └── Zero Catastrophic Forgetting
-    │   - Dynamic Block Types (Plain / ResNet / ViT)                                │
+    │   - Dynamic Block Types (Plain / ResNet)                        │
     └── Hard Pruning -> StaticChildModel Extraction                                 └── Synthesized Child CNN (<10k params)
 ```
 

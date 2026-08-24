@@ -39,6 +39,14 @@ try:
 except ImportError:
     _C_available = False
 
+# InstanceNorm variant of the fused pipeline (per-channel norm statistics).
+try:
+    import mgn.accel._Cin as _Cin
+    from mgn.accel.fused_autograd_in import FusedPipelineFunctionIN
+    _Cin_available = True
+except ImportError:
+    _Cin_available = False
+
 try:
     from mgn.accel.fused_autograd import FusedPipelineFunction
     _fused_autograd_available = True
@@ -47,6 +55,9 @@ except ImportError:
 
 
 def get_prototype_layout(max_layers, max_dim, num_classes):
+    # Per layer: conv weight [C_out*C_in*9] + bias [C_out].
+    # NOTE: legacy layouts reserved per-layer attention (qkv/proj) slices;
+    # they were never consumed by any executor and are removed.
     offsets = []
     layer_info = []
     idx = 0
@@ -59,27 +70,24 @@ def get_prototype_layout(max_layers, max_dim, num_classes):
         idx += w_size
         b_start, b_end = idx, idx + b_size
         idx += b_size
-        
+
         layer_info.append((w_start, w_end, b_start, b_end, in_c, out_c))
         offsets.append((w_start, w_end, b_start, b_end, in_c))
-        
+
         in_c = out_c
-            
-        attn_dim = max_dim // 4
-        idx += (3 * attn_dim) * max_dim * 1 + 3 * attn_dim
-        idx += max_dim * attn_dim * 1 + max_dim
-        
+
     wo_offset = idx
     bo_offset = idx + (16 * max_dim) * num_classes
     total_dim = bo_offset + num_classes
     return total_dim, offsets, layer_info, wo_offset, bo_offset
 
 class AcceleratedCVNetwork(nn.Module):
-    def __init__(self, max_layers=6, max_dim=64, num_classes=10):
+    def __init__(self, max_layers=6, max_dim=64, num_classes=10, norm_mode="gn1"):
         super().__init__()
         self.max_layers = max_layers
         self.max_dim = max_dim
         self.num_classes = num_classes
+        self.norm_mode = norm_mode
         self.pool = nn.AdaptiveAvgPool2d((4, 4))
         
         # Build layer offsets for exactly 18 layers
@@ -104,7 +112,7 @@ class AcceleratedCVNetwork(nn.Module):
         B = x.shape[0]
         H, W = x.shape[2], x.shape[3]
 
-        if _C_available and x.is_cuda:
+        if self.norm_mode == "in" and _Cin_available and x.is_cuda:
             w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
             b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
             C_ins = [self.offsets[i][4] for i in range(self.max_layers)]
@@ -112,14 +120,36 @@ class AcceleratedCVNetwork(nn.Module):
             Hs = [H]
             Ws = [W]
             for i in range(1, self.max_layers):
-                if i == 5 or i == 11:
-                    Hs.append(H // 2)
-                    Ws.append(W // 2)
+                if i == 6 or i == 12:
                     H = H // 2
                     W = W // 2
-                else:
-                    Hs.append(Hs[-1])
-                    Ws.append(Ws[-1])
+                Hs.append(H)
+                Ws.append(W)
+            bm = S.block_mode.float() if S.block_mode is not None else torch.ones(B, self.max_layers, 2, device=x.device, dtype=torch.float32) * 0.5
+            with torch.amp.autocast("cuda", enabled=False):
+                h = FusedPipelineFunctionIN.apply(
+                    x.float(), prototypes.float(), pi.float(),
+                    S.layer_gates.float(), S.dim_masks.float(), bm.float(),
+                    w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
+                )
+        elif _C_available and x.is_cuda:
+            w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
+            b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
+            C_ins = [self.offsets[i][4] for i in range(self.max_layers)]
+            C_outs = [self.max_dim] * self.max_layers
+            # Hs/Ws are the INPUT spatial sizes for layer i.
+            # Pooling happens AFTER layers 5 and 11, so inputs are:
+            #   layers 0..5  -> H
+            #   layers 6..11 -> H/2
+            #   layers 12..17-> H/4
+            Hs = [H]
+            Ws = [W]
+            for i in range(1, self.max_layers):
+                if i == 6 or i == 12:
+                    H = H // 2
+                    W = W // 2
+                Hs.append(H)
+                Ws.append(W)
             bm = S.block_mode.float() if S.block_mode is not None else torch.ones(B, self.max_layers, 2, device=x.device, dtype=torch.float32) * 0.5
             with torch.amp.autocast("cuda", enabled=False):
                 if _fused_autograd_available:
@@ -144,7 +174,10 @@ class AcceleratedCVNetwork(nn.Module):
                 gate_c = S.layer_gates[:, i:i+1].view(-1, 1, 1, 1)
                 dim_mask_c = S.dim_masks[:, i].view(-1, S.dim_masks.shape[-1], 1, 1)
 
-                h_norm = F.group_norm(h_conv, num_groups=1)
+                if self.norm_mode == "in":
+                    h_norm = F.instance_norm(h_conv)
+                else:
+                    h_norm = F.group_norm(h_conv, num_groups=1)
                 h_plain = F.relu(h_norm) * dim_mask_c
                 h_expand = h_plain if i == 0 else h * dim_mask_c
 
