@@ -14,7 +14,7 @@ from .data.memory import EpisodicMemoryBuffer
 from .training.trainer import ContinualTrainer
 from .evaluation.evaluator import ContinualEvaluator
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __all__ = [
     "HtSDualResidualBasis",
     "HtSResidualBlock",

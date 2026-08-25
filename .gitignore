@@ -1,11 +1,20 @@
 # Python bytecode and caches
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
 *$py.class
 .cache_task*.pt
 *.egg-info/
 build/
 dist/
+
+# Compiled CUDA extensions (mgn/accel/_C*.pyd|.so).
+# These are build artifacts, deliberately not tracked: regenerate with
+#   python build_ext.py
+# On Windows run it from a Developer Command Prompt (or after vcvars64.bat)
+# so that cl.exe is on PATH.
+*.pyd
+*.so
 
 # Virtual environments
 venv/
@@ -20,8 +29,13 @@ ENV/
 # Large binary checkpoints (prevent exceeding GitHub 100MB limit)
 *.pth
 *.pt
-experiments_archive/*.pth
-experiments_archive/*.pt
-experiments_archive/*.pth.tar
 AML_Core_Code/*.pth
 AML_Core_Code/*.pt
+
+# Profiler traces and run logs (leak machine hostnames)
+logs/
+*.pt.trace.json
+
+# Run logs
+*_run.log
+smoke_*.log

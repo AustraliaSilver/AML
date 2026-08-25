@@ -1,14 +1,17 @@
-# 🌟 Architecture Mode Learning (AML) Unified Framework
+# Architecture Mode Learning (AML) Unified Framework
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch%202.0+-ee4c2c.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/AustraliaSilver/AML/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 
-Official PyTorch implementation of **Architecture Mode Learning (AML)** — a meta-learning paradigm for dynamic continuous architecture synthesis, efficient subnetwork generation, and multi-domain continual learning.
+PyTorch implementation of **Architecture Mode Learning (AML)** — a meta-learning
+paradigm for dynamic architecture synthesis (per-sample depth / width / block-type
+routing) and multi-domain continual learning with hypernetworks.
 
 ---
 
-## 🏛️ 1. Framework Architecture
+## 1. Framework Architecture
 
 The AML framework unifies two complementary engines:
 
@@ -18,84 +21,133 @@ The AML framework unifies two complementary engines:
                 ┌─────────────────────────────────┴─────────────────────────────────┐
                 ▼                                                                   ▼
     [1] AML Meta-Supernet Engine                                    [2] HtS Continual Hypernetwork
-    (ModelGenerator G_phi -> TaskNetwork T_W)                       (Multi-Domain Lifelong Learning)
+    (Vision Encoder -> Structure Heads -> TaskNetwork)              (Multi-Domain Lifelong Learning)
                 │                                                                   │
-    ├── PrototypeLibrary (K=32 Modes)                               ├── Dual-Residual Basis (K=8 Experts)
+    ├── PrototypeLibrary (K=32 prototype rows)                      ├── Dual-Residual Basis (K=8 Experts)
     ├── Gumbel-Softmax Continuous Routing                           ├── B_shared Base + sum(alpha_i * B_priv_i)
     │   - Dynamic Depth Gates L(x)                                  ├── Layer-Aware Diversity & Orthogonality
-    │   - Dynamic Channel Width Masks D(x)                          └── Zero Catastrophic Forgetting
-    │   - Dynamic Block Types (Plain / ResNet)                        │
-    └── Hard Pruning -> StaticChildModel Extraction                                 └── Synthesized Child CNN (<10k params)
+    │   - Dynamic Channel Width Masks D(x)                          └── Episodic Memory Buffer + Routing Isolation
+    │   - Dynamic Block Types (Plain / ResNet)
+    └── Hard Pruning -> StaticChildModel Extraction                 Synthesized Child CNN (<10k active params)
 ```
 
----
+## 2. Core Subsystems
 
-## 🚀 2. Core AML Subsystems
+### Engine 1: AML Meta-Supernet (`train.py` + `mgn/` + `AML_Core_Code/`)
+- **ConvAML_CIFAR_TrueDynamic** (`train.py`) — the live 18-layer vision supernet:
+  a CNN encoder produces a latent `z`, from which per-sample depth gates, width
+  masks and Plain/ResNet block modes are generated; weights are mixed from a
+  shared prototype library via attention over routing logits `pi`.
+- **AcceleratedCVNetwork** (`AML_Core_Code/train_cv_cifar_18.py`) — the executor.
+  Uses the fused CUDA kernels in `mgn/accel/_C*` when available and falls back to
+  native PyTorch ops otherwise (identical math, slower).
+- **Static Subnet Compiler** (`AML_Core_Code/extract_static_model.py`) — hard-prunes
+  the dynamic supernet into a standalone `StaticChildModel` (pure `nn.Module`, zero
+  Gumbel overhead at inference). Entry point: `extract_child(mother, x_dummy)`.
+- **$C^\infty$ Smooth Efficiency Barrier** (`mgn/constraints.py`) — smooth surrogate
+  for accuracy-per-parameter that keeps meta-gradients bounded.
 
-### 🔹 Engine 1: Model Generator Supernet (`mgn/` & `AML_Core_Code/`)
-- **Meta-Generator (`mgn.generator.ModelGenerator`)**: Dynamically samples computational topologies and weights conditioned on input properties.
-- **TaskNetwork Executor (`mgn.executor.TaskNetwork`)**: Executes dynamically masked and routed graphs with per-sample group convolutions.
-- **Static Subnet Compiler (`AML_Core_Code/extract_static_model.py`)**: Hard-prunes the dynamic supernet into a standalone `StaticChildModel` (pure `nn.Sequential` with zero runtime Gumbel overhead).
-- **$C^\infty$ Smooth Efficiency Barrier (`mgn.constraints.compute_aml_efficiency`)**: Mathematical objective $\mathcal{E}_{\text{AML}}$ guaranteeing non-exploding meta-gradients.
+### Engine 2: Continual Lifelong Hypernetwork (`hts_lib/`)
+- **Dual-Residual Basis** (`hts_lib.models.HtSDualResidualBasis`) — decouples an
+  invariant shared base from sample-adaptive private residual experts.
+- **Continual pipeline** (`train_continual_aml.py`) — task-incremental learning on
+  MNIST → CIFAR-10 → Fashion-MNIST with prototype-row isolation, episodic replay,
+  int8 snapshots of routing state, and post-training consolidation.
+- **Academic Evaluator** (`hts_lib.evaluation.ContinualEvaluator`) — accuracy matrix
+  $A_{i,j}$, backward transfer (BWT), average forgetting.
 
-### 🔹 Engine 2: Continual Lifelong Hypernetwork (`hts_lib/`)
-- **Dual-Residual Basis (`hts_lib.models.HtSDualResidualBasis`)**: Decouples invariant core knowledge ($\mathbf{B}_{\text{shared}}$) from sample-adaptive residual modulations ($\mathbf{B}_{\text{private}}$).
-- **Task-Incremental Lifelong Learning**: Evaluated on 3-domain sequence ($\text{MNIST} \to \text{CIFAR-10} \to \text{Fashion-MNIST}$) with Positive Backward Transfer ($\text{BWT} = +1.95\%$) and empirical zero forgetting ($F = 0.06\%$).
-- **Episodic Memory Buffer (`hts_lib.data.EpisodicMemoryBuffer`)**: Formal memory-budgeted reservoir sampling and rebalancing for constrained continual learning.
+## 3. Results
 
----
+Run the continual benchmark yourself:
 
-## 📊 3. Academic Continual Learning Benchmark
+```bash
+python train_continual_aml.py                  # full default schedule (5,14,8 epochs + consolidation)
+python train_continual_aml.py --epochs 1,1,1 --consolidate-epochs 1   # quick smoke run
+```
 
-### Accuracy Matrix $A_{i, j}$ (Accuracy on Task $j$ after Training Stage $i$):
+The script prints the full accuracy matrix $A_{i,j}$, BWT and forgetting after each
+stage. Vision supernet benchmarks (including static baselines) are recorded in
+`experiments/*.json`.
 
-| Training Stage ($i$) | Evaluated on MNIST ($j=1$) | Evaluated on CIFAR-10 ($j=2$) | Evaluated on Fashion-MNIST ($j=3$) |
-| :--- | :---: | :---: | :---: |
-| **After Stage 1 (MNIST)** | **$99.53\%$** | — | — |
-| **After Stage 2 (CIFAR-10)** | **$99.35\%$** | **$68.71\%$** | — |
-| **After Stage 3 (Fashion-MNIST)** | **$99.41\%$** | **$72.73\%$** 🚀 | **$90.51\%$** ⚡ |
+> Note: earlier README revisions quoted headline numbers (+1.95% BWT, CIFAR-10
+> 72.73%) from a specific v14/v15 run whose exact configuration is not fully
+> reproducible from the current tree; those claims were removed rather than
+> restated. Treat freshly generated runs as the source of truth.
 
----
-
-## 📦 4. Repository Structure
+## 4. Repository Structure
 
 ```text
-AustraliaSilver/AML (main branch)
-├── 📦 mgn/                    # Model Generator Network (AML Core Supernet)
-│   ├── generator.py           # ModelGenerator & PrototypeLibrary
-│   ├── executor.py            # Dynamic TaskNetwork executor
-│   ├── constraints.py         # C^infinity efficiency metric E_AML & soft barrier
-│   ├── export.py              # Supernet to static model compiler
-│   └── losses.py              # Meta-loss & structural regularization
+├── train.py                    # Live 18-layer ConvAML_CIFAR_TrueDynamic trainer (bi-level DARTS-style loop)
+├── train_continual_aml.py      # 3-task continual pipeline (replay + ProtoIsolator + int8 snapshots)
+├── compare_architectures.py    # Static-vs-dynamic architecture comparison
+├── benchmark_baselines.py      # HtS continual-learning baselines
+├── quickstart_aml.py           # End-to-end demo: supernet -> extraction -> HtS
+├── quickstart_hts.py           # Minimal HtS-only demo
+├── validate_ext_in.py          # Numeric parity checks for the fused CUDA kernels
+├── build_ext.py                # Rebuilds both CUDA extensions (_C, _Cin) from source
+├── setup.py                    # pip install -e .
 │
-├── 📦 AML_Core_Code/          # AML Vision pipelines & Static Model Extractor
-│   ├── train_cv_cifar.py      # ConvAML CIFAR Supernet training
-│   └── extract_static_model.py# StaticChildModel extraction engine
+├── mgn/                        # AML core library
+│   ├── generator.py            #   ModelGenerator & PrototypeLibrary (reference impl)
+│   ├── executor.py             #   TaskNetwork executor (reference impl)
+│   ├── constraints.py          #   C-infinity efficiency barrier E_AML, budget projection
+│   ├── losses.py               #   Unified meta-loss
+│   ├── trainer.py              #   MetaTrainer (bi-level optimization)
+│   ├── evaluator.py            #   Candidate scoring
+│   ├── regularization.py       #   Structural regularizers
+│   ├── architecture.py         #   ModelStructure / GeneratedModel dataclasses
+│   ├── tests/                  #   Kernel correctness + speed benchmarks (CUDA required)
+│   ├── accel/                  #   Fused CUDA ops (built by build_ext.py into _C*.ext)
+│   └── csrc/                   #   CUDA/C++ sources for the extensions
 │
-├── 📦 hts_lib/                # Continual Learning Hypernetwork Engine
-│   ├── models/                # Dual-Residual Basis, Dynamic Blocks, Losses
-│   ├── data/                  # Loaders & EpisodicMemoryBuffer
-│   ├── training/              # ContinualTrainer (Optimizer preservation)
-│   └── evaluation/            # Academic Evaluator (A[i,j], BWT, Forgetting)
+├── hts_lib/                    # Continual-learning hypernetwork library
+│   ├── models/                 #   Dual-residual basis, blocks, losses, HtSContinualModel
+│   ├── data/                   #   Loaders & EpisodicMemoryBuffer
+│   ├── training/               #   ContinualTrainer (optimizer-state preservation)
+│   └── evaluation/             #   A[i,j], BWT, forgetting metrics
 │
-├── 🧪 tests/                  # Unit and integration test suite
-├── 🚀 quickstart_aml.py       # End-to-end demo of Supernet & Subnet extraction
-├── 📊 benchmark_baselines.py  # Standard baseline comparisons
-├── 📄 setup.py                # Unified package installer (pip install -e .)
-└── 📁 paper_and_documents/    # Research paper, LaTeX sources, and proofs
+├── AML_Core_Code/              # Vision pipeline pieces shared with train.py
+│   ├── train_cv_cifar_18.py    #   AcceleratedCVNetwork executor + prototype layout
+│   └── extract_static_model.py #   StaticChildModel extraction engine
+│
+├── experiments/                # Benchmark scripts + recorded JSON results
+├── probes/                     # Ad-hoc causal probes used during development
+├── tests/                      # Unit/integration test suite (CPU-safe)
+├── paper_and_documents/        # LaTeX paper source + compiled PDF
+└── data/                       # Datasets (gitignored; auto-downloaded by torchvision)
 ```
 
----
-
-## ⚡ 5. Quickstart & Verification
+## 5. Quickstart & Verification
 
 ```bash
 # 1. Install package in editable mode
 pip install -e .
 
-# 2. Run unit tests
+# 2. Run unit tests (CPU-only, ~10s)
 python -m unittest discover tests
 
-# 3. Run full AML unified demo (Supernet generation + Static extraction + Continual learning)
+# 3. Run the full unified demo (supernet + static extraction + continual hypernetwork)
 python quickstart_aml.py
 ```
+
+Everything above works on CPU out of the box. The fused CUDA kernels are used
+automatically on CUDA machines when built:
+
+```bash
+# Windows: run from an MSVC Developer Command Prompt (needs cl.exe + nvcc)
+python build_ext.py          # builds both _C and _Cin into mgn/accel/
+
+# Verify kernel numeric parity against eager references (CUDA required)
+python validate_ext_in.py
+```
+
+Training:
+
+```bash
+python train.py                       # vision supernet on CIFAR-10 (fused kernels if available)
+python train_continual_aml.py         # 3-domain continual benchmark
+```
+
+## 6. License
+
+MIT — see [LICENSE](LICENSE).

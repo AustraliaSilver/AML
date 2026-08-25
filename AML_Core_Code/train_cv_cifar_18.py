@@ -8,26 +8,13 @@ import time
 import os
 import sys
 
-cuda_toolkit_bin = r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin'
-if os.path.isdir(cuda_toolkit_bin):
-    os.add_dll_directory(cuda_toolkit_bin)
-torch_lib = r'C:\Users\hunga\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\lib'
-if os.path.isdir(torch_lib):
-    os.add_dll_directory(torch_lib)
+# Register CUDA/torch DLL directories and harden the inductor cache before
+# any native extension import. Paths are derived from the live environment
+# (CUDA_PATH, installed torch) rather than hardcoded.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from mgn.accel.dllsetup import bootstrap
 
-import torch._inductor.codecache as _cc
-import pathlib as _pathlib
-_orig_write_atomic = _cc.write_atomic
-def _patched_write_atomic(path, data, **kwargs):
-    try:
-        _orig_write_atomic(path, data, **kwargs)
-    except FileExistsError:
-        _pathlib.Path(path).unlink(missing_ok=True)
-        _orig_write_atomic(path, data, **kwargs)
-_cc.write_atomic = _patched_write_atomic
-
-import torch._dynamo
-torch._dynamo.config.suppress_errors = True
+bootstrap()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mgn.generator import ModelGenerator
@@ -288,7 +275,7 @@ class ConvAML_CIFAR(nn.Module):
 
 
 def train_cifar():
-    torch.backends.cuda.benchmark = True
+    torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"

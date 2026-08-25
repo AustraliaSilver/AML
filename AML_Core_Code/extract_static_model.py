@@ -3,9 +3,8 @@ extract_static_model.py — Hard-prune the dynamic AML supernet into a
 standalone static child model (pure nn.Sequential-style, zero Gumbel
 overhead at inference).
 
-Supports both mothers:
+Supports the live mother:
   - ConvAML_CIFAR_TrueDynamic (repo-root train.py, 18 layers, K=32)
-  - ConvAML_CIFAR (legacy 6-layer, AML_Core_Code/train_cv_cifar.py)
 
 The prototype weight layout comes exclusively from
 train_cv_cifar_18.get_prototype_layout so extractor and trainers can
@@ -163,55 +162,20 @@ def extract_child_truedynamic(mother_model, x_dummy):
 
 
 @torch.no_grad()
-def extract_child_legacy(mother_model, x_dummy):
-    """Extract a static child from the legacy 6-layer ConvAML_CIFAR."""
-    mother_model.eval()
-    B = x_dummy.shape[0]
-    device = x_dummy.device
+def extract_child(mother_model, x_dummy):
+    """Extract a static child from the AML supernet.
 
-    gen = mother_model.gen
-    if hasattr(gen, 'vision_encoder'):
-        z = gen.vision_encoder(x_dummy)
-    else:
-        z = gen.encoder(x_dummy.view(x_dummy.shape[0], -1))
-
-    pi = torch.softmax(gen.prototype_selector(z), dim=-1).mean(dim=0, keepdim=True)
-
-    S = gen(x_dummy).structure
-    layer_gates = S.layer_gates.float().mean(dim=0, keepdim=True)
-    dim_masks = S.dim_masks.float().mean(dim=0, keepdim=True)
-    block_probs = S.block_mode.float().mean(dim=0, keepdim=True) if S.block_mode is not None else None
-
-    return _build_child(
-        gen.prototype_lib.proto_weights, pi, layer_gates, dim_masks, block_probs,
-        max_layers=mother_model.exec_.max_layers,
-        max_dim=mother_model.exec_.max_dim,
-        num_classes=mother_model.exec_.num_classes,
-        pool_after=(2,), device=device,
-        layout_fn=_legacy_layout)
-
-
-def _legacy_layout(max_layers, max_dim, num_classes):
-    """Replicates the inlined offset walk of the legacy 6-layer
-    AcceleratedCVNetwork (train_cv_cifar.py), which still reserves
-    per-layer attention slices."""
-    offsets = []
-    idx = 0
-    for i in range(max_layers):
-        in_c = 3 if i == 0 else max_dim
-        w1_numel = max_dim * in_c * 9
-        w_start = idx
-        b_start = idx + w1_numel
-        w_end = b_start
-        b_end = b_start + max_dim
-        idx = b_end
-        attn_dim = max_dim // 4
-        idx += (3 * attn_dim) * max_dim * 1 + 3 * attn_dim
-        idx += max_dim * attn_dim * 1 + max_dim
-        offsets.append((w_start, w_end, b_start, b_end, in_c))
-    wo_offset = idx
-    bo_offset = idx + (16 * max_dim) * num_classes
-    return bo_offset + num_classes, offsets, None, wo_offset, bo_offset
+    Public entry point. Currently a thin validating wrapper around
+    `extract_child_truedynamic`, which handles ConvAML_CIFAR_TrueDynamic
+    (repo-root train.py).
+    """
+    if not (hasattr(mother_model, "proto_weights")
+            and hasattr(mother_model, "structure_delta")):
+        raise TypeError(
+            f"Unsupported mother model {type(mother_model).__name__}: expected "
+            "ConvAML_CIFAR_TrueDynamic (attrs: proto_weights, structure_delta)."
+        )
+    return extract_child_truedynamic(mother_model, x_dummy)
 
 
 def _logits_of(module, x):
@@ -224,25 +188,18 @@ def _logits_of(module, x):
 def benchmark():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    use_true = "--legacy" not in sys.argv
-    if use_true:
-        print("Loading ConvAML_CIFAR_TrueDynamic (18-layer)...")
-        from train import ConvAML_CIFAR_TrueDynamic
-        ckpt_path = os.environ.get("AML_CKPT",
-                                   os.path.join(_ROOT, "aml_core_best.pth"))
-        mother = ConvAML_CIFAR_TrueDynamic(K=32, max_dim=64, max_layers=18).to(device)
-        if os.path.isfile(ckpt_path):
-            mother.load_state_dict(
-                torch.load(ckpt_path, map_location=device, weights_only=True))
-            print(f"  loaded checkpoint: {ckpt_path}")
-        else:
-            print(f"  [warn] checkpoint not found ({ckpt_path}), using random init")
-        extract_fn = extract_child_truedynamic
+    print("Loading ConvAML_CIFAR_TrueDynamic (18-layer)...")
+    from train import ConvAML_CIFAR_TrueDynamic
+    ckpt_path = os.environ.get("AML_CKPT",
+                               os.path.join(_ROOT, "aml_core_best.pth"))
+    mother = ConvAML_CIFAR_TrueDynamic(K=32, max_dim=64, max_layers=18).to(device)
+    if os.path.isfile(ckpt_path):
+        mother.load_state_dict(
+            torch.load(ckpt_path, map_location=device, weights_only=True))
+        print(f"  loaded checkpoint: {ckpt_path}")
     else:
-        print("Loading legacy ConvAML_CIFAR (6-layer)...")
-        from train_cv_cifar import ConvAML_CIFAR
-        mother = ConvAML_CIFAR().to(device)
-        extract_fn = extract_child_legacy
+        print(f"  [warn] checkpoint not found ({ckpt_path}), using random init")
+    extract_fn = extract_child_truedynamic
 
     mother.eval()
     x_test = torch.randn(1, 3, 32, 32, device=device)
