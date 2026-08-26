@@ -101,7 +101,7 @@ Vision supernet benchmarks (including static baselines) are recorded in
 ├── quickstart_hts.py           # Minimal HtS-only demo
 ├── validate_ext_in.py          # Numeric parity checks for the fused CUDA kernels
 ├── build_ext.py                # Rebuilds both CUDA extensions (_C, _Cin) from source
-├── setup.py                    # pip install -e .
+├── pyproject.toml              # pip install -e .
 │
 ├── mgn/                        # AML core library
 │   ├── generator.py            #   ModelGenerator & PrototypeLibrary (reference impl)

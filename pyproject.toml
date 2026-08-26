@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aml-framework"
+version = "2.0.0"
+description = "Architecture Mode Learning (AML) Framework: Meta-Generators (MGN) & Continual Hypernetworks (HtS)"
+authors = [{ name = "AustraliaSilver" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+# Only needed by experiments/benchmark_baselines.py
+baselines = ["scikit-learn>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/AustraliaSilver/AML"
+
+[tool.setuptools.packages.find]
+include = ["mgn*", "hts_lib*"]
