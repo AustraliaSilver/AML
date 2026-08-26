@@ -199,21 +199,36 @@ class MetaTrainer:
         if self.evaluator is None:
             raise ValueError("predict_with_evaluator requires an evaluator; "
                              "pass one to MetaTrainer.__init__ or use predict().")
+        gen_was = self.generator.training
+        exe_was = self.executor.training
         self.generator.eval()
-        self.evaluator.eval()
-        with torch.no_grad():
-            candidates = [self.generator(x.to(self.device), tau=tau)
-                          for _ in range(num_candidates)]
-            best, best_idx, scores = self.evaluator.select_best(candidates)
-            logits = self.executor(x.to(self.device), best)
-            return logits.argmax(dim=-1), best_idx, scores
+        self.executor.eval()
+        if self.evaluator is not None:
+            self.evaluator.eval()
+        try:
+            with torch.no_grad():
+                candidates = [self.generator(x.to(self.device), tau=tau)
+                              for _ in range(num_candidates)]
+                best, best_idx, scores = self.evaluator.select_best(candidates)
+                logits = self.executor(x.to(self.device), best)
+                return logits.argmax(dim=-1), best_idx, scores
+        finally:
+            self.generator.train(gen_was)
+            self.executor.train(exe_was)
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
+        gen_was = self.generator.training
+        exe_was = self.executor.training
         self.generator.eval()
-        with torch.no_grad():
-            model = self.generator(x.to(self.device))
-            logits = self.executor(x.to(self.device), model)
-            return logits.argmax(dim=-1)
+        self.executor.eval()
+        try:
+            with torch.no_grad():
+                model = self.generator(x.to(self.device))
+                logits = self.executor(x.to(self.device), model)
+                return logits.argmax(dim=-1)
+        finally:
+            self.generator.train(gen_was)
+            self.executor.train(exe_was)
 
     def generate_architecture(self, x: torch.Tensor) -> dict:
         self.generator.eval()

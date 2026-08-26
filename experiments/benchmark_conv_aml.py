@@ -38,8 +38,12 @@ def make_conv_aml(input_dim, output_dim, in_channels):
         use_conv=True, in_channels=in_channels
     )
     exec_ = TaskNetwork()
+    # lambda_balance=0: the -entropy(pi_avg) routing-balance term (weight 1.0)
+    # fought the task objective and cost ~3 points in controlled ablations
+    # (probes/probe_gate_collapse.py, round 2); diversity emerges without it.
+    p_allow = 562186.0 if in_channels == 3 else 506762.0
     loss = MetaLoss(lambda_p=lp, lambda_c=1e-9, lambda_m=0,
-                    lambda_balance=1.0, lambda_stability=1e-6, lambda_design=0,
+                    lambda_balance=0.0, lambda_stability=1e-6, lambda_design=0,
                     lambda_eff=0.2, p_allowance=p_allow)
     return gen, exec_, loss
 
@@ -49,7 +53,8 @@ def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, tes
     trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size)
     elapsed = time.time() - t0
     gen.eval()
-    with torch.no_grad():
+    exec_.eval()  # executor carries dropout; leaving it in train mode
+    with torch.no_grad():  # depresses every accuracy measured here.
         def eval_conv_acc(x_tensor, y_tensor):
             correct, total = 0, 0
             for i in range(0, len(x_tensor), 256):

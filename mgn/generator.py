@@ -160,6 +160,14 @@ class ModelGenerator(nn.Module):
         if self.use_conv:
             self.weight_delta.requires_grad_(False)
 
+        # Optional exploration floor for depth gates (NAS-style path keep-alive).
+        # While >0, layer_gates_soft is clamped from below before the
+        # straight-through hardening, so deep paths stay gradient-alive (and,
+        # once the floor crosses 0.5, forward-active) early in training.
+        # Callers (e.g. MetaTrainer users) anneal it to 0 to hand control back
+        # to the router. Default 0.0 reproduces the original behaviour.
+        self.gate_floor = 0.0
+
     def forward(
         self,
         x: torch.Tensor,
@@ -178,7 +186,13 @@ class ModelGenerator(nn.Module):
             z_noisy = z + eps * sigma
             pi_logits = self.prototype_selector(z_noisy)
 
-        pi = F.gumbel_softmax(pi_logits, tau=tau, hard=False)
+        # Routing is stochastic only while training. Gumbel noise does not
+        # respect module.eval() on its own, so gate it explicitly -- otherwise
+        # evaluation measures accuracy through randomly perturbed weights.
+        if self.training:
+            pi = F.gumbel_softmax(pi_logits, tau=tau, hard=False)
+        else:
+            pi = F.softmax(pi_logits, dim=-1)
 
         # Always mix prototype rows into concrete per-sample weights. Passing
         # skip_weights=True here used to leave the conv model with no weights
@@ -202,6 +216,8 @@ class ModelGenerator(nn.Module):
 
         layer_logits = layer_logits + 2.0
         layer_gates_soft = torch.sigmoid(layer_logits)
+        if self.gate_floor > 0 and self.training:
+            layer_gates_soft = torch.clamp(layer_gates_soft, min=self.gate_floor)
         layer_gates = (layer_gates_soft > 0.5).float().detach() + layer_gates_soft - layer_gates_soft.detach()
         
         dim_logits = dim_logits.view(-1, self.max_layers, len(self.dim_choices))
@@ -216,7 +232,11 @@ class ModelGenerator(nn.Module):
 
         if self.use_conv:
             block_logits = self.block_mode_head(z).view(-1, self.max_layers, 2)
-            block_mode = F.gumbel_softmax(block_logits, tau=tau, hard=True)
+            if self.training:
+                block_mode = F.gumbel_softmax(block_logits, tau=tau, hard=True)
+            else:
+                # Deterministic argmax mode at eval time.
+                block_mode = F.one_hot(block_logits.argmax(dim=-1), 2).float()
         else:
             block_mode = None
 

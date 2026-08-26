@@ -25,7 +25,12 @@ class TaskNetwork(nn.Module):
         dim_mask = (dim_mask_soft > 0.5).float().detach() + dim_mask_soft - dim_mask_soft.detach()
 
         L_probs = S.layer_gates
-        each_layer = F.gumbel_softmax(L_probs, tau=0.5, hard=False, dim=-1)
+        if self.training:
+            each_layer = F.gumbel_softmax(L_probs, tau=0.5, hard=False, dim=-1)
+        else:
+            # Deterministic soft routing at eval time (Gumbel noise would
+            # otherwise perturb predictions regardless of module.eval()).
+            each_layer = F.softmax(L_probs / 0.5, dim=-1)
         each_layer_hard = (each_layer > 0.5).float().detach() + each_layer - each_layer.detach()
 
         if getattr(S, "use_conv", False) or "c1.weight" in W:
