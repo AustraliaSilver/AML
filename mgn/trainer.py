@@ -36,7 +36,9 @@ class MetaTrainer:
         self.history = {"loss": [], "task_loss": [], "resource_cost": [], "acc": []}
         self._prev_model = None
 
-    def train_epoch(self, dataloader: DataLoader, val_dataloader: DataLoader = None, tau: float = 1.0, epoch_progress: float = 0.0) -> dict:
+    def train_epoch(self, dataloader: DataLoader, val_dataloader: DataLoader = None,
+                    tau: float = 1.0, epoch_progress: float = 0.0,
+                    task_loss_fn: nn.Module = None) -> dict:
         self.generator.train()
         total_metrics = {"loss": 0.0, "task_loss": 0.0, "resource_cost": 0.0, "acc": 0.0}
         num_batches = 0
@@ -110,6 +112,8 @@ class MetaTrainer:
             logits_val = self.executor(x_val, model)
 
             kwargs = {"pi_logits": model.pi_logits, "epoch_progress": epoch_progress}
+            if task_loss_fn is not None:
+                kwargs["task_loss_fn"] = task_loss_fn
             if self.meta_loss.lambda_stability > 0 and self._prev_model is not None:
                 kwargs["prev_model"] = self._prev_model
             if self.meta_loss.lambda_contrastive > 0 and task_ids is not None:

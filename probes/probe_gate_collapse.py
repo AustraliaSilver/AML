@@ -27,10 +27,16 @@ Three rounds of controlled ablations (fashion_mnist, 1200/400 samples,
   Round 3 (data/step levers): batch 128 hurts (-3.6); shrinking the
   val split changes nothing. nobal config confirmed as champion.
 
-Final (fast regime): base 75.0 -> fixed 79.1 @15.9k params vs SmallCNN
-84.8 @111k / ResNetBlock 77.5 @78k. ConvAML now strictly beats
-ResNetBlock on both axes; the residual gap to SmallCNN in this
-data-starved regime is the price of per-sample weight synthesis.
+Final (fast regime): base 75.0 -> 81.1 @18k params vs SmallCNN
+84.4 @111k / FixedMLP 82.5 @55k / ResNetBlock 77.5 @78k.
+
+  Round 4 (stacking on nobal): lr=1e-3 +2.0 (the round-2 combo failed
+  only because it also disabled InstanceNorm); K=8 prototypes -2.1;
+  removing label smoothing -1.9; epochs 50 no gain (SmallCNN saturated).
+  Round 5 (refinement): lr=1.5e-3 ties; tau-floor 0.2 and ep40 no gain.
+
+Winning config adopted by experiments/benchmark_conv_aml.py:
+  lambda_balance=0, MetaTrainer(lr=1e-3), batch 64, 25 epochs, ls=0.1.
 
 Run: python probes/probe_gate_collapse.py [--seeds 2]
 """
@@ -59,11 +65,12 @@ def set_seed(seed):
     np.random.seed(seed)
 
 
-def make_model(in_channels, output_dim, lambda_eff, lambda_balance=1.0):
+def make_model(in_channels, output_dim, lambda_eff, lambda_balance=1.0,
+               num_prototypes=4):
     gen = ModelGenerator(
         input_dim=784 if in_channels == 1 else 3072, output_dim=output_dim,
         max_layers=4, max_dim=128, dim_choices=(32, 64, 96, 128),
-        latent_dim=64, noise_dim=64, num_prototypes=4,
+        latent_dim=64, noise_dim=64, num_prototypes=num_prototypes,
         use_conv=True, in_channels=in_channels,
     )
     exec_ = TaskNetwork()
@@ -107,10 +114,12 @@ def floor_schedule(progress, start=0.55, end=0.30, horizon=0.6):
 
 def run_variant(name, data, in_channels, seed, lambda_eff=0.2, use_floor=False,
                 freeze_arch=False, lambda_balance=1.0, lr=5e-4, no_in=False,
-                batch_size=BATCH, val_frac=0.2):
+                batch_size=BATCH, val_frac=0.2, num_prototypes=4,
+                label_smoothing=0.1, epochs=EPOCHS, tau_floor=0.5):
     set_seed(seed)
     gen, exec_, loss = make_model(in_channels, data["output_dim"], lambda_eff,
-                                  lambda_balance=lambda_balance)
+                                  lambda_balance=lambda_balance,
+                                  num_prototypes=num_prototypes)
     gen.to(DEVICE)
 
     if freeze_arch:
@@ -138,13 +147,15 @@ def run_variant(name, data, in_channels, seed, lambda_eff=0.2, use_floor=False,
     t0 = time.time()
     if no_in:
         disable_instancenorm()
+    task_loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     try:
-        for epoch in range(EPOCHS):
-            progress = epoch / max(1, EPOCHS - 1)
-            tau = max(0.5, 1.0 - epoch / 30.0)
+        for epoch in range(epochs):
+            progress = epoch / max(1, epochs - 1)
+            tau = max(tau_floor, 1.0 - epoch / 30.0)
             gen.gate_floor = floor_schedule(progress) if use_floor else 0.0
             metrics = trainer.train_epoch(loader, val_dataloader=val_loader,
-                                          tau=tau, epoch_progress=progress)
+                                          tau=tau, epoch_progress=progress,
+                                          task_loss_fn=task_loss_fn)
             scheduler.step()
             with torch.no_grad():
                 smp = gen(data["train_x"][:64].to(DEVICE))
@@ -177,6 +188,19 @@ def run_variant(name, data, in_channels, seed, lambda_eff=0.2, use_floor=False,
     return {"acc": test_acc, "L": L, "P": P}
 
 
+def run_smallcnn_reference(data, in_channels, seed, epochs=EPOCHS):
+    """Fair SmallCNN reference under identical data/epochs."""
+    from experiments.benchmark_baselines import SmallCNN, train_torch
+    set_seed(seed)
+    model = SmallCNN(in_channels=in_channels,
+                     input_dim=data["input_dim"], output_dim=data["output_dim"])
+    res = train_torch(model, data["train_x"], data["train_y"],
+                      data["test_x"], data["test_y"],
+                      epochs=epochs, batch_size=128, device=DEVICE,
+                      label="SmallCNN-ref")
+    return float(res["test_acc"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=2)
@@ -187,13 +211,14 @@ def main():
     print(f"Device={DEVICE} | train={data['n_train']} test={data['n_test']} "
           f"| epochs={EPOCHS} seeds={args.seeds}", flush=True)
 
-    # Round 3: with lambda_balance=0 as the new base, test data/step levers.
+    # Round 5: refine the round-4 winner (nobal + lr1e3).
     variants = [
-        ("nobal",       dict(lambda_eff=0.2, lambda_balance=0.0)),
-        ("nobal_b128",  dict(lambda_eff=0.2, lambda_balance=0.0, batch_size=128)),
-        ("nobal_val05", dict(lambda_eff=0.2, lambda_balance=0.0, val_frac=0.05)),
-        ("nobal_both",  dict(lambda_eff=0.2, lambda_balance=0.0, batch_size=128,
-                             val_frac=0.05)),
+        ("nb_lr1e3",       dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3)),
+        ("nb_lr15",        dict(lambda_eff=0.2, lambda_balance=0.0, lr=1.5e-3)),
+        ("nb_lr1e3_tau02", dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
+                                tau_floor=0.2)),
+        ("nb_lr1e3_ep40",  dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
+                                epochs=40)),
     ]
 
     summary = {}
@@ -206,14 +231,24 @@ def main():
             "P": float(np.mean([r["P"] for r in runs])),
         }
 
+    # Fair references under each distinct epoch budget used above.
+    ep_budgets = sorted({cfg.get("epochs", EPOCHS) for _, cfg in variants})
+    cnn_ref = {}
+    for ep in ep_budgets:
+        accs = [run_smallcnn_reference(data, in_ch, 42 + s, epochs=ep)
+                for s in range(args.seeds)]
+        cnn_ref[ep] = float(np.mean(accs))
+        print(f"  [SmallCNN-ref ep={ep}] acc={cnn_ref[ep]:.4f}", flush=True)
+
     print("\n" + "=" * 62)
     print(f"{'variant':12s} {'test_acc':>9s} {'avg_L':>6s} {'P_eff':>8s}")
     print("-" * 62)
     for name, s in summary.items():
         print(f"{name:12s} {s['acc']:>9.4f} {s['L']:>6.2f} {int(s['P']):>8d}")
     print("=" * 62)
-    print("Reference (same regime, from conv_aml_fashion_mnist.json):")
-    print("  SmallCNN 84.75% @111k | FixedMLP 82.50% @55k | ResNetBlock 77.50% @78k")
+    for ep, acc in cnn_ref.items():
+        print(f"SmallCNN @ep{ep}: {acc:.4f} @111k params")
+    print("Other refs (fast regime): FixedMLP 82.50% @55k | ResNetBlock 77.50% @78k")
 
 
 if __name__ == "__main__":
