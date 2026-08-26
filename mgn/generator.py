@@ -180,7 +180,10 @@ class ModelGenerator(nn.Module):
 
         pi = F.gumbel_softmax(pi_logits, tau=tau, hard=False)
 
-        base_layers, base_dims, base_res, w_direct = self.prototype_lib(pi, skip_weights=self.use_conv)
+        # Always mix prototype rows into concrete per-sample weights. Passing
+        # skip_weights=True here used to leave the conv model with no weights
+        # at all, crashing TaskNetwork's conv branch with KeyError 'c1.weight'.
+        base_layers, base_dims, base_res, w_direct = self.prototype_lib(pi)
 
         if self.use_conv:
             delta = self.structure_delta(z)
@@ -219,7 +222,24 @@ class ModelGenerator(nn.Module):
 
         W = {}
         if self.use_conv:
-            pass
+            # Slice the prototype-mixed flat weight vector into per-layer
+            # tensors matching TaskNetwork's contract:
+            #   c{i}.weight [B, max_dim, in_c, 3, 3], c{i}.bias [B, max_dim],
+            #   out.weight [B, output_dim, 16*max_dim], out.bias [B, output_dim].
+            # Layout must mirror PrototypeLibrary's init loop exactly.
+            D = self.max_dim
+            idx = 0
+            for i in range(self.max_layers):
+                in_c = self.in_channels if i == 0 else D
+                sz_w = D * in_c * 9
+                W[f"c{i+1}.weight"] = w_direct[:, idx:idx + sz_w].view(-1, D, in_c, 3, 3)
+                idx += sz_w
+                W[f"c{i+1}.bias"] = w_direct[:, idx:idx + D]
+                idx += D
+            sz_w = (16 * D) * self.output_dim
+            W["out.weight"] = w_direct[:, idx:idx + sz_w].view(-1, self.output_dim, 16 * D)
+            idx += sz_w
+            W["out.bias"] = w_direct[:, idx:idx + self.output_dim]
         else:
             idx = 0
             for i in range(self.max_layers):
@@ -251,4 +271,7 @@ class ModelGenerator(nn.Module):
             dim_choices=self.dim_choices,
             in_channels=self.in_channels
         )
-        return GeneratedModel(structure=struct, weights=W, pi_logits=pi_logits)
+        # Persist the latent so ModelEvaluator.score_candidate can score the
+        # candidate without re-running the encoder.
+        return GeneratedModel(structure=struct, weights=W, pi_logits=pi_logits,
+                              embedding=z)

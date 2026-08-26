@@ -289,8 +289,24 @@ if __name__ == "__main__":
         with open(f"experiments/conv_aml_{ds}.json", "w") as f:
             json.dump(r, f, indent=2)
 
-    with open("experiments/conv_aml_all.json", "w") as f:
-        json.dump(all_res, f, indent=2)
+    # Upsert into the aggregate file by dataset so that running a single
+    # dataset does not silently discard previously recorded results for
+    # the others.
+    all_path = "experiments/conv_aml_all.json"
+    try:
+        with open(all_path) as f:
+            merged = json.load(f)
+        if not isinstance(merged, list):
+            merged = []
+    except (FileNotFoundError, json.JSONDecodeError):
+        merged = []
+    by_ds = {e.get("dataset"): e for e in merged}
+    for r in all_res:
+        by_ds[r["dataset"]] = r
+    merged = list(by_ds.values())
+
+    with open(all_path, "w") as f:
+        json.dump(merged, f, indent=2)
 
     print("\n" + "=" * 70)
     print("ConvAML Benchmark Summary Table")

@@ -20,8 +20,11 @@ class MetaLoss(nn.Module):
         lambda_stability: float = 0.0,
         lambda_design: float = 0.0,
         lambda_reg: float = 0.0,
-        lambda_eff: float = 0.0,
-        p_allowance: float = 110986.0,
+    lambda_eff: float = 0.0,
+    # Default = SmallCNN's parameter count from experiments/results_fashion_mnist.json,
+    # i.e. the efficiency barrier is calibrated against the strongest static baseline
+    # by default. Override per-experiment via MetaLoss(..., p_allowance=...).
+    p_allowance: float = 110986.0,
         reg_sigma: float = 1.0,
         resource_budget: ResourceBudget = None,
     ):

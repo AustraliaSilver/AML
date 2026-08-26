@@ -33,8 +33,13 @@ class ModelEvaluator(nn.Module):
         )
 
     def score_candidate(self, model: GeneratedModel) -> torch.Tensor:
-        z = model.embedding
-        quality = self.quality_head(z).squeeze(-1).mean()
+        z = getattr(model, "embedding", None)
+        if z is None:
+            # No latent available (e.g. a hand-constructed GeneratedModel);
+            # score purely on cost rather than crashing.
+            quality = torch.zeros((), device=self.quality_head[0].weight.device)
+        else:
+            quality = self.quality_head(z).squeeze(-1).mean()
 
         cost = phi_cost(
             model.structure,

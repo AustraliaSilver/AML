@@ -551,7 +551,12 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             tot_loss += loss.item()
 
         sch.step()
-        sch_arch.step()
+        # The architecture optimizer does not step while the structure is
+        # frozen; stepping its scheduler anyway would silently decay the LR
+        # for epochs that never trained (and trips PyTorch's
+        # scheduler-before-optimizer warning).
+        if not freeze:
+            sch_arch.step()
         acc, _ = evaluate(model, testloader, device, amp_dtype)
         print(f"  {log_prefix}ep {epoch+1}/{epochs} | {time.time()-t0:5.1f}s | "
               f"loss {tot_loss/len(trainloader):.4f} | {name} acc {acc*100:.2f}%"

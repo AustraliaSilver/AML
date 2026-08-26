@@ -25,9 +25,6 @@ class TaskNetwork(nn.Module):
         dim_mask = (dim_mask_soft > 0.5).float().detach() + dim_mask_soft - dim_mask_soft.detach()
 
         L_probs = S.layer_gates
-        layer_mask_soft = L_probs.sum(dim=-1, keepdim=True)
-        layer_range = torch.arange(L_max, device=device, dtype=torch.float32).unsqueeze(0)
-        cum_prob = L_probs.cumsum(dim=-1)
         each_layer = F.gumbel_softmax(L_probs, tau=0.5, hard=False, dim=-1)
         each_layer_hard = (each_layer > 0.5).float().detach() + each_layer - each_layer.detach()
 

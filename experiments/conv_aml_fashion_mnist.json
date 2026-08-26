@@ -1,74 +1,66 @@
 {
   "dataset": "fashion_mnist",
-  "seeds": 2,
+  "seeds": 1,
   "methods": {
     "ConvAML": {
-      "test_acc_mean": 0.85,
-      "test_acc_std": 0.0028284271247461927,
-      "P_mean": 18929.142578125,
-      "P_std": 4476.104696752998,
-      "time_mean": 754.9176951646805,
+      "test_acc_mean": 0.75,
+      "test_acc_std": 0.0,
+      "P_mean": 23274.001953125,
+      "P_std": 0.0,
+      "time_mean": 124.50519752502441,
       "all_test_accs": [
-        0.852,
-        0.848
+        0.75
       ],
       "all_Ps": [
-        22094.2265625,
-        15764.05859375
+        23274.001953125
       ],
-      "avg_L": 0.6123046875,
-      "avg_entropy": 1.2742623686790466,
+      "avg_L": 0.08500000089406967,
+      "avg_entropy": 1.2584800720214844,
       "avg_prototypes_used": 4.0
     },
     "ConvAML_No_O": {
-      "test_acc_mean": 0.85575,
-      "test_acc_std": 0.0010606601717798615,
-      "P_mean": 235650.5703125,
-      "P_std": 18852.538495148594,
-      "time_mean": 579.0336949825287
+      "test_acc_mean": 0.76,
+      "test_acc_std": 0.0,
+      "P_mean": 18877.712890625,
+      "P_std": 0.0,
+      "time_mean": 92.1947853565216
     },
     "SmallCNN": {
-      "test_acc_mean": 0.8680000000000001,
-      "test_acc_std": 0.00777817459305203,
+      "test_acc_mean": 0.8475,
+      "test_acc_std": 0.0,
       "P_mean": 110986.0,
       "P_std": 0.0,
-      "time_mean": 6.77529513835907,
+      "time_mean": 3.1434528827667236,
       "all_test_accs": [
-        0.8625,
-        0.8735
+        0.8475
       ],
       "all_Ps": [
-        110986,
         110986
       ]
     },
     "FixedMLP": {
-      "test_acc_mean": 0.8420000000000001,
-      "test_acc_std": 0.01626345596729061,
+      "test_acc_mean": 0.825,
+      "test_acc_std": 0.0,
       "P_mean": 55050.0,
       "P_std": 0.0,
-      "time_mean": 3.505468487739563,
+      "time_mean": 1.3992505073547363,
       "all_test_accs": [
-        0.8305,
-        0.8535
+        0.825
       ],
       "all_Ps": [
-        55050,
         55050
       ]
     },
     "ResNetBlock": {
-      "test_acc_mean": 0.8222499999999999,
-      "test_acc_std": 0.011667261889578083,
+      "test_acc_mean": 0.775,
+      "test_acc_std": 0.0,
       "P_mean": 77578.0,
       "P_std": 0.0,
-      "time_mean": 15.644070148468018,
+      "time_mean": 5.8678483963012695,
       "all_test_accs": [
-        0.814,
-        0.8305
+        0.775
       ],
       "all_Ps": [
-        77578,
         77578
       ]
     }

@@ -194,11 +194,16 @@ class MetaTrainer:
                 )
                 sys.stdout.flush()
 
-    def predict_with_evaluator(self, x: torch.Tensor, num_candidates: int = 5) -> tuple:
+    def predict_with_evaluator(self, x: torch.Tensor, num_candidates: int = 5,
+                               tau: float = 1.0) -> tuple:
+        if self.evaluator is None:
+            raise ValueError("predict_with_evaluator requires an evaluator; "
+                             "pass one to MetaTrainer.__init__ or use predict().")
         self.generator.eval()
         self.evaluator.eval()
         with torch.no_grad():
-            candidates = self.generator.generate_candidates(x.to(self.device), num_candidates)
+            candidates = [self.generator(x.to(self.device), tau=tau)
+                          for _ in range(num_candidates)]
             best, best_idx, scores = self.evaluator.select_best(candidates)
             logits = self.executor(x.to(self.device), best)
             return logits.argmax(dim=-1), best_idx, scores

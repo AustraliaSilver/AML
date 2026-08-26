@@ -37,5 +37,4 @@ logs/
 *.pt.trace.json
 
 # Run logs
-*_run.log
-smoke_*.log
+*.log
