@@ -20,6 +20,8 @@ class MetaTrainer:
         lr: float = 1e-3,
         device: str = "cpu",
         num_candidates: int = 1,
+        optimizer: str = "adamw",
+        weight_decay: float = 0.05,
     ):
         self.generator = generator.to(device)
         self.executor = executor.to(device)
@@ -31,7 +33,12 @@ class MetaTrainer:
         params = list(self.generator.parameters())
         if self.evaluator is not None:
             params = params + list(self.evaluator.parameters())
-        self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.05)
+        opt_cls = {"adamw": torch.optim.AdamW,
+                   "adam": torch.optim.Adam}.get(optimizer.lower())
+        if opt_cls is None:
+            raise ValueError(f"Unknown optimizer {optimizer!r}; "
+                             "expected 'adamw' or 'adam'.")
+        self.optimizer = opt_cls(params, lr=lr, weight_decay=weight_decay)
 
         self.history = {"loss": [], "task_loss": [], "resource_cost": [], "acc": []}
         self._prev_model = None

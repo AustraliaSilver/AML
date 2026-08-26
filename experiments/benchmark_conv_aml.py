@@ -52,7 +52,10 @@ def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, tes
     # lr=1e-3: matches the plain baselines' optimizer scale; +2 points over
     # the old 5e-4 in controlled ablation (probes/probe_gate_collapse.py,
     # rounds 4-5). lambda_balance=0 likewise per round 2 (+3.1).
-    trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device)
+    # weight_decay=0.01: non-monotonic sweep found 0.05 too strong and 0
+    # too weak (+0.9 vs both, round 6).
+    trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device,
+                          weight_decay=0.01)
     trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size)
     elapsed = time.time() - t0
     gen.eval()

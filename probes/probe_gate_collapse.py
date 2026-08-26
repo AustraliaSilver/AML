@@ -36,7 +36,12 @@ Final (fast regime): base 75.0 -> 81.1 @18k params vs SmallCNN
   Round 5 (refinement): lr=1.5e-3 ties; tau-floor 0.2 and ep40 no gain.
 
 Winning config adopted by experiments/benchmark_conv_aml.py:
-  lambda_balance=0, MetaTrainer(lr=1e-3), batch 64, 25 epochs, ls=0.1.
+  lambda_balance=0, MetaTrainer(lr=1e-3, weight_decay=0.01), batch 64,
+  25 epochs, ls=0.1.
+
+  Round 6 (optimizer): AdamW wd sweep is non-monotonic -- wd=0.01 +0.9
+  over both wd=0.05 and wd=0; plain Adam trails AdamW at equal wd, so
+  the decoupled decay genuinely helps.
 
 Run: python probes/probe_gate_collapse.py [--seeds 2]
 """
@@ -115,7 +120,8 @@ def floor_schedule(progress, start=0.55, end=0.30, horizon=0.6):
 def run_variant(name, data, in_channels, seed, lambda_eff=0.2, use_floor=False,
                 freeze_arch=False, lambda_balance=1.0, lr=5e-4, no_in=False,
                 batch_size=BATCH, val_frac=0.2, num_prototypes=4,
-                label_smoothing=0.1, epochs=EPOCHS, tau_floor=0.5):
+                label_smoothing=0.1, epochs=EPOCHS, tau_floor=0.5,
+                optim="adamw", wd=0.05):
     set_seed(seed)
     gen, exec_, loss = make_model(in_channels, data["output_dim"], lambda_eff,
                                   lambda_balance=lambda_balance,
@@ -136,7 +142,8 @@ def run_variant(name, data, in_channels, seed, lambda_eff=0.2, use_floor=False,
     trx, try_ = data["train_x"][idx[:-n_val]], data["train_y"][idx[:-n_val]]
     vx, vy = data["train_x"][idx[-n_val:]], data["train_y"][idx[-n_val:]]
 
-    trainer = MetaTrainer(gen, exec_, loss, lr=lr, device=DEVICE)
+    trainer = MetaTrainer(gen, exec_, loss, lr=lr, device=DEVICE,
+                          optimizer=optim, weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         trainer.optimizer, T_max=EPOCHS, eta_min=1e-5)
 
@@ -211,14 +218,19 @@ def main():
     print(f"Device={DEVICE} | train={data['n_train']} test={data['n_test']} "
           f"| epochs={EPOCHS} seeds={args.seeds}", flush=True)
 
-    # Round 5: refine the round-4 winner (nobal + lr1e3).
+    # Round 6: optimizer ablation at the winning config (nobal + lr1e3).
+    # MetaTrainer always used AdamW(wd=0.05); Adam and other wd values were
+    # never compared. Baselines train with plain Adam(wd=0).
     variants = [
-        ("nb_lr1e3",       dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3)),
-        ("nb_lr15",        dict(lambda_eff=0.2, lambda_balance=0.0, lr=1.5e-3)),
-        ("nb_lr1e3_tau02", dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
-                                tau_floor=0.2)),
-        ("nb_lr1e3_ep40",  dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
-                                epochs=40)),
+        ("nb_lr1e3",     dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3)),
+        ("adamw_wd001",  dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
+                              wd=0.01)),
+        ("adamw_wd0",    dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
+                              wd=0.0)),
+        ("adam_wd0",     dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
+                              optim="adam", wd=0.0)),
+        ("adam_wd01",    dict(lambda_eff=0.2, lambda_balance=0.0, lr=1e-3,
+                              optim="adam", wd=0.01)),
     ]
 
     summary = {}
