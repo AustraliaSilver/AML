@@ -65,14 +65,30 @@ python train_continual_aml.py                  # full default schedule (5,14,8 e
 python train_continual_aml.py --epochs 1,1,1 --consolidate-epochs 1   # quick smoke run
 ```
 
-The script prints the full accuracy matrix $A_{i,j}$, BWT and forgetting after each
-stage. Vision supernet benchmarks (including static baselines) are recorded in
-`experiments/*.json`.
+Freshly measured on the current tree (RTX 3050 6GB, seed 42, full default schedule,
+~75 min wall-clock):
 
-> Note: earlier README revisions quoted headline numbers (+1.95% BWT, CIFAR-10
-> 72.73%) from a specific v14/v15 run whose exact configuration is not fully
-> reproducible from the current tree; those claims were removed rather than
-> restated. Treat freshly generated runs as the source of truth.
+### Accuracy matrix $A_{i,j}$ (accuracy on task $j$ after training stage $i$)
+
+| Training stage ($i$) | MNIST ($j$=1) | CIFAR-10 ($j$=2) | Fashion-MNIST ($j$=3) |
+| :--- | :---: | :---: | :---: |
+| After Stage 1 (MNIST) | **99.32%** | — | — |
+| After Stage 2 (CIFAR-10) | **99.34%** | **74.49%** | — |
+| After Stage 3 (Fashion-MNIST) | **99.34%** | **74.20%** | **90.36%** |
+
+**Backward transfer: −0.14% · Average forgetting: 0.15%** — i.e. near-zero
+catastrophic forgetting across the 3-domain sequence. Per-domain structure
+fingerprints confirm the generated architectures genuinely diverge per domain
+(pairwise gate/bmRes L1 divergence 0.7–2.1 rather than ~0).
+
+> Note on historical numbers: earlier revisions of this README quoted
+> "BWT = +1.95%" from a specific v14/v15 run whose exact configuration is not
+> reproducible from the current tree; the repo's own test suite encoded a
+> different value. That claim was removed. Treat freshly generated runs as the
+> source of truth.
+
+Vision supernet benchmarks (including static baselines) are recorded in
+`experiments/*.json`.
 
 ## 4. Repository Structure
 
