@@ -62,7 +62,7 @@ def run_benchmark():
     print(f'-> [After] Pipeline C++ (CUDAGraphs Fusion): {graph_time:.2f} ms')
     
     speedup = no_graph_time / graph_time
-    print(f'-> Tốc độ tăng thêm: {speedup:.2f}x (Nhanh hơn {(speedup - 1)*100:.1f}%)')
+    print(f'-> Speedup: {speedup:.2f}x ({(speedup - 1)*100:.1f}% faster)')
     print("================================================================")
 
 if __name__ == '__main__':

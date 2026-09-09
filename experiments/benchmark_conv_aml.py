@@ -29,7 +29,7 @@ def set_seed(seed):
 def make_conv_aml(input_dim, output_dim, in_channels):
     num_p = 2
     lp = 0.0
-    # Cấu trúc khổng lồ: L=4, D=128 => p_allow tăng vọt để chứa mạng siêu to
+    # Huge architecture: L=4, D=128 => p_allow inflated to accommodate very large nets
     p_allow = 562186.0 if in_channels == 3 else 506762.0
     gen = ModelGenerator(
         input_dim=input_dim, output_dim=output_dim,
