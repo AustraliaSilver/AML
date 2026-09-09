@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,10 +70,13 @@ class MetaLoss(nn.Module):
             
             # ============================================================
             # G_gap: Normalized Generalization Gap (Hybrid Stable Version)
-            # Tu so: clamp(Delta, 0) - chi phat khi overfit, gradient on dinh
-            # Mau so: softplus(ln(Y) - L_train) - C-infinity, tranh chia cho 0
+            # Numerator: clamp(Delta, 0) - only penalizes overfitting, stable gradient
+            # Denominator: softplus(ln(Y) - L_train) - C-infinity, avoids division by 0
             # ============================================================
-            ln_Y = 2.302  # ln(10)
+            # Derive ln(#classes) from the structure instead of hard-coding
+            # ln(10): the gap normalization is silently wrong on any
+            # dataset with a different label count.
+            ln_Y = math.log(max(int(model.structure.output_dim), 2))
             gap_numerator   = torch.clamp(L_val - L_task.detach(), min=0.0)
             gap_denominator = F.softplus(ln_Y - L_task.detach())
             G_gap = gap_numerator / (gap_denominator + 1e-4)
@@ -100,10 +105,10 @@ class MetaLoss(nn.Module):
             E_aml_raw = torch.clamp(E_aml_raw, min=1e-6)
             
             # ============================================================
-            # Normalized E_AML: 1 - exp(-k * E_aml) ∈ (0, 1)
-            # Đảm bảo O luôn ∈ (0,1) → (1-O) luôn dương → không bao giờ
-            # biến Loss thành cơ chế thưởng vô hạn.
-            # k = 5.0: núm vặn kiểm soát độ nhạy (scaling factor)
+            # Normalized E_AML: 1 - exp(-k * E_aml) in (0, 1)
+            # Ensures O is always in (0,1) -> (1-O) always positive -> loss
+            # can never become an unbounded reward mechanism.
+            # k = 5.0: scaling factor controlling sensitivity
             # ============================================================
             # ============================================================
             k = 5.0
@@ -132,15 +137,15 @@ class MetaLoss(nn.Module):
                 current_lambda_eff = self.lambda_eff
                 
             gamma = 2.0
-            lambda_val = 1.0  # Giảm penalty để tránh gradient vanishing do nhiễu batch
+            lambda_val = 1.0  # Reduced penalty to avoid gradient vanishing from batch noise
             eps = 1e-4
-            
+
             R_gamma = (E_aml / E_0) ** gamma
-            # Dùng G_gap bậc 1 thay vì bậc 2 để tránh khuếch đại nhiễu (noise amplification)
+            # Use first-order G_gap instead of second-order to avoid noise amplification
             O = E_aml * torch.exp(-lambda_val * G_gap / (R_gamma + eps))
             O_val = O
-            
-            # Loss = L_task + mu * (1 - O), với O ∈ (0,1) nên (1-O) luôn ≥ 0
+
+            # Loss = L_task + mu * (1 - O), with O in (0,1) so (1-O) >= 0
             L_eff = current_lambda_eff * (1.0 - O)
 
             # ============================================================

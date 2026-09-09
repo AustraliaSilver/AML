@@ -6,6 +6,29 @@ import numpy as np
 from collections import Counter
 import re, os, pickle, itertools
 
+STATS_DIR = os.path.join(".", "data")
+
+
+def _load_or_build_vocab(name, max_features):
+    """BOW vocabulary built ONCE from the train split and shared by all
+    splits: independent per-split vocabs made column k of the feature matrix
+    mean different WORDS in train vs test (silent feature misalignment)."""
+    os.makedirs(STATS_DIR, exist_ok=True)
+    cache = os.path.join(STATS_DIR, f"bow_vocab_{name}_{max_features}.pkl")
+    if os.path.exists(cache):
+        with open(cache, "rb") as f:
+            return pickle.load(f)
+    from datasets import load_dataset
+    hf_train = load_dataset(name, split="train", trust_remote_code=True)
+    vocab = Counter()
+    for example in hf_train:
+        vocab.update(re.findall(r"\w+", example["text"].lower()))
+    top_words = [w for w, _ in vocab.most_common(max_features - 1)]
+    word2idx = {w: i + 1 for i, w in enumerate(top_words)}
+    with open(cache, "wb") as f:
+        pickle.dump(word2idx, f)
+    return word2idx
+
 
 class FlattenedImageDataset(Dataset):
     def __init__(self, name, train=True, max_samples=None, download=True):
@@ -34,8 +57,22 @@ class FlattenedImageDataset(Dataset):
         self.data = torch.tensor(np.array(self.images), dtype=torch.float32)
         self.targets = torch.tensor(self.labels, dtype=torch.long)
 
-        x_mean = self.data.mean(dim=0, keepdim=True)
-        x_std = self.data.std(dim=0, keepdim=True) + 1e-8
+        # Standardize with stats computed from the TRAIN split for BOTH
+        # splits (per-split self-stats leak test data and descale features).
+        os.makedirs(STATS_DIR, exist_ok=True)
+        stats_path = os.path.join(STATS_DIR, f"flat_stats_{name}.pt")
+        if train:
+            x_mean = self.data.mean(dim=0, keepdim=True)
+            x_std = self.data.std(dim=0, keepdim=True) + 1e-8
+            torch.save((x_mean, x_std), stats_path)
+        elif os.path.exists(stats_path):
+            x_mean, x_std = torch.load(stats_path, weights_only=True)
+        else:
+            # get_dataset() always builds train first; if out of build order,
+            # compute from the paired train split.
+            ref = FlattenedImageDataset(name, train=True, max_samples=None, download=download)
+            x_mean = ref.data.mean(dim=0, keepdim=True)
+            x_std = ref.data.std(dim=0, keepdim=True) + 1e-8
         self.data = (self.data - x_mean) / x_std
 
         self.input_dim = self.data.shape[1]
@@ -68,13 +105,7 @@ class TextBOWDataset(Dataset):
             texts.append(example["text"])
             labels.append(example["label"])
 
-        vocab = Counter()
-        for t in texts:
-            tokens = re.findall(r"\w+", t.lower())
-            vocab.update(tokens)
-
-        top_words = [w for w, _ in vocab.most_common(max_features - 1)]
-        word2idx = {w: i + 1 for i, w in enumerate(top_words)}
+        word2idx = _load_or_build_vocab(name, max_features)
 
         X = np.zeros((len(texts), max_features), dtype=np.float32)
         for i, t in enumerate(texts):

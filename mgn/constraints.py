@@ -21,7 +21,10 @@ def compute_aml_efficiency(accuracy: float, p_allowance: float, q_used: float) -
     if accuracy <= 0 or q_used <= 0 or p_allowance <= 0:
         return 0.0
     a = min(max(float(accuracy), 1e-3), 1.0)
-    q = float(q_used)
+    # Mirror the torch twin's guards: q >= 100 and r = q/p clamped to 4.5
+    # (beta*(r-1) stays below the float64-safe exp range). Without these,
+    # math.exp(20*(r-1)) raises OverflowError for heavily over-budget q.
+    q = min(max(float(q_used), 100.0), float(p_allowance) * 4.5)
     p = float(p_allowance)
     b = max(p / q, 0.1)
 
@@ -39,7 +42,7 @@ def compute_aml_efficiency(accuracy: float, p_allowance: float, q_used: float) -
     # Apply C^inf Normalized Exponential Soft Barrier
     beta = 20.0
     lam = 2.0
-    r = q_used / p_allowance
+    r = q / p
     F_norm = ( (1.0 + math.exp(beta * (r - 1.0))) / 2.0 ) ** (-lam / beta)
     
     return float((a / denom) * ratio_term * F_norm)

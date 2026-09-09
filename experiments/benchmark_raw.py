@@ -4,7 +4,8 @@ Usage: python experiments/benchmark_raw.py --datasets cifar10 --seeds 3
 """
 import sys, os, json, time, argparse, warnings
 warnings.filterwarnings("ignore")
-sys.path.insert(0, '/kaggle/working/ALM-V1')
+# Make the repo importable when run as `python experiments/benchmark_raw.py`
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import numpy as np
@@ -36,14 +37,17 @@ def run_benchmark(dataset_name, seeds=3, quick=False):
     epochs = 80 if quick else 150
 
     data = get_dataset(dataset_name, max_train=max_train, max_test=max_test)
-    
+
     train_x = data["train_x"].float() / 255.0
     test_x = data["test_x"].float() / 255.0
-    
-    # Normalize
-    train_x = (train_x - train_x.mean()) / (train_x.std() + 1e-8)
-    test_x = (test_x - test_x.mean()) / (test_x.std() + 1e-8)
+
+    # Normalize: mean/std come from TRAIN ONLY (computing them from the test
+    # split leaks test statistics into the preprocessing).
+    mean, std = train_x.mean(), train_x.std() + 1e-8
+    train_x = (train_x - mean) / std
+    test_x = (test_x - mean) / std
     train_y, test_y = data["train_y"], data["test_y"]
+    train_x, train_y, test_x, test_y = (t.to(DEVICE) for t in (train_x, train_y, test_x, test_y))
 
     print(f"  Input={data['input_dim']} Output={data['output_dim']}")
     print(f"  Train: {data['n_train']} Test: {data['n_test']}")
@@ -62,9 +66,10 @@ def run_benchmark(dataset_name, seeds=3, quick=False):
             max_layers=2, max_dim=64, dim_choices=(32, 64),
             latent_dim=32, noise_dim=32, num_prototypes=8,
         )
-        exec_ = TaskNetwork(dropout=0.2)
+        exec_ = TaskNetwork(dropout=0.2).to(DEVICE)
+        from mgn.constraints import phi_cost
         loss = MetaLoss(lambda_p=1e-4, lambda_c=1e-7, lambda_m=1e-8,
-                      lambda_balance=0.5, lambda_stability=0.1, lambda_design=1e-4)
+                      lambda_balance=0.5, lambda_stability=0.1, lambda_design=1e-4).to(DEVICE)
         
         trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=DEVICE)
         
@@ -81,7 +86,10 @@ def run_benchmark(dataset_name, seeds=3, quick=False):
                 logits = exec_(xb, model)
                 l2 = sum(p.pow(2).sum() for p in model.weights.values()) * 1e-5
                 task_loss = torch.nn.functional.cross_entropy(logits, yb, label_smoothing=0.1)
-                reg = loss(xb, yb, model)['resource_cost']
+                # resource_cost comes from the structure cost term; calling
+                # MetaLoss positionally here (loss(xb, yb, model)) fed raw
+                # inputs as "logits_train" and built a throwaway graph.
+                reg = phi_cost(model.structure, 1e-4, 1e-7, 1e-8).mean()
                 (task_loss + reg + l2).backward()
                 trainer.optimizer.step()
             

@@ -7,6 +7,7 @@
  */
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdio>
 
 #define FPB_THREADS 256
 
@@ -161,6 +162,11 @@ __global__ void fused_post_conv_bwd_kernel(
             smean_dn_n = s_dn_n / count;
         }
     }
+    /* Barrier REQUIRED here: warps <32 are still reading s_partial[] above,
+     * while the next phase (threads 32,64,...) writes dgp/dgr/dlg into the
+     * SAME shared-memory array. Without this sync the read/write race makes
+     * the GN backward means undefined (compute-sanitizer racecheck). */
+    __syncthreads();
 
     /* Reduce scalar param grads using warp shuffles */
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -327,6 +333,9 @@ void fused_post_conv_bwd_launcher(
         dh_conv_out, dh_prev_out, grad_bm_out, grad_lg_out, grad_dm_out,
         B, C, spatial, D, is_layer0
     );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "AML kernel launch error (fused_post_conv_bwd): %s\n", cudaGetErrorString(err));
 }
 
 void maxpool2x2_bwd_launcher(
@@ -497,4 +506,7 @@ void grouped_conv_bwd_launcher(
     grouped_conv_bwd_db_kernel<<<B * C_out, 256, 0, stream>>>(
         dY, db, B, C_out, H, W_
     );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "AML kernel launch error (grouped_conv_bwd): %s\n", cudaGetErrorString(err));
 }

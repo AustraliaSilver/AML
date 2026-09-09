@@ -47,6 +47,7 @@ class MetaTrainer:
                     tau: float = 1.0, epoch_progress: float = 0.0,
                     task_loss_fn: nn.Module = None) -> dict:
         self.generator.train()
+        self.executor.train()
         total_metrics = {"loss": 0.0, "task_loss": 0.0, "resource_cost": 0.0, "acc": 0.0}
         num_batches = 0
         val_iter = iter(val_dataloader) if val_dataloader is not None else None
@@ -58,18 +59,13 @@ class MetaTrainer:
                 x_batch, y_batch = batch
                 task_ids = None
             x_batch = x_batch.to(self.device)
-            if self.generator.training and x_batch.shape[1] == 3072:
-                import torchvision.transforms as transforms
-                self.transform = transforms.Compose([
-                    transforms.RandomHorizontalFlip(),
-                    transforms.Normalize((0.5,), (0.5,))
-                ])
-                import torchvision.transforms.functional as TF
-                import random
+            if self.generator.training and x_batch.dim() == 2 and x_batch.shape[1] == 3072:
+                # Vectorized per-sample hflip from the TORCH RNG so runs stay
+                # reproducible under torch.manual_seed (python's `random` was
+                # left unseeded by most experiment entry points).
                 x_images = x_batch.view(-1, 3, 32, 32)
-                for i in range(x_images.size(0)):
-                    if random.random() < 0.5:
-                        x_images[i] = TF.hflip(x_images[i])
+                flip = torch.rand(x_images.size(0), device=x_images.device) < 0.5
+                x_images = torch.where(flip.view(-1, 1, 1, 1), x_images.flip(-1), x_images)
                 x_batch = x_images.view(-1, 3072)
             y_batch = y_batch.to(self.device)
 
@@ -142,6 +138,8 @@ class MetaTrainer:
                         layer_gates=model.structure.layer_gates.clone(),
                         dim_weights=model.structure.dim_weights.clone(),
                         residual=model.structure.residual.clone(),
+                        dim_masks=model.structure.dim_masks.clone() if model.structure.dim_masks is not None else None,
+                        block_mode=model.structure.block_mode.clone() if model.structure.block_mode is not None else None,
                         input_dim=model.structure.input_dim,
                         output_dim=model.structure.output_dim,
                         max_dim=model.structure.max_dim,
@@ -162,6 +160,8 @@ class MetaTrainer:
             total_metrics["aml_objective"] += metrics.get("aml_objective", 0.0).item()
             num_batches += 1
 
+        if num_batches == 0:
+            return {k: 0.0 for k in dict(total_metrics, aml_objective=0.0)}
         avg = {k: v / num_batches for k, v in total_metrics.items()}
         for k, v in avg.items():
             self.history.setdefault(k, []).append(v)
@@ -242,39 +242,54 @@ class MetaTrainer:
             self.executor.train(exe_was)
 
     def generate_architecture(self, x: torch.Tensor) -> dict:
+        gen_was = self.generator.training
         self.generator.eval()
-        with torch.no_grad():
-            model = self.generator(x.to(self.device))
-            S = model.structure
-            L_mean = S.num_layers.mean().item()
-            D_mean = S.hidden_dim.mean().item()
-            P_eff = S.effective_params_formula().mean().item()
-            return {
-                "L": round(L_mean, 1),
-                "D": round(D_mean, 1),
-                "P_eff": int(round(P_eff)),
-            }
+        try:
+            with torch.no_grad():
+                model = self.generator(x.to(self.device))
+                S = model.structure
+                L_mean = S.num_layers.mean().item()
+                D_mean = S.hidden_dim.mean().item()
+                P_eff = S.effective_params_formula().mean().item()
+                return {
+                    "L": round(L_mean, 1),
+                    "D": round(D_mean, 1),
+                    "P_eff": int(round(P_eff)),
+                }
+        finally:
+            # Without this, one eval call between epochs silently leaves the
+            # generator in eval mode and the next train_epoch stops injecting
+            # routing exploration for the rest of training.
+            self.generator.train(gen_was)
 
     def compare_architectures(self, x1: torch.Tensor, x2: torch.Tensor) -> dict:
+        gen_was = self.generator.training
         self.generator.eval()
-        with torch.no_grad():
-            m1 = self.generator(x1.to(self.device))
-            m2 = self.generator(x2.to(self.device))
-            dist = arch_distance(m1, m2)
-            return {
-                "arch1": self.generate_architecture(x1),
-                "arch2": self.generate_architecture(x2),
-                "distance": dist.item(),
-            }
+        try:
+            with torch.no_grad():
+                m1 = self.generator(x1.to(self.device))
+                m2 = self.generator(x2.to(self.device))
+                dist = arch_distance(m1, m2)
+                return {
+                    "arch1": self.generate_architecture(x1),
+                    "arch2": self.generate_architecture(x2),
+                    "distance": dist.item(),
+                }
+        finally:
+            self.generator.train(gen_was)
 
     def prototype_usage(self, x: torch.Tensor) -> dict:
+        gen_was = self.generator.training
         self.generator.eval()
-        with torch.no_grad():
-            model = self.generator(x.to(self.device))
-            pi = torch.softmax(model.pi_logits, dim=-1)
-            assignments = pi.argmax(dim=-1)
-            usage = {}
-            for a in assignments.tolist():
-                usage[a] = usage.get(a, 0) + 1
-            entropy = -(pi.mean(dim=0) * torch.log(pi.mean(dim=0) + 1e-8)).sum().item()
-            return {"usage": usage, "entropy": entropy, "num_prototypes_used": len(usage)}
+        try:
+            with torch.no_grad():
+                model = self.generator(x.to(self.device))
+                pi = torch.softmax(model.pi_logits, dim=-1)
+                assignments = pi.argmax(dim=-1)
+                usage = {}
+                for a in assignments.tolist():
+                    usage[a] = usage.get(a, 0) + 1
+                entropy = -(pi.mean(dim=0) * torch.log(pi.mean(dim=0) + 1e-8)).sum().item()
+                return {"usage": usage, "entropy": entropy, "num_prototypes_used": len(usage)}
+        finally:
+            self.generator.train(gen_was)

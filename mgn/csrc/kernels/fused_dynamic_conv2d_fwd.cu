@@ -15,6 +15,8 @@
 #include "common.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cstdio>
 
 #define TILE_H 16
 #define TILE_W 16
@@ -127,11 +129,19 @@ void tiled_conv_fwd_launcher(
 
     int smem = (C_in * 9 + (TILE_H + 2) * (TILE_W + 2)) * sizeof(float);
 
-    tiled_conv_fwd_kernel<<<grid, block, smem>>>(
+    /* Must launch on the current torch stream: torch streams are created
+     * with cudaStreamNonBlocking, so a null-stream launch has NO ordering
+     * guarantee against them (races under torch.cuda.stream() / CUDA-graph
+     * capture in benchmark_pipeline.py). */
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    tiled_conv_fwd_kernel<<<grid, block, smem, stream>>>(
         W,
         reinterpret_cast<const __nv_bfloat16*>(X),
         bias,
         reinterpret_cast<__nv_bfloat16*>(Y),
         C_in, C_out, H, W_
     );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "AML kernel launch error (tiled_conv_fwd): %s\n", cudaGetErrorString(err));
 }

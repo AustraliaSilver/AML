@@ -370,6 +370,21 @@ class ProtoIsolator:
         return s, e
 
     @torch.no_grad()
+    def mask_grad(self):
+        """Zero the .grad of every frozen row BEFORE the optimizer step.
+        Without this, gradients flow into frozen rows every step (pi-mixing
+        touches all rows), so Adam momentum/variance accumulate behind the
+        per-step restore() and silently prime the optimizer to move a row
+        far more than intended the moment it is exposed."""
+        g = self.p.grad
+        if g is None:
+            return
+        if self.frozen_hi > 0:
+            g[:self.frozen_hi] = 0
+        if self.future_lo < self.K:
+            g[self.future_lo:] = 0
+
+    @torch.no_grad()
     def restore(self):
         if self.snapshot is None:
             return
@@ -417,6 +432,8 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
             if not torch.isfinite(loss):
                 continue
             loss.backward()
+            if isolator is not None:
+                isolator.mask_grad()
             torch.nn.utils.clip_grad_norm_(other_params, 5.0)
             opt.step()
             if dom_head is not None:
@@ -467,20 +484,26 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
         w_pi = 0.0 if epoch < epochs // 2 else w_pi_final
         t0, tot_loss = time.time(), 0.0
 
-        for inputs, targets in trainloader:
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+        for new_x, new_y in trainloader:
+            new_x = new_x.to(device, non_blocking=True)
+            new_y = new_y.to(device, non_blocking=True)
 
-            # Replay mixing: append replay exemplars ON TOP of most of the
-            # new batch (keeps ~62% new-data rate vs 50% with replacement),
-            # total batch stays 128 -> unchanged VRAM.
+            # Split NEW data: first half (+ replay) updates weights, second
+            # half supervises ONLY the architecture step. Feeding the weight
+            # update the same samples the arch step "validates" on double
+            # counts the data and contaminates the DARTS bi-level signal.
+            n_v = new_x.size(0) // 2
+            x_a, y_a = new_x[n_v:], new_y[n_v:]
+            inputs, targets = new_x[:n_v], new_y[:n_v]
+
+            # Replay mixing: exemplars are appended to the WEIGHT half so
+            # anti-forgetting supervision never leaks into the arch signal.
             re_t = None
             if replay is not None and len(replay) > 0:
-                n_re = min(48, inputs.size(0) // 2, len(replay))
+                n_re = min(48, inputs.size(0), len(replay))
                 re_x, re_y, re_t = replay.sample(n_re, device)
-                keep = inputs.size(0) - n_re
-                inputs = torch.cat([inputs[:keep], re_x])
-                targets = torch.cat([targets[:keep], re_y])
+                inputs = torch.cat([inputs, re_x])
+                targets = torch.cat([targets, re_y])
 
             opt.zero_grad(set_to_none=True)
             opt_arch.zero_grad(set_to_none=True)
@@ -520,22 +543,25 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
+                if isolator is not None:
+                    isolator.mask_grad()
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
                 scaler.step(opt)
                 scaler.update()
             else:
                 loss.backward()
+                if isolator is not None:
+                    isolator.mask_grad()
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
                 opt.step()
             if isolator is not None:
                 isolator.restore()
 
             if not freeze:
-                n_v = inputs.size(0) // 2
                 opt_arch.zero_grad(set_to_none=True)
                 with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
-                    out_v, _, _, _ = model(inputs[n_v:], tau=0.8)
-                    loss_a = ce(out_v, targets[n_v:])
+                    out_v, _, _, _ = model(x_a, tau=0.8)
+                    loss_a = ce(out_v, y_a)
                 if torch.isfinite(loss_a):
                     if scaler is not None:
                         scaler.scale(loss_a).backward()

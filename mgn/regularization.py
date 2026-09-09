@@ -28,8 +28,12 @@ def structure_distance(s1: ModelStructure, s2: ModelStructure) -> torch.Tensor:
     gate_dist = 0.0
     g1 = s1.layer_gates
     g2 = s2.layer_gates
-    if g1.dim() == 2 and g2.dim() == 2 and g1.shape[0] == 1 and g2.shape[0] == 1:
-        gate_dist = F.mse_loss(g1, g2, reduction="sum")
+    if g1.dim() == 2 and g2.dim() == 2:
+        # The old `shape[0] == 1 for both` condition meant the per-layer gate
+        # term never fired for batched training (the usual case). Compare the
+        # overlapping rows instead.
+        n = min(g1.shape[0], g2.shape[0])
+        gate_dist = F.mse_loss(g1[:n], g2[:n], reduction="mean")
 
     return L_diff + D_diff + gate_dist
 

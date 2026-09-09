@@ -255,7 +255,13 @@ class ConvAML_CIFAR(nn.Module):
 
     def forward(self, x):
         model = self.gen(x)
-        pi_aml = F.gumbel_softmax(model.pi_logits, tau=1.0, hard=False)
+        if self.training:
+            pi_aml = F.gumbel_softmax(model.pi_logits, tau=1.0, hard=False)
+        else:
+            # Deterministic routing at eval: Gumbel noise ignores module.eval()
+            # and otherwise makes repeated test evaluations disagree (same seed,
+            # different draw order) -- mirrors the fix in mgn/generator.py.
+            pi_aml = F.softmax(model.pi_logits, dim=-1)
 
         z = self.gen._cached_z
         pi_hts = F.softmax(self.hts_router(z), dim=-1)
@@ -303,8 +309,17 @@ def train_cifar():
 
     data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
     print(f"Loading CIFAR10 from {os.path.abspath(data_root)}...", flush=True)
-    trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_train)
+    train_full = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_train)
+    train_clean = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_test)
+
+    # Held-out validation split: model selection must not read the test set.
+    n_val = 5000
+    perm = torch.randperm(len(train_full), generator=torch.Generator().manual_seed(42))
+    tr_idx, va_idx = perm[:-n_val].tolist(), perm[-n_val:].tolist()
+    trainset = torch.utils.data.Subset(train_full, tr_idx)
+    valset = torch.utils.data.Subset(train_clean, va_idx)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True, drop_last=True)
+    valloader = torch.utils.data.DataLoader(valset, batch_size=256, shuffle=False, num_workers=1, pin_memory=True, persistent_workers=True)
 
     testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=False, transform=transform_test)
     testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=1, pin_memory=True, persistent_workers=True)
@@ -327,7 +342,20 @@ def train_cifar():
 
     criterion = nn.CrossEntropyLoss()
 
-    best_acc = 0.0
+    best_val = 0.0
+    best_state = None
+    ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aml_core_best.pth")
+
+    def run_eval(loader, n_total):
+        correct = 0
+        with torch.no_grad():
+            for inputs, labels in loader:
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    outputs, _ = model(inputs)
+                correct += outputs.argmax(1).eq(labels).sum().item()
+        return 100. * correct / n_total
 
     for epoch in range(epochs):
         model.train()
@@ -370,31 +398,24 @@ def train_cifar():
         train_acc = 100. * correct / total
 
         model.eval()
-        test_correct = 0
-        test_total = 0
-        with torch.no_grad():
-            for inputs, labels in testloader:
-                inputs = inputs.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    outputs, _ = model(inputs)
-                _, predicted = outputs.max(1)
-                test_total += labels.size(0)
-                test_correct += predicted.eq(labels).sum().item()
-
-        test_acc = 100. * test_correct / test_total
-        if test_acc > best_acc:
-            best_acc = test_acc
-            torch.save(model.state_dict(), "aml_core_best.pth")
+        val_acc = run_eval(valloader, len(valset))
+        test_acc = run_eval(testloader, len(testset))
+        if val_acc > best_val:
+            best_val = val_acc
+            best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+            torch.save(model.state_dict(), ckpt_path)
 
         mem_gate = torch.sigmoid(model.memory_gate).item()
         mem_norm = model.hts_memory.norm().item()
-        print(f"Epoch [{epoch+1:02d}/{epochs}] | {epoch_time:.1f}s ({total/epoch_time:.0f} img/s) | Loss: {total_loss/len(trainloader):.4f} | Train: {train_acc:.2f}% | Test: {test_acc:.2f}% | MemGate: {mem_gate:.3f} | MemNorm: {mem_norm:.4f}", flush=True)
+        print(f"Epoch [{epoch+1:02d}/{epochs}] | {epoch_time:.1f}s ({total/epoch_time:.0f} img/s) | Loss: {total_loss/len(trainloader):.4f} | Train: {train_acc:.2f}% | Val: {val_acc:.2f}% | Test: {test_acc:.2f}% | MemGate: {mem_gate:.3f} | MemNorm: {mem_norm:.4f}", flush=True)
 
         scheduler_gen.step()
         scheduler_hts.step()
 
-    print(f"=== BEST ACCURACY: {best_acc:.2f}% ===")
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    final_test = run_eval(testloader, len(testset))
+    print(f"=== BEST VAL ACCURACY: {best_val:.2f}% | Test acc of best-val model: {final_test:.2f}% ===")
 
 if __name__ == "__main__":
     train_cifar()

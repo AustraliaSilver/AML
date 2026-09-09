@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import torch
+import torch.nn.functional as F
 
 
 @dataclass
@@ -117,13 +118,21 @@ def project_architecture(S: ModelStructure, P_max: float):
     if not mask.any():
         return S
     scale = torch.sqrt(P_max / (P + 1e-8))
-    D_proj = D * scale.clamp(max=1.0)
+    D_sq = D.squeeze(-1) if D.dim() > 1 else D
+    D_proj = D_sq * scale.clamp(max=1.0)
     L_proj = L * scale.clamp(max=1.0)
-    d_choices = torch.tensor(S.dim_choices, device=D.device, dtype=torch.float32)
-    D_idx = (d_choices.unsqueeze(0) - D_proj.unsqueeze(1)).abs().argmin(dim=-1)
-    D_onehot = torch.zeros_like(S.dim_weights)
-    D_onehot.scatter_(1, D_idx.unsqueeze(1), 1.0)
-    S.dim_weights = torch.where(mask.unsqueeze(1), D_onehot, S.dim_weights)
+    keep = (~mask).reshape(-1, *([1] * (S.dim_weights.dim() - 1)))
+    if S.dim_weights.dim() == 3 and S.dim_weights.shape[-1] == 1:
+        # Continuous mode: dim_weights stores WIDTH FRACTIONS [B, L, 1].
+        # (The old code scattered a discrete one-hot of shape [B, nd] into
+        # this [B, L, 1] tensor -> shape error / silent wrong broadcast.)
+        D_new = (D_proj / S.max_dim).reshape(S.dim_weights.shape)
+    else:
+        d_choices = torch.tensor(S.dim_choices, device=D.device, dtype=torch.float32)
+        D_idx = (d_choices.unsqueeze(0) - D_proj.unsqueeze(1)).abs().argmin(dim=-1)
+        D_onehot = F.one_hot(D_idx, num_samples=len(S.dim_choices)).to(S.dim_weights.dtype)
+        D_new = D_onehot.unsqueeze(1).expand_as(S.dim_weights)
+    S.dim_weights = torch.where(keep, S.dim_weights, D_new)
     return S
 
 

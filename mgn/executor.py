@@ -24,14 +24,13 @@ class TaskNetwork(nn.Module):
         dim_mask_soft = torch.sigmoid((D_eff.unsqueeze(1) - arange.unsqueeze(0)) / 0.5)
         dim_mask = (dim_mask_soft > 0.5).float().detach() + dim_mask_soft - dim_mask_soft.detach()
 
-        L_probs = S.layer_gates
-        if self.training:
-            each_layer = F.gumbel_softmax(L_probs, tau=0.5, hard=False, dim=-1)
-        else:
-            # Deterministic soft routing at eval time (Gumbel noise would
-            # otherwise perturb predictions regardless of module.eval()).
-            each_layer = F.softmax(L_probs / 0.5, dim=-1)
-        each_layer_hard = (each_layer > 0.5).float().detach() + each_layer - each_layer.detach()
+        # Depth gates are INDEPENDENT per-layer Bernoulli gates, already
+        # straight-through hardened at generation time (generator.py). The
+        # previous F.gumbel_softmax(L_probs, dim=-1) normalized ACROSS the
+        # layer dimension, turning them into a winner-take-all categorical
+        # (≈1 active layer in train, often 0 at eval). Use them directly,
+        # exactly like the conv branch below.
+        each_layer_hard = S.layer_gates
 
         if getattr(S, "use_conv", False) or "c1.weight" in W:
             in_ch = getattr(S, "in_channels", 1)
@@ -149,7 +148,11 @@ class TaskNetwork(nn.Module):
 
                 gate = each_layer_hard[:, i:i+1]
 
-                h_new = torch.bmm(h.unsqueeze(1), w).squeeze(1) + b
+                # fc weights are stored [B, out, in] (generator view), so the
+                # bmm must transpose: [B,1,in] x [B,in,out]. The old
+                # h.unsqueeze(1) @ w only worked when h_dim == out_dim, i.e.
+                # input_dim == max_dim.
+                h_new = torch.bmm(h.unsqueeze(1), w.transpose(1, 2)).squeeze(1) + b
 
                 if i == 0:
                     h = h_new

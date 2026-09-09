@@ -18,6 +18,8 @@
 #include "common.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cstdio>
 
 #define IG_TILE_OC 16
 #define IG_TILE_S  8
@@ -138,6 +140,11 @@ void implicit_gemm_fwd_launcher(
 
     int smem = ((IG_TILE_S+2)*(IG_TILE_S+2) + IG_TILE_OC*9) * sizeof(float);
 
-    implicit_gemm_conv3x3_fwd_kernel<<<grid, block, smem>>>(
+    /* Current-torch-stream launch + error surface (see tiled_conv_fwd). */
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    implicit_gemm_conv3x3_fwd_kernel<<<grid, block, smem, stream>>>(
         W, (const __nv_bfloat16*)X_bf16, bias, (__nv_bfloat16*)Y_bf16, C_in, C_out, H, W_);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "AML kernel launch error (implicit_gemm_fwd): %s\n", cudaGetErrorString(err));
 }

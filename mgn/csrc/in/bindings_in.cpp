@@ -160,7 +160,9 @@ torch::Tensor in_maxpool2x2_bwd(
     torch::Tensor dh_out, torch::Tensor h_in,
     int B, int C, int H, int W_
 ) {
-    auto dh_in = torch::empty_like(h_in);
+    /* zeros_like: with odd H/W the edge row/column is covered by no pooling
+     * window; with empty_like it would keep uninitialized memory. */
+    auto dh_in = torch::zeros_like(h_in);
     in_maxpool2x2_bwd_launcher(
         dh_out.data_ptr<float>(), h_in.data_ptr<float>(), dh_in.data_ptr<float>(),
         B, C, H, W_

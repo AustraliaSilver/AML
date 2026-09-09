@@ -56,6 +56,11 @@ torch::Tensor conv_fwd(
     torch::Tensor W, torch::Tensor X, torch::Tensor bias
 ) {
     TORCH_CHECK(W.is_cuda() && X.is_cuda() && bias.is_cuda(), "All inputs must be CUDA");
+    /* The kernels type-pun X/Y pointers as bf16 and W/bias as fp32.
+     * An fp32 X used to be silently reinterpreted -> type-punned garbage. */
+    TORCH_CHECK(W.scalar_type() == torch::kFloat32, "conv_fwd: W must be float32");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "conv_fwd: bias must be float32");
+    if (X.scalar_type() != torch::kBFloat16) X = X.to(torch::kBFloat16);
     TORCH_CHECK(W.is_contiguous() && X.is_contiguous() && bias.is_contiguous(),
                 "All inputs must be contiguous");
 
@@ -76,6 +81,10 @@ std::vector<torch::Tensor> conv_bwd(
     torch::Tensor grad_Y, torch::Tensor W, torch::Tensor X
 ) {
     TORCH_CHECK(grad_Y.is_cuda() && W.is_cuda() && X.is_cuda());
+    TORCH_CHECK(W.scalar_type() == torch::kFloat32, "conv_bwd: W must be float32");
+    if (grad_Y.scalar_type() != torch::kBFloat16) grad_Y = grad_Y.to(torch::kBFloat16);
+    if (X.scalar_type() != torch::kBFloat16) X = X.to(torch::kBFloat16);
+    grad_Y = grad_Y.contiguous(); X = X.contiguous(); W = W.contiguous();
     int B = grad_Y.size(0), C_out = grad_Y.size(1), H = grad_Y.size(2), W_ = grad_Y.size(3), C_in = X.size(1);
     auto grad_X = torch::zeros({B, C_in, H, W_}, W.options());
     auto grad_W = torch::zeros({B, C_out, C_in * 9}, W.options());
@@ -324,7 +333,12 @@ torch::Tensor maxpool2x2_bwd(
     torch::Tensor dh_out, torch::Tensor h_in,
     int B, int C, int H, int W_
 ) {
-    auto dh_in = torch::empty_like(h_in);
+    /* zeros_like (not empty_like): the kernel only writes positions that fall
+     * inside a complete 2x2 window, so with odd H/W the last row/column would
+     * otherwise keep uninitialized memory and pollute the upstream gradient. */
+    auto dh_in = torch::zeros_like(h_in);
+    dh_out = dh_out.contiguous();
+    h_in = h_in.contiguous();
     maxpool2x2_bwd_launcher(
         dh_out.data_ptr<float>(), h_in.data_ptr<float>(), dh_in.data_ptr<float>(),
         B, C, H, W_
@@ -390,10 +404,13 @@ std::vector<torch::Tensor> fused_backward_full(
             grad = maxpool2x2_bwd(grad, h_post_2, B, C_out, h_dim, w_dim);
         }
 
-        /* Post-conv backward */
-        auto grad_bm_i = grad_block_mode.select(1, i).narrow(1, 0, 2);
-        auto grad_lg_i = grad_layer_gates.select(1, i);
-        auto grad_dm_i = grad_dim_masks.select(1, i);
+        /* Accumulate per-layer grads through CONTIGUOUS scratch buffers.
+         * The previous version handed select()/narrow() views (non-contiguous
+         * row strides) directly to kernels that index linearly for packed
+         * [B,2]/[B]/[B,D] layouts, so the writes landed in wrong memory. */
+        auto grad_bm_i = torch::zeros({B, 2}, grad_output.options());
+        auto grad_lg_i = torch::zeros({B}, grad_output.options());
+        auto grad_dm_i = torch::zeros({B, max_dim}, grad_output.options());
 
         auto bwd = fused_post_conv_bwd(
             grad.contiguous(), saved_h_conv[i], hp,
@@ -401,6 +418,9 @@ std::vector<torch::Tensor> fused_backward_full(
             grad_bm_i, grad_lg_i, grad_dm_i,
             B, C_out, h_dim * w_dim, max_dim, (i == 0) ? 1 : 0
         );
+        grad_block_mode.select(1, i).narrow(1, 0, 2).add_(grad_bm_i);
+        grad_layer_gates.select(1, i).add_(grad_lg_i);
+        grad_dim_masks.select(1, i).add_(grad_dm_i);
         auto dh_conv = bwd[0];
         auto dh_skip = bwd[1];
 

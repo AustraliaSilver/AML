@@ -112,7 +112,13 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
             block_mode = block_mode.to(device=device, dtype=torch.float32)
         else:
             layer_gates = (layer_soft > 0.5).float().detach() + layer_soft - layer_soft.detach()
-            block_mode = F.gumbel_softmax(bm_logits, tau=tau, hard=True, dim=-1)
+            if self.training:
+                block_mode = F.gumbel_softmax(bm_logits, tau=tau, hard=True, dim=-1)
+            else:
+                # Deterministic argmax mode at eval: Gumbel sampling does not
+                # respect module.eval(), so leaving it on makes test accuracy
+                # depend on RNG draw order (two runs of the same seed disagree).
+                block_mode = F.one_hot(bm_logits.argmax(dim=-1), 2).float()
 
         dim_weights = d_lengths / self.max_dim
 
@@ -154,7 +160,8 @@ def set_seed(seed=42):
 def get_args():
     import argparse
     parser = argparse.ArgumentParser(description="True AML Dynamic Architecture Training")
-    parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10'])
+    parser.add_argument('--dataset', type=str, default='cifar10',
+                        choices=['cifar10', 'mnist', 'fashion'])
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -166,6 +173,40 @@ def get_args():
     parser.add_argument('--workers', type=int, default=3)
     parser.add_argument('--out', type=str, default='aml_core_best.pth')
     return parser.parse_args()
+
+@torch.no_grad()
+def eval_structure(model, loader, n_total, use_amp, amp_dtype, diag=True):
+    """Deterministic eval pass; returns (acc, diagnostics dict). Used for
+    BOTH validation-based model selection and test reporting."""
+    device = next(model.parameters()).device
+    model.eval()
+    correct, eff_params_sum = 0, 0
+    bm_sums = torch.zeros(model.max_layers, 2, device=device)
+    pi_ent_sum, pi_ent_n = 0.0, 0
+    gate_soft_list = []
+    for inputs, targets in loader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+            outputs, struct, pi_eval, diag_eval = model(inputs, tau=0.1)
+        correct += (outputs.argmax(-1) == targets).sum().item()
+        if diag:
+            eff_params_sum += struct.effective_params_formula().sum().item()
+            bm_sums += struct.block_mode.sum(dim=0)
+            pi_f = pi_eval.float()
+            pi_ent_sum += -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).sum().item()
+            pi_ent_n += pi_f.shape[0]
+            gate_soft_list.append(diag_eval["layer_soft"].float())
+    m = {"eff": eff_params_sum / max(n_total, 1),
+         "pi_H": pi_ent_sum / max(pi_ent_n, 1),
+         "gate_std": torch.cat(gate_soft_list, dim=0).std(0).mean().item() if gate_soft_list else 0.0,
+         "bm_str": ""}
+    if diag:
+        bm_avg = bm_sums / max(n_total, 1)
+        m["bm_str"] = " | ".join(
+            f"L{i+1}:{bm_avg[i, 0] * 100:4.0f}/{bm_avg[i, 1] * 100:4.0f}"
+            for i in range(model.max_layers))
+    return correct / max(n_total, 1), m
 
 def main():
     args = get_args()
@@ -181,26 +222,61 @@ def main():
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler('cuda') if (use_amp and amp_dtype == torch.float16) else None
 
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-
+    # All datasets are consumed as 3x32x32 (grayscale replicated + resized),
+    # matching the prototype layout (first-layer in_channels=3) and the
+    # convention used by train_continual_aml.py.
     data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
     if args.dataset == 'cifar10':
-        trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform_train)
-        testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
+        tf_clean = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        tf_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            tf_clean.transforms[0],
+            tf_clean.transforms[1],
+        ])
+        train_full = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=tf_train)
+        train_clean = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=tf_clean)
+        testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=tf_clean)
+    else:
+        if args.dataset == 'mnist':
+            mean, std, cls = (0.1307,) * 3, (0.3081,) * 3, torchvision.datasets.MNIST
+        else:
+            mean, std, cls = (0.2860,) * 3, (0.3530,) * 3, torchvision.datasets.FashionMNIST
+        tf_clean = transforms.Compose([
+            transforms.Grayscale(num_output_channels=3),
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        aug_ops = [transforms.Grayscale(num_output_channels=3),
+                   transforms.Resize((32, 32)),
+                   transforms.RandomCrop(32, padding=2)]
+        if args.dataset == 'fashion':
+            aug_ops.append(transforms.RandomHorizontalFlip())
+        tf_train = transforms.Compose(aug_ops + [transforms.ToTensor(), transforms.Normalize(mean, std)])
+        train_full = cls(root=data_root, train=True, download=True, transform=tf_train)
+        train_clean = cls(root=data_root, train=True, download=False, transform=tf_clean)
+        testset = cls(root=data_root, train=False, download=True, transform=tf_clean)
+
+    # HELD-OUT VALIDATION SPLIT (never used for weight updates) -- model
+    # selection must not read the test set, otherwise every early-stopped
+    # "best acc" number is optimistically biased.
+    n_val = min(5000, len(train_full) // 10)
+    perm = torch.randperm(len(train_full), generator=torch.Generator().manual_seed(args.seed))
+    tr_idx, va_idx = perm[:-n_val].tolist(), perm[-n_val:].tolist()
+    trainset = torch.utils.data.Subset(train_full, tr_idx)
+    valset = torch.utils.data.Subset(train_clean, va_idx)
 
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0,
         drop_last=True, prefetch_factor=4 if args.workers > 0 else None)
+    valloader = torch.utils.data.DataLoader(
+        valset, batch_size=max(args.batch_size, 256), shuffle=False,
+        num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
     testloader = torch.utils.data.DataLoader(
         testset, batch_size=max(args.batch_size, 256), shuffle=False,
         num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
@@ -221,14 +297,15 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scheduler_arch = optim.lr_scheduler.CosineAnnealingLR(optimizer_arch, T_max=args.epochs)
 
-    print(f"========== TRAINING {args.max_layers}-LAYER TRUE AML DYNAMIC ==========")
+    print(f"========== TRAINING {args.max_layers}-LAYER TRUE AML DYNAMIC on {args.dataset} ==========")
     meta_loss_fn = MetaLoss(
         lambda_eff=0.0,
         lambda_p=0.0,
         p_allowance=args.p_allowance
     ).to(device)
 
-    best_acc = 0.0
+    best_val = 0.0
+    best_state = None
     for epoch in range(args.epochs):
         model.train()
         total_loss, total_eff = 0, 0
@@ -285,15 +362,19 @@ def main():
             optimizer_arch.zero_grad(set_to_none=True)
 
             # Second half of the batch is held out as the validation signal
-            # for the architecture step below.
+            # for the architecture step below. The weight step sees ONLY the
+            # first half: reusing the full batch and then "validating" on a
+            # subset of it double-counts the same samples and contaminates
+            # the DARTS bi-level approximation.
             n_v = inputs.size(0) // 2
+            x_w, y_w = inputs[:n_v], targets[:n_v]
 
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                outputs, struct, pi, diag = model(inputs, tau=tau)
+                outputs, struct, pi, diag = model(x_w, tau=tau)
                 gen_model = GeneratedModel(structure=struct, weights={}, pi_logits=pi)
 
                 loss_dict = meta_loss_fn(
-                    logits_train=outputs.float(), targets_train=targets,
+                    logits_train=outputs.float(), targets_train=y_w,
                     logits_val=None, targets_val=None,
                     model=gen_model, epoch_progress=epoch/args.epochs
                 )
@@ -361,50 +442,33 @@ def main():
                         torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
                         optimizer_arch.step()
 
-            total_loss += loss_dict["task_loss"].item() * inputs.size(0)
-            total_eff += loss_dict.get("efficiency_cost", torch.tensor(0.0)).item() * inputs.size(0)
+            total_loss += loss_dict["task_loss"].item() * x_w.size(0)
+            total_eff += loss_dict.get("efficiency_cost", torch.tensor(0.0)).item() * x_w.size(0)
 
         scheduler.step()
         scheduler_arch.step()
-        train_loss = total_loss / len(trainset)
+        train_loss = total_loss / max(len(trainset), 1)
 
-        model.eval()
-        correct, eff_params_sum = 0, 0
-        bm_sums = torch.zeros(model.max_layers, 2, device=device) # [max_layers, 2]
-        pi_ent_sum, pi_ent_n = 0.0, 0
-        gate_soft_list = []
-        with torch.no_grad():
-            for inputs, targets in testloader:
-                inputs = inputs.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-                with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    outputs, struct, pi_eval, diag_eval = model(inputs, tau=0.1)
-                correct += (outputs.argmax(-1) == targets).sum().item()
-                eff_params_sum += struct.effective_params_formula().sum().item()
-                bm_sums += struct.block_mode.sum(dim=0)
-                pi_f = pi_eval.float()
-                pi_ent_sum += -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).sum().item()
-                pi_ent_n += pi_f.shape[0]
-                gate_soft_list.append(diag_eval["layer_soft"].float())
+        val_acc, vm = eval_structure(model, valloader, len(valset), use_amp, amp_dtype)
+        test_acc, _ = eval_structure(model, testloader, len(testset), use_amp, amp_dtype, diag=False)
 
-        test_acc = correct / len(testset)
-        avg_eff_params = eff_params_sum / len(testset)
-        pi_H = pi_ent_sum / max(pi_ent_n, 1)
-        gate_std = torch.cat(gate_soft_list, dim=0).std(0).mean().item()
-
-        if test_acc > best_acc:
-            best_acc = test_acc
+        # Model selection on the VALIDATION split only (see split note above).
+        if val_acc > best_val:
+            best_val = val_acc
+            best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
             torch.save(model.state_dict(), args.out)
-            print(f"  [*] Saved new best model to {args.out} (Acc: {test_acc*100:.2f}%)")
+            print(f"  [*] Saved new best model to {args.out} (Val Acc: {val_acc*100:.2f}%)")
 
-        print(f"Epoch {epoch+1:2d}/{args.epochs} | {time.time()-t0:5.1f}s | Task Loss: {train_loss:.4f} | Test Acc: {test_acc*100:.2f}% | Avg Used Params: {avg_eff_params/1e6:.2f}M | pi_H: {pi_H:.3f}/{math.log(args.K):.3f} | gate_std: {gate_std:.4f} | Tau: {tau:.1f}")
+        print(f"Epoch {epoch+1:2d}/{args.epochs} | {time.time()-t0:5.1f}s | Task Loss: {train_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Test Acc: {test_acc*100:.2f}% | Avg Used Params: {vm['eff']/1e6:.2f}M | pi_H: {vm['pi_H']:.3f}/{math.log(args.K):.3f} | gate_std: {vm['gate_std']:.4f} | Tau: {tau:.1f}")
+        print(f"  -> Plain/ResNet% per layer: {vm['bm_str']}")
 
-        bm_avg = bm_sums / len(testset)
-        dist_str = " | ".join(
-            f"L{i+1}:{bm_avg[i,0]*100:4.0f}/{bm_avg[i,1]*100:4.0f}"
-            for i in range(model.max_layers)
-        )
-        print(f"  -> Plain/ResNet% per layer: {dist_str}")
+    # ---- Report the final TEST accuracy of the best-validation model ----
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    best_test_acc, bvm = eval_structure(model, testloader, len(testset), use_amp, amp_dtype)
+    print(f"\n========== FINAL: Best Val: {best_val*100:.2f}% | Test acc of best-val model: {best_test_acc*100:.2f}% | "
+          f"Avg Used Params: {bvm['eff']/1e6:.2f}M | gate_std: {bvm['gate_std']:.4f} ==========")
+    print(f"  -> Plain/ResNet% per layer: {bvm['bm_str']}")
 
 if __name__ == '__main__':
     main()

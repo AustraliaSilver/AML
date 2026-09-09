@@ -18,6 +18,7 @@
  */
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdio>
 
 #define INB_THREADS 256
 
@@ -160,6 +161,10 @@ __global__ void in_fused_post_conv_bwd_kernel(
             s_mdnn = b2 / count;
         }
     }
+    /* Barrier REQUIRED here: warps <32 are still reading s_red[] above while
+     * the next reduce phase writes dgp/dgr/dlg into the SAME shared array,
+     * which would race (undefined GN/IN backward means). */
+    __syncthreads();
 
     /* reduce scalars (dgp, dgr, dlg) */
     #pragma unroll

@@ -6,6 +6,8 @@
 #include "common.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cstdio>
 
 #define BWD_NTHREADS 256
 #define BTILE 16
@@ -193,6 +195,10 @@ void tiled_conv_bwd_launcher(
 ) {
     auto gY = reinterpret_cast<const __nv_bfloat16*>(grad_Y_f);
     auto X_ = reinterpret_cast<const __nv_bfloat16*>(X_f);
+    /* Launch on the CURRENT torch stream (non-blocking streams have no
+     * implicit ordering with the null stream) and surface launch failures
+     * instead of silently producing stale buffers. */
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     /* 1. grad_X */
     {
@@ -202,7 +208,7 @@ void tiled_conv_bwd_launcher(
         dim3 grid(B, C_in, num_tiles);
         dim3 block(BBLOCK);
         int smem = (9 + (BTILE + 2) * (BTILE + 2)) * sizeof(float);
-        bwd_input_kernel<<<grid, block, smem>>>(
+        bwd_input_kernel<<<grid, block, smem, stream>>>(
             gY, W, grad_X, C_in, C_out, H, W_);
     }
 
@@ -211,7 +217,7 @@ void tiled_conv_bwd_launcher(
         dim3 grid(B, C_out, C_in);
         dim3 block(BWD_NTHREADS);
         int smem = BWD_NTHREADS * sizeof(float);
-        bwd_weight_kernel<<<grid, block, smem>>>(
+        bwd_weight_kernel<<<grid, block, smem, stream>>>(
             gY, X_, grad_W, C_in, C_out, H, W_);
     }
 
@@ -220,7 +226,10 @@ void tiled_conv_bwd_launcher(
         dim3 grid(B, C_out);
         dim3 block(BWD_NTHREADS);
         int smem = BWD_NTHREADS * sizeof(float);
-        bwd_bias_kernel<<<grid, block, smem>>>(
+        bwd_bias_kernel<<<grid, block, smem, stream>>>(
             gY, grad_bias, C_out, H, W_);
     }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "AML kernel launch error (tiled_conv_bwd): %s\n", cudaGetErrorString(err));
 }
