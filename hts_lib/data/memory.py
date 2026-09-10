@@ -5,8 +5,12 @@ from torch.utils.data import Dataset, DataLoader
 class EpisodicMemoryBuffer:
     """
     Episodic Memory Buffer for Continual Learning under strict Memory Budgets.
-    Implements Reservoir Sampling and Balanced Per-Class Exemplar Storage.
-    
+
+    Balanced per-class exemplar storage is used when the source dataset
+    exposes a `.targets` attribute (torchvision datasets do); otherwise the
+    subset is plain uniform random. There is no reservoir/stream API --
+    exemplars are drawn from the full in-memory training dataset.
+
     Args:
         max_total_samples: Maximum number of total samples across all past tasks (e.g. 500, 1000, 2000).
         per_task_budget: Optional fixed budget per task. If None, budget is equally partitioned across tasks.
@@ -19,14 +23,25 @@ class EpisodicMemoryBuffer:
     def update_with_dataset(self, task_name, dataset, num_samples=None):
         """
         Populates exemplar memory for `task_name` from a full training dataset.
-        Samples randomly or up to allocated budget.
+        Class-balanced when `dataset.targets` exists, random otherwise.
         """
         budget = num_samples or self.per_task_budget or (self.max_total_samples // (len(self.task_memories) + 1))
-        
-        # Extract subset of exemplars
-        indices = list(range(len(dataset)))
-        random.shuffle(indices)
-        selected_idx = indices[:budget]
+
+        targets = getattr(dataset, "targets", None)
+        if targets is not None:
+            # torch RNG keeps this reproducible under set_seed()
+            t = torch.as_tensor(list(targets))
+            quota = max(budget // int(t.max().item()) + 1, 1)
+            selected_idx = []
+            for c in torch.unique(t):
+                cls_idx = (t == c).nonzero(as_tuple=True)[0]
+                keep = cls_idx[torch.randperm(len(cls_idx))[:quota]]
+                selected_idx.extend(keep.tolist())
+            selected_idx = selected_idx[:budget]
+        else:
+            indices = list(range(len(dataset)))
+            random.shuffle(indices)
+            selected_idx = indices[:budget]
         
         exemplar_data = []
         exemplar_targets = []

@@ -10,15 +10,15 @@ Compares 4 architectural baselines under identical budget and data protocols:
 Outputs formal comparison table and Accuracy Matrices.
 """
 
-import time
 import argparse
-import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hts_lib.models.hypernetwork import HtSContinualModel
 from hts_lib.models.losses import compute_layer_aware_diversity_loss
 from hts_lib.data.loaders import get_continual_dataloaders
+from hts_lib.data.memory import EpisodicMemoryBuffer
 from hts_lib.evaluation.evaluator import ContinualEvaluator
 from hts_lib.utils import set_seed, get_device
 
@@ -77,6 +77,8 @@ def run_academic_benchmark():
     parser.add_argument("--epochs_cifar", type=int, default=10)
     parser.add_argument("--epochs_fashion", type=int, default=8)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--memory-budget", type=int, default=1500,
+                        help="total CLS exemplars held across past tasks (0 disables replay)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -84,7 +86,8 @@ def run_academic_benchmark():
     print(f"=== ACADEMIC BASELINES & ABLATION MATRIX BENCHMARK ({device}) ===")
     print("Setting: Task-Aware Continual Learning (MNIST -> CIFAR-10 -> Fashion-MNIST)\n")
 
-    loaders = get_continual_dataloaders(data_dir='./data', batch_size=128, test_batch_size=256)
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
+    loaders = get_continual_dataloaders(data_dir=data_dir, batch_size=128, test_batch_size=256)
     test_loaders = {
         "mnist": loaders["mnist"]["test"],
         "cifar": loaders["cifar"]["test"],
@@ -102,9 +105,9 @@ def run_academic_benchmark():
     epochs_dict = {"mnist": args.epochs_mnist, "cifar": args.epochs_cifar, "fashion": args.epochs_fashion}
 
     for exp_name, model, is_hts in experiments:
-        print(f"\n=================================================================")
+        print("\n=================================================================")
         print(f"RUNNING: {exp_name}")
-        print(f"=================================================================")
+        print("=================================================================")
         
         criterion = nn.CrossEntropyLoss(label_smoothing=0.03)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=3e-4)
@@ -113,6 +116,10 @@ def run_academic_benchmark():
         
         evaluator = ContinualEvaluator(model, device=device)
         acc_matrix = []
+        # Class-balanced episodic memory under a FIXED budget (CLS standard):
+        # replay draws from stored exemplars, not the full previous train
+        # loaders, so the memory-budget comparison with the AML pipeline holds.
+        memory = EpisodicMemoryBuffer(max_total_samples=max(args.memory_budget, 0))
 
         # Sequence of 3 tasks
         for stage_idx, current_task in enumerate(task_sequence):
@@ -120,8 +127,8 @@ def run_academic_benchmark():
             sch = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ep_count, eta_min=1e-5)
             
             # Setup past replay
-            replay_tasks = task_sequence[:stage_idx]
-            replay_iters = {t: iter(loaders[t]["train"]) for t in replay_tasks}
+            replay_tasks = task_sequence[:stage_idx] if args.memory_budget > 0 else []
+            replay_iters = {t: iter(memory.get_memory_loader(t, batch_size=128)) for t in replay_tasks}
             
             print(f"  [Stage {stage_idx+1}] Training on '{current_task.upper()}' ({ep_count} Epochs) | Replay: {replay_tasks}")
             
@@ -141,12 +148,12 @@ def run_academic_benchmark():
                             l_ent, l_use, l_ort = compute_layer_aware_diversity_loss(alphas, model, K=model.K)
                             loss += 0.015 * l_ent + 0.10 * l_use + 0.05 * l_ort
                             
-                        # Interleaved replay
+                        # Interleaved replay from bounded episodic memory
                         for r_t in replay_tasks:
                             try:
                                 x_r, y_r = next(replay_iters[r_t])
                             except StopIteration:
-                                replay_iters[r_t] = iter(loaders[r_t]["train"])
+                                replay_iters[r_t] = iter(memory.get_memory_loader(r_t, batch_size=128))
                                 x_r, y_r = next(replay_iters[r_t])
                             x_r, y_r = x_r.to(device, non_blocking=True), y_r.to(device, non_blocking=True)
                             
@@ -160,6 +167,10 @@ def run_academic_benchmark():
                         loss.backward()
                         optimizer.step()
                 sch.step()
+
+            # Store this task's exemplars for bounded replay by later tasks.
+            if args.memory_budget > 0:
+                memory.update_with_dataset(current_task, loaders[current_task]["train"].dataset)
 
             # Evaluate on all tasks after this stage
             stage_accs = [

@@ -1,12 +1,24 @@
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 import numpy as np
 from collections import Counter
-import re, os, pickle, itertools
+import re, os, pickle
 
 STATS_DIR = os.path.join(".", "data")
+
+
+def cifar_hflip_flat(x):
+    """MetaTrainer(preprocess_fn=...): 50% per-sample horizontal flip on a
+    flat [B, 3072] CIFAR batch. Uses the TORCH RNG, so set_seed(seed) keeps
+    augmented runs reproducible (the python `random` module used by older
+    entry points was left unseeded)."""
+    if x.dim() == 2 and x.shape[1] == 3072:
+        img = x.reshape(-1, 3, 32, 32)
+        flip = torch.rand(img.size(0), device=img.device) < 0.5
+        img = torch.where(flip.view(-1, 1, 1, 1), img.flip(-1), img)
+        return img.reshape(-1, 3072)
+    return x
 
 
 def _load_or_build_vocab(name, max_features):

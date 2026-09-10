@@ -113,12 +113,14 @@ class ContinualEvaluator:
                 x = x.to(self.device)
                 _, alphas = self.model(x, task=task, tau=0.5)
                 
-                # Weight tensor of deepest block (Stage 3 Block 8)
-                w = self.model.basis_sys.get_kernel('b3', alphas[:, 7]).flatten(1)
+                # Weight tensor of the deepest block (stage 3, last alpha slot)
+                last = self.model.n_blocks - 1
+                w = self.model.basis_sys.get_kernel(self.model.block_kernels[last],
+                                                    alphas[:, last]).flatten(1)
                 w_norm = F.normalize(w, p=2, dim=-1)
                 
                 weights_dict[task] = w_norm
-                alphas_dict[task] = alphas[:, 7].mean(dim=0).cpu().numpy().round(3).tolist()
+                alphas_dict[task] = alphas[:, last].mean(dim=0).cpu().numpy().round(3).tolist()
                 
         metrics = {"router_alphas": alphas_dict}
         tasks = list(task_loaders.keys())
