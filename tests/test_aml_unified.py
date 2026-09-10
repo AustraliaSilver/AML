@@ -5,7 +5,6 @@ from mgn.executor import TaskNetwork
 from mgn.constraints import compute_aml_efficiency, compute_aml_efficiency_torch
 from hts_lib.models.hypernetwork import HtSContinualModel
 from hts_lib.data.memory import EpisodicMemoryBuffer
-from hts_lib.evaluation.evaluator import ContinualEvaluator
 
 class TestAMLUnified(unittest.TestCase):
     def setUp(self):

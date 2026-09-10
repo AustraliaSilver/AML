@@ -12,7 +12,6 @@ Tests:
 """
 
 import unittest
-import numpy as np
 import torch
 from hts_lib.models.hypernetwork import HtSContinualModel
 from hts_lib.models.losses import compute_layer_aware_diversity_loss

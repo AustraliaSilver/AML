@@ -19,9 +19,37 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed by experiments/benchmark_baselines.py
 baselines = ["scikit-learn>=1.0"]
+# Needed by the experiments/ and probes/ benchmark + plotting scripts.
+experiments = [
+    "matplotlib>=3.5",
+    "scipy>=1.8",
+    "scikit-learn>=1.0",
+    "datasets>=2.14",
+]
+dev = ["ruff>=0.5"]
 
 [project.urls]
 Homepage = "https://github.com/AustraliaSilver/AML"
 
 [tool.setuptools.packages.find]
 include = ["mgn*", "hts_lib*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["venv", "build", "data", "experiments_archive", "aml_framework.egg-info"]
+
+[tool.ruff.lint]
+# F = pyflakes (undefined names, unused imports, dead refs -> real defects)
+# E9 = syntax / evaluation errors. Formatting-heavy rules (E501...) and import
+# sorting (I) are intentionally left off to avoid a repo-wide churn commit.
+select = ["F", "E9"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__ re-exports are "unused" in-file by design.
+"__init__.py" = ["F401"]
+# Dev-only benchmark/probe scripts deliberately capture return values for
+# side effects (matplotlib drawing, CUDA timing) without reading them back.
+"probes/*" = ["F841"]
+"mgn/tests/*" = ["F841"]
+"experiments/*" = ["F841"]
