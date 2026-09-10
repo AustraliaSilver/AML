@@ -58,6 +58,12 @@ The AML framework unifies two complementary engines:
 
 ## 3. Results
 
+> These numbers were freshly measured **on the correctness-fixed tree**
+> (`4791131`+): deterministic evaluation, validation-split model selection,
+> CUDA race fixes, and the two-protocol reporting below. Older revisions of
+> this README quoted figures measured with evaluation-time Gumbel noise and
+> test-set selection; treat them as superseded.
+
 Run the continual benchmark yourself:
 
 ```bash
@@ -66,20 +72,30 @@ python train_continual_aml.py --epochs 1,1,1 --consolidate-epochs 1   # quick sm
 ```
 
 Freshly measured on the current tree (RTX 3050 6GB, seed 42, full default schedule,
-~75 min wall-clock):
+~65 min wall-clock):
 
-### Accuracy matrix $A_{i,j}$ (accuracy on task $j$ after training stage $i$)
+### Accuracy matrix $A_{i,j}$ — LIVE weights (standard CL protocol, comparable to ER/EWC/DER literature)
 
 | Training stage ($i$) | MNIST ($j$=1) | CIFAR-10 ($j$=2) | Fashion-MNIST ($j$=3) |
 | :--- | :---: | :---: | :---: |
-| After Stage 1 (MNIST) | **99.32%** | — | — |
-| After Stage 2 (CIFAR-10) | **99.34%** | **74.49%** | — |
-| After Stage 3 (Fashion-MNIST) | **99.34%** | **74.20%** | **90.36%** |
+| After Stage 1 (MNIST) | **99.21%** | — | — |
+| After Stage 2 (CIFAR-10) | 98.53% | **73.70%** | — |
+| After Stage 3 (Fashion-MNIST) | 98.11% | 69.09% | **89.97%** |
 
-**Backward transfer: −0.14% · Average forgetting: 0.15%** — i.e. near-zero
-catastrophic forgetting across the 3-domain sequence. Per-domain structure
-fingerprints confirm the generated architectures genuinely diverge per domain
-(pairwise gate/bmRes L1 divergence 0.7–2.1 rather than ~0).
+**LIVE: BWT −2.86% · average forgetting 2.86%**
+
+### Accuracy matrix $A_{i,j}$ — METHOD (per-domain int8 snapshots + router, incl. test-time retrieval of ambiguous samples)
+
+| Training stage ($i$) | MNIST | CIFAR-10 | Fashion-MNIST |
+| :--- | :---: | :---: | :---: |
+| After Stage 3 | **99.23%** | **73.56%** | **89.98%** |
+
+**METHOD: BWT −0.05% · average forgetting 0.05%** — the gap versus the LIVE
+column (~+4.5pt on CIFAR-10) is the measured contribution of snapshot
+retrieval, reported separately rather than blended into one headline number.
+
+Per-domain structure fingerprints confirm the generated architectures genuinely
+diverge per domain (pairwise gate L1 divergence **1.57–3.29** rather than ~0).
 
 > Note on historical numbers: earlier revisions of this README quoted
 > "BWT = +1.95%" from a specific v14/v15 run whose exact configuration is not
@@ -96,19 +112,19 @@ Vision supernet benchmarks (including static baselines) are recorded in
 ├── train.py                    # Live 18-layer ConvAML_CIFAR_TrueDynamic trainer (bi-level DARTS-style loop)
 ├── train_continual_aml.py      # 3-task continual pipeline (replay + ProtoIsolator + int8 snapshots)
 ├── compare_architectures.py    # Static-vs-dynamic architecture comparison
-├── benchmark_baselines.py      # HtS continual-learning baselines
 ├── quickstart_aml.py           # End-to-end demo: supernet -> extraction -> HtS
 ├── quickstart_hts.py           # Minimal HtS-only demo
 ├── validate_ext_in.py          # Numeric parity checks for the fused CUDA kernels
 ├── build_ext.py                # Rebuilds both CUDA extensions (_C, _Cin) from source
-├── pyproject.toml              # pip install -e .
+├── pyproject.toml              # pip install -e . ; [tool.ruff] lint config
 │
 ├── mgn/                        # AML core library
+│   ├── layout.py               #   CANONICAL flat prototype-weight layout (single source of truth)
 │   ├── generator.py            #   ModelGenerator & PrototypeLibrary (reference impl)
 │   ├── executor.py             #   TaskNetwork executor (reference impl)
-│   ├── constraints.py          #   C-infinity efficiency barrier E_AML, budget projection
+│   ├── constraints.py          #   C-infinity efficiency barrier E_AML
 │   ├── losses.py               #   Unified meta-loss
-│   ├── trainer.py              #   MetaTrainer (bi-level optimization)
+│   ├── trainer.py              #   MetaTrainer (bi-level optimization; injectable preprocess_fn)
 │   ├── evaluator.py            #   Candidate scoring
 │   ├── regularization.py       #   Structural regularizers
 │   ├── architecture.py         #   ModelStructure / GeneratedModel dataclasses
@@ -123,12 +139,13 @@ Vision supernet benchmarks (including static baselines) are recorded in
 │   └── evaluation/             #   A[i,j], BWT, forgetting metrics
 │
 ├── AML_Core_Code/              # Vision pipeline pieces shared with train.py
-│   ├── train_cv_cifar_18.py    #   AcceleratedCVNetwork executor + prototype layout
+│   ├── train_cv_cifar_18.py    #   AcceleratedCVNetwork executor (re-exports mgn.layout)
 │   └── extract_static_model.py #   StaticChildModel extraction engine
 │
 ├── experiments/                # Benchmark scripts + recorded JSON results
+│   └── benchmark_hts_baselines.py  # HtS continual-learning academic baselines
 ├── probes/                     # Ad-hoc causal probes used during development
-├── tests/                      # Unit/integration test suite (CPU-safe)
+├── tests/                      # Unit/integration test suite (CPU-safe; incl. train() smoke)
 ├── paper_and_documents/        # LaTeX paper source + compiled PDF
 └── data/                       # Datasets (gitignored; auto-downloaded by torchvision)
 ```
@@ -146,21 +163,40 @@ python -m unittest discover tests
 python quickstart_aml.py
 ```
 
-Everything above works on CPU out of the box. The fused CUDA kernels are used
-automatically on CUDA machines when built:
+Everything above works on CPU out of the box. The CI runs ruff (`F`+`E9`),
+the CPU-safe unit suite (including an end-to-end `train.main()` smoke run),
+and both quickstarts on Python 3.10/3.12; the CUDA parity check runs only on
+GPU runners. Lint locally with:
 
 ```bash
-# Windows: run from an MSVC Developer Command Prompt (needs cl.exe + nvcc)
+pip install "ruff>=0.5"
+ruff check .                      # config: [tool.ruff] in pyproject.toml
+```
+
+The fused CUDA kernels are used automatically on CUDA machines when built:
+
+```bash
+# Windows: run from an MSVC Developer Command Prompt (needs cl.exe + nvcc):
+#   "C:\Program Files (x86)\Microsoft Visual Studio\...\vcvars64.bat"
 python build_ext.py          # builds both _C and _Cin into mgn/accel/
 
 # Verify kernel numeric parity against eager references (CUDA required)
 python validate_ext_in.py
 ```
 
+> **Verified build toolchain (Windows):** Python 3.12, `torch 2.5.1+cu124`,
+> `nvcc 13.3` (`CUDA 13.3` toolkit), MSVC C/C++ from *Visual Studio Build
+> Tools 18*. The wheels bundle their own cu12 runtime, so a newer host `nvcc`
+> still links correctly; other combinations are unverified. The prebuilt
+> `.pyd`s in `mgn/accel/` are committed, so a plain `pip install -e .` +
+> `python train.py` needs no local CUDA build.
+
 Training:
 
 ```bash
 python train.py                       # vision supernet on CIFAR-10 (fused kernels if available)
+python train.py --dataset mnist       # MNIST / fashion (both mapped to 3x32x32)
+python train.py --steps 4 --epochs 1  # capped sanity run (no full-epoch cost)
 python train_continual_aml.py         # 3-domain continual benchmark
 ```
 
