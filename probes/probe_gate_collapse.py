@@ -46,13 +46,11 @@ Winning config adopted by experiments/benchmark_conv_aml.py:
 Run: python probes/probe_gate_collapse.py [--seeds 2]
 """
 import argparse
-import copy
 import sys
 import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 sys.path.insert(0, ".")

@@ -22,7 +22,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'AML_Core_Code'))
 
 from train import ConvAML_CIFAR_TrueDynamic
-from extract_static_model import extract_child, StaticChildModel
+from extract_static_model import extract_child
 from mgn.constraints import compute_aml_efficiency
 from hts_lib.models.hypernetwork import HtSContinualModel
 

@@ -6,7 +6,7 @@ and inspect parameter statistics.
 """
 
 import torch
-from hts_lib import HtSContinualModel, ContinualEvaluator, get_continual_dataloaders
+from hts_lib import HtSContinualModel
 
 def demo_quickstart():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
@@ -197,7 +196,7 @@ if __name__ == '__main__':
         torch.cuda.empty_cache()
 
     print(f"\n{'='*70}")
-    print(f"  RESULTS (10 epochs, CIFAR-10, batch=128, lr=1e-3, AdamW)")
+    print("  RESULTS (10 epochs, CIFAR-10, batch=128, lr=1e-3, AdamW)")
     print(f"{'='*70}")
     print(f"{'Model':<15} {'Best%':>7} {'Last%':>7} {'Params':>10} {'s/ep':>7} {'img/s':>8} {'VRAM':>8}")
     print(f"{'-'*15} {'-'*7} {'-'*7} {'-'*10} {'-'*7} {'-'*8} {'-'*8}")

@@ -8,7 +8,6 @@ Checks:
 """
 import os, sys
 import torch
-import torch.nn.functional as F
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)

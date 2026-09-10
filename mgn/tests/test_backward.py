@@ -73,17 +73,17 @@ def test_backward_layer_0():
     # Compare grad_X
     gx_diff = (gX_ref - X_cu.grad).abs().max().item()
     print(f"  grad_X:  max_diff={gx_diff:.6e}")
-    assert torch.allclose(gX_ref, X_cu.grad, atol=1e-3), f"grad_X FAILED!"
+    assert torch.allclose(gX_ref, X_cu.grad, atol=1e-3), "grad_X FAILED!"
 
     # Compare grad_pi
     gpi_diff = (gpi_ref - pi_cu.grad).abs().max().item()
     print(f"  grad_pi: max_diff={gpi_diff:.6e}")
-    assert torch.allclose(gpi_ref, pi_cu.grad, atol=1e-3), f"grad_pi FAILED!"
+    assert torch.allclose(gpi_ref, pi_cu.grad, atol=1e-3), "grad_pi FAILED!"
 
     # Compare grad_proto
     gp_diff = (gproto_ref - proto_cu.grad).abs().max().item()
     print(f"  grad_proto: max_diff={gp_diff:.6e}")
-    assert torch.allclose(gproto_ref, proto_cu.grad, atol=1e-3), f"grad_proto FAILED!"
+    assert torch.allclose(gproto_ref, proto_cu.grad, atol=1e-3), "grad_proto FAILED!"
 
     print("  PASSED")
 

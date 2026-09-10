@@ -5,14 +5,12 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
 from mgn import (
     ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer,
-    ModelEvaluator, ResourceBudget, compute_aml_efficiency,
-    compute_aml_efficiency_torch, arch_distance,
+    compute_aml_efficiency,
 )
 from experiments.benchmark_datasets import get_dataset
 from experiments.benchmark_baselines import (
