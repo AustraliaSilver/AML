@@ -17,7 +17,6 @@ Reports:
 
 import os
 import sys
-import math
 import time
 import argparse
 
@@ -32,7 +31,6 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "AML_Core_Code"))
 
 from train import ConvAML_CIFAR_TrueDynamic, set_seed
-from mgn.architecture import GeneratedModel
 
 
 # ----------------------------------------------------------------------
@@ -326,15 +324,6 @@ class ReplayBuffer:
                                            num_workers=0)
 
 
-def window_mask(task_ids, K, num_tasks, device):
-    """Boolean [B,K] mask restricting each sample's routing to its domain's
-    prototype-row window (same rounding as ProtoIsolator ownership)."""
-    ar = torch.arange(K, device=device)
-    lo = torch.round(task_ids.float() * K / num_tasks).long()
-    hi = torch.round((task_ids.float() + 1) * K / num_tasks).long()
-    return (ar.unsqueeze(0) >= lo.unsqueeze(1)) & (ar.unsqueeze(0) < hi.unsqueeze(1))
-
-
 class ProtoIsolator:
     """
     Per-task ownership of prototype rows with THREE zones during task i:
@@ -401,7 +390,6 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
     Also keeps the domain router calibrated on all seen tasks."""
     if len(replay) == 0:
         return
-    K = model.proto_weights.shape[0]
     model.train()
     arch_names = ("structure_delta", "block_mode_head")
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
@@ -635,7 +623,8 @@ def main():
                                       norm_mode=args.norm).to(device)
 
     T = len(tasks)
-    A = [[None] * T for _ in range(T)]      # A[i][j]: acc on task j after training task i
+    A = [[None] * T for _ in range(T)]        # method protocol (snapshot retrieval)
+    A_live = [[None] * T for _ in range(T)]   # standard CL (current weights only)
     fingerprints = {}
     replay = ReplayBuffer()
     isolator = ProtoIsolator(model)
@@ -711,7 +700,13 @@ def main():
         anchor_snap = [(p, p.detach().clone()) for n_, p in model.named_parameters()
                        if any(k in n_ for k in anchor_names)]
 
-        # Evaluate on ALL seen tasks (routed through domain slots once available)
+        # Evaluate on ALL seen tasks through BOTH protocols:
+        #   A[i][j]      - method protocol: per-domain snapshot + router
+        #                  (incl. test-time max-confidence retrieval of
+        #                  ambiguous samples). Reported by design.
+        #   A_live[i][j] - standard CL protocol: current mutable weights,
+        #                  no snapshot swap, no test-time selection. This is
+        #                  the column comparable to ER/EWC/DER literature.
         for j in range(i + 1):
             _, el = get_task_data(tasks[j], os.path.join(_ROOT, "data"))
             use_route = all(slots[k] is not None for k in range(i + 1))
@@ -720,31 +715,44 @@ def main():
                                slots=(slots[:i + 1] if use_route else None),
                                snaps=(dom_snaps[:i + 1] if use_route else None),
                                route_tau=args.route_tau)
+            acc_live, _ = evaluate(model, el, device, amp_dtype)
             A[i][j] = acc
+            A_live[i][j] = acc_live
             if j == i:
                 fingerprints[name] = fp
             tag = "routed" if use_route else "live"
-            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): {acc*100:.2f}%")
+            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): {acc*100:.2f}% | live: {acc_live*100:.2f}%")
 
         torch.save(model.state_dict(), os.path.join(_ROOT, f"aml_continual_after_{name}.pth"))
 
     # ---- CL metrics ----
-    print("\n===== ACCURACY MATRIX A[i,j] =====")
-    header = "after \\ eval on | " + " | ".join(f"{t:>8s}" for t in tasks)
-    print(header)
-    for i in range(T):
-        row = " | ".join(f"{A[i][j]*100:8.2f}" if A[i][j] is not None else f"{'—':>8s}"
-                         for j in range(T))
-        print(f"{tasks[i]:>17s} | {row}")
+    def print_matrix(M, title):
+        print(f"\n===== {title} =====")
+        header = "after \\ eval on | " + " | ".join(f"{t:>8s}" for t in tasks)
+        print(header)
+        for i in range(T):
+            row = " | ".join(f"{M[i][j]*100:8.2f}" if M[i][j] is not None else f"{'—':>8s}"
+                             for j in range(T))
+            print(f"{tasks[i]:>17s} | {row}")
 
-    if T > 1:
-        bwt = sum(A[T-1][j] - A[j][j] for j in range(T - 1)) / (T - 1)
+    def cl_metrics(M):
+        bwt = sum(M[T-1][j] - M[j][j] for j in range(T - 1)) / (T - 1)
         forg = []
         for j in range(T - 1):
-            worst_before = max(A[t][j] for t in range(j, T - 1))
-            forg.append(worst_before - A[T-1][j])
-        print(f"\nBWT (positive-backward-transfer): {bwt*100:+.2f}%")
-        print(f"Forgetting (avg): {sum(forg)/len(forg)*100:.2f}%")
+            worst_before = max(M[t][j] for t in range(j, T - 1))
+            forg.append(worst_before - M[T-1][j])
+        return bwt, sum(forg) / len(forg)
+
+    print_matrix(A, "ACCURACY MATRIX A[i,j] - METHOD (snapshot retrieval)")
+    print_matrix(A_live, "ACCURACY MATRIX A[i,j] - LIVE WEIGHTS (standard CL)")
+
+    if T > 1:
+        bwt, forg = cl_metrics(A_live)
+        bwt_m, forg_m = cl_metrics(A)
+        print(f"\n[live]   BWT: {bwt*100:+.2f}% | Forgetting (avg): {forg*100:.2f}%")
+        print(f"[method] BWT: {bwt_m*100:+.2f}% | Forgetting (avg): {forg_m*100:.2f}%")
+        print("  (method column uses test-time router+snapshot retrieval; report")
+        print("   the LIVE column when comparing against standard CL literature)")
 
     # ---- Structure divergence across domains ----
     print("\n===== PER-DOMAIN STRUCTURE FINGERPRINTS =====")
@@ -766,7 +774,7 @@ def main():
                 gb = fingerprints[names[b]]["gate_tensor"]
                 nmin = min(ga.shape[0], gb.shape[0])
                 d_sample = (ga[:nmin].mean(0) - gb[:nmin].mean(0)).abs().sum().item()
-                print(f"  {names[a]} vs {names[b]}: gate_L1={d:.3f} | bmRes_L1={d_bm:.3f}")
+                print(f"  {names[a]} vs {names[b]}: gate_L1={d:.3f} | bmRes_L1={d_bm:.3f} | mean_gate_L1={d_sample:.3f}")
     print("\n(Interpretation: large L1 => architecture genuinely differs per domain;" 
           " ~0 => static network despite dynamic machinery)")
 
