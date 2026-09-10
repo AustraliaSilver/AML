@@ -38,8 +38,12 @@ jobs:
       - name: Install torch (CPU build) and the package
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # torch AND torchvision must come from the same (+cpu) index:
+          # a PyPI-default torchvision wheel is built against the CUDA torch
+          # (ABI mismatch -> "operator torchvision::nms does not exist").
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
+          python -c "import torch, torchvision; print('torch', torch.__version__, '| torchvision', torchvision.__version__)"
       - name: Package sanity (import without CUDA extension)
         run: >
           python -c "import mgn, hts_lib;
