@@ -22,7 +22,13 @@ class MetaTrainer:
         num_candidates: int = 1,
         optimizer: str = "adamw",
         weight_decay: float = 0.05,
+        preprocess_fn=None,
     ):
+        """preprocess_fn: optional callable applied to every TRAIN x-batch
+        (e.g. dataset-side horizontal flip for flat CIFAR). The library keeps
+        no dataset-specific augmentation policy of its own; use torch RNG
+        inside the fn so torch.manual_seed keeps the run reproducible."""
+        self.preprocess_fn = preprocess_fn
         self.generator = generator.to(device)
         self.executor = executor.to(device)
         self.meta_loss = meta_loss
@@ -59,14 +65,8 @@ class MetaTrainer:
                 x_batch, y_batch = batch
                 task_ids = None
             x_batch = x_batch.to(self.device)
-            if self.generator.training and x_batch.dim() == 2 and x_batch.shape[1] == 3072:
-                # Vectorized per-sample hflip from the TORCH RNG so runs stay
-                # reproducible under torch.manual_seed (python's `random` was
-                # left unseeded by most experiment entry points).
-                x_images = x_batch.view(-1, 3, 32, 32)
-                flip = torch.rand(x_images.size(0), device=x_images.device) < 0.5
-                x_images = torch.where(flip.view(-1, 1, 1, 1), x_images.flip(-1), x_images)
-                x_batch = x_images.view(-1, 3072)
+            if self.preprocess_fn is not None and self.generator.training:
+                x_batch = self.preprocess_fn(x_batch)
             y_batch = y_batch.to(self.device)
 
             self.optimizer.zero_grad()

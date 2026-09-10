@@ -5,7 +5,7 @@ Usage:
     python experiments/benchmark.py [--datasets mnist,fashion_mnist,cifar10] [--seeds 5] [--quick]
 """
 
-import sys, os, json, time, itertools, argparse, warnings
+import sys, os, json, time, argparse, warnings
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,11 +17,10 @@ import matplotlib.pyplot as plt
 
 from mgn import (
     ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer,
-    ModelEvaluator, ResourceBudget, arch_distance,
 )
-from experiments.benchmark_datasets import get_dataset
+from experiments.benchmark_datasets import get_dataset, cifar_hflip_flat
 from experiments.benchmark_baselines import (
-    FixedMLP, FixedMoE, SmallCNN,
+    FixedMoE, SmallCNN,
     train_torch, train_rf, search_best_mlp,
 )
 
@@ -66,7 +65,8 @@ def make_mgn(input_dim, output_dim, latent_dim=128, num_prototypes=8):
 def train_mgn(generator, executor, meta_loss, train_x, train_y,
               test_x, test_y, epochs=100, batch_size=128, device=DEVICE, label=""):
     t0 = time.time()
-    trainer = MetaTrainer(generator, executor, meta_loss, lr=1e-3, device=device)
+    trainer = MetaTrainer(generator, executor, meta_loss, lr=1e-3, device=device,
+                          preprocess_fn=cifar_hflip_flat)
     trainer.train(train_x, train_y, epochs=epochs, batch_size=batch_size)
     elapsed = time.time() - t0
 
@@ -182,7 +182,7 @@ def run_benchmark(dataset_name, seeds=5, quick=False):
     }
 
     # --- Random Forest ---
-    print(f"\n--- Random Forest ---")
+    print("\n--- Random Forest ---")
     rf_res = train_rf(train_x, train_y, test_x, test_y, n_estimators=200)
     print(f"  test={rf_res['test_acc']:.4f} P≈{rf_res['P']}")
     results["methods"]["RandomForest"] = {
@@ -301,7 +301,7 @@ def plot_comparison(results_list, save_dir="experiments"):
         means = [r["methods"].get(method, {}).get("test_acc_mean", 0) for r in results_list]
         stds = [r["methods"].get(method, {}).get("test_acc_std", 0) for r in results_list]
         offset = (idx - n_methods / 2 + 0.5) * width
-        bars = ax.bar(x + offset, means, width, label=method, color=colors[idx], alpha=0.8, edgecolor="k")
+        ax.bar(x + offset, means, width, label=method, color=colors[idx], alpha=0.8, edgecolor="k")
         ax.errorbar(x + offset, means, yerr=stds, fmt="none", capsize=3, color="black", linewidth=1)
 
     ax.set_xticks(x)

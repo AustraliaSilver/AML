@@ -20,8 +20,8 @@ import matplotlib.pyplot as plt
 from scipy import stats
 
 from mgn import ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer
-from experiments.benchmark_datasets import get_dataset
-from experiments.benchmark_baselines import FixedMLP, FixedMoE, SmallCNN, train_torch, search_best_mlp
+from experiments.benchmark_datasets import get_dataset, cifar_hflip_flat
+from experiments.benchmark_baselines import FixedMoE, SmallCNN, train_torch, search_best_mlp
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
@@ -53,7 +53,8 @@ def make_mgn(input_dim, output_dim):
 def train_mgn(gen, exec_, loss, train_x, train_y, test_x, test_y,
               epochs=100, batch_size=128, device=DEVICE):
     t0 = time.time()
-    trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device)
+    trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device,
+                          preprocess_fn=cifar_hflip_flat)
     trainer.train(train_x, train_y, epochs=epochs, batch_size=batch_size)
     elapsed = time.time() - t0
     gen.eval()
@@ -186,7 +187,7 @@ def run_benchmark(dataset_name, seeds=5, pca_dim=32, quick=False):
         }
 
     # ======== Random Forest (on PCA features) ========
-    print(f"\n--- Random Forest ---")
+    print("\n--- Random Forest ---")
     from experiments.benchmark_baselines import train_rf
     rf_res = train_rf(train_x_pca, train_y, test_x_pca, test_y, n_estimators=200)
     print("  test={:.4f} P~{}".format(rf_res['test_acc'], rf_res['P']))
@@ -287,7 +288,7 @@ def plot_results(results_list, save_dir="experiments"):
     plt.tight_layout()
     fig.savefig(os.path.join(save_dir, "benchmark_accuracy_params.png"), dpi=120)
     plt.close()
-    print(f"  [Saved benchmark_accuracy_params.png]")
+    print("  [Saved benchmark_accuracy_params.png]")
 
     # Efficiency scatter
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -312,7 +313,7 @@ def plot_results(results_list, save_dir="experiments"):
     plt.tight_layout()
     fig.savefig(os.path.join(save_dir, "benchmark_efficiency.png"), dpi=120)
     plt.close()
-    print(f"  [Saved benchmark_efficiency.png]")
+    print("  [Saved benchmark_efficiency.png]")
 
     # Parameter efficiency ratio bar chart
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -341,7 +342,7 @@ def plot_results(results_list, save_dir="experiments"):
     plt.tight_layout()
     fig.savefig(os.path.join(save_dir, "benchmark_param_ratio.png"), dpi=120)
     plt.close()
-    print(f"  [Saved benchmark_param_ratio.png]")
+    print("  [Saved benchmark_param_ratio.png]")
 
 
 if __name__ == "__main__":

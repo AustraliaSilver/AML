@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from .architecture import GeneratedModel
 from .constraints import ResourceBudget, phi_cost
-from .regularization import similarity_regularization, arch_distance, contrastive_architecture_loss
+from .regularization import arch_distance, contrastive_architecture_loss
 
 
 class MetaLoss(nn.Module):
@@ -21,13 +21,10 @@ class MetaLoss(nn.Module):
         lambda_contrastive: float = 0.0,
         lambda_stability: float = 0.0,
         lambda_design: float = 0.0,
-        lambda_reg: float = 0.0,
-    lambda_eff: float = 0.0,
-    # Default = SmallCNN's parameter count from experiments/results_fashion_mnist.json,
-    # i.e. the efficiency barrier is calibrated against the strongest static baseline
-    # by default. Override per-experiment via MetaLoss(..., p_allowance=...).
-    p_allowance: float = 110986.0,
-        reg_sigma: float = 1.0,
+        lambda_eff: float = 0.0,
+        # No dataset-specific default: pass the parameter budget of the
+        # static baseline you are competing against (per experiment).
+        p_allowance: float = None,
         resource_budget: ResourceBudget = None,
     ):
         super().__init__()
@@ -40,10 +37,8 @@ class MetaLoss(nn.Module):
         self.lambda_contrastive = lambda_contrastive
         self.lambda_stability = lambda_stability
         self.lambda_design = lambda_design
-        self.lambda_reg = lambda_reg
         self.lambda_eff = lambda_eff
         self.p_allowance = p_allowance
-        self.reg_sigma = reg_sigma
         self.resource_budget = resource_budget
 
     def forward(
@@ -96,12 +91,18 @@ class MetaLoss(nn.Module):
         L_eff = torch.tensor(0.0, device=logits_train.device)
         O_val = torch.tensor(0.0, device=logits_train.device)
         if getattr(self, "lambda_eff", 0.0) > 0:
+            if self.p_allowance is None:
+                raise ValueError(
+                    "MetaLoss: lambda_eff > 0 requires an explicit "
+                    "p_allowance (parameter budget of the static baseline "
+                    "you compete against); the library ships no default.")
+            p_allow = float(self.p_allowance)
             from .constraints import compute_aml_efficiency_torch
             probs = F.softmax(logits_train, dim=-1)
             true_probs = probs.gather(1, targets_train.to(logits_train.device).unsqueeze(1)).squeeze(1).mean()
             P_eff = model.structure.effective_params_formula()
             
-            E_aml_raw = compute_aml_efficiency_torch(true_probs, getattr(self, "p_allowance", 110986.0), P_eff).mean()
+            E_aml_raw = compute_aml_efficiency_torch(true_probs, p_allow, P_eff).mean()
             E_aml_raw = torch.clamp(E_aml_raw, min=1e-6)
             
             # ============================================================
@@ -154,7 +155,7 @@ class MetaLoss(nn.Module):
             # This quadratic penalty provides constant gradient signal
             # to push P_eff below P_allow.
             # ============================================================
-            r_raw = P_eff.mean() / getattr(self, "p_allowance", 110986.0)
+            r_raw = P_eff.mean() / p_allow
             over_budget = torch.relu(r_raw - 1.0)
             L_eff = L_eff + current_lambda_eff * over_budget * over_budget
 
@@ -172,7 +173,6 @@ class MetaLoss(nn.Module):
         if self.lambda_balance > 0 and pi_logits is not None:
             pi = F.softmax(pi_logits, dim=-1)
             pi_avg = pi.mean(dim=0)
-            K = pi_avg.shape[0]
             entropy = -(pi_avg * torch.log(pi_avg + 1e-8)).sum()
             L_balance = -self.lambda_balance * entropy
 
@@ -195,8 +195,3 @@ class MetaLoss(nn.Module):
             "balance_cost": L_balance.detach(),
             "contrastive_cost": L_contrastive.detach(),
         }
-
-    def compute_similarity_reg(self, models: list, embeddings: torch.Tensor) -> torch.Tensor:
-        if self.lambda_reg <= 0 or len(models) < 2:
-            return torch.tensor(0.0, device=embeddings.device)
-        return similarity_regularization(models, embeddings, self.reg_sigma, self.lambda_reg)

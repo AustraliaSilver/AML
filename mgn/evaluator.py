@@ -56,8 +56,9 @@ class ModelEvaluator(nn.Module):
 
     def compute_efficiency(self, accuracy: float, p_allowance: float, model: GeneratedModel) -> float:
         """
-        Evaluate candidate architecture using E_new(a, p, q):
-        E(a, p, q) = (a / log10(p^2 / q)) * (p / q)^|a * log10(a)|
+        Scalar efficiency score of a candidate. See constraints.compute_aml_efficiency
+        for the authoritative formula (C^infinity balanced polynomial alpha(a, b)
+        plus the soft budget barrier F_norm).
         """
         from .constraints import compute_aml_efficiency
         q_used = model.structure.effective_params_formula().mean().item()

@@ -4,11 +4,6 @@ import torch.nn.functional as F
 from .architecture import ModelStructure, GeneratedModel
 
 
-def kernel_rbf(emb_i: torch.Tensor, emb_j: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
-    dist_sq = torch.cdist(emb_i, emb_j, p=2).pow(2)
-    return torch.exp(-dist_sq / (2 * sigma * sigma))
-
-
 def structure_distance(s1: ModelStructure, s2: ModelStructure) -> torch.Tensor:
     L1 = s1.num_layers
     L2 = s2.num_layers
@@ -38,45 +33,10 @@ def structure_distance(s1: ModelStructure, s2: ModelStructure) -> torch.Tensor:
     return L_diff + D_diff + gate_dist
 
 
-def weight_distance(w1: dict, w2: dict) -> torch.Tensor:
-    dist = torch.tensor(0.0, device=next(iter(w1.values())).device)
-    for key in w1:
-        if key in w2:
-            t1, t2 = w1[key], w2[key]
-            if t1.shape == t2.shape:
-                dist = dist + F.mse_loss(t1, t2, reduction="mean")
-            else:
-                min_dims = [min(s1, s2) for s1, s2 in zip(t1.shape, t2.shape)]
-                s1 = t1[tuple(slice(d) for d in min_dims)]
-                s2 = t2[tuple(slice(d) for d in min_dims)]
-                dist = dist + F.mse_loss(s1, s2, reduction="mean")
-    return dist
-
-
 def arch_distance(a1: GeneratedModel, a2: GeneratedModel) -> torch.Tensor:
     # As weights are dynamically generated per-sample, comparing them across different batches is meaningless.
     # Therefore, we only compare structural gating decisions.
     return structure_distance(a1.structure, a2.structure)
-
-
-def similarity_regularization(
-    models: list,
-    embeddings: torch.Tensor,
-    sigma: float = 1.0,
-    lambda_reg: float = 1.0,
-) -> torch.Tensor:
-    n = len(models)
-    if n < 2:
-        return torch.tensor(0.0, device=embeddings.device)
-    K = kernel_rbf(embeddings, embeddings, sigma)
-    reg = torch.tensor(0.0, device=embeddings.device)
-    count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = structure_distance(models[i].structure, models[j].structure)
-            reg = reg + K[i, j] * d
-            count += 1
-    return lambda_reg * reg / max(count, 1)
 
 
 def contrastive_architecture_loss(
@@ -103,17 +63,3 @@ def contrastive_architecture_loss(
     mean_same = sum_same / max(count_same, 1)
     mean_diff = sum_diff / max(count_diff, 1)
     return mean_same / (mean_diff + 1e-8)
-
-
-def arch_entropy(arch: GeneratedModel, eps: float = 1e-8) -> torch.Tensor:
-    total_entropy = torch.tensor(0.0, device=next(iter(arch.weights.values())).device)
-    for w in arch.weights.values():
-        w_flat = w.flatten()
-        if w_flat.numel() < 2:
-            continue
-        std = w_flat.std() + eps
-        normalized = w_flat / std
-        probs = F.softmax(normalized, dim=-1)
-        entropy = -(probs * torch.log(probs + eps)).sum()
-        total_entropy = total_entropy + entropy
-    return total_entropy

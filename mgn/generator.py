@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .architecture import ModelStructure, GeneratedModel
+from .layout import get_prototype_layout
 
 
 class PrototypeLibrary(nn.Module):
@@ -30,25 +31,22 @@ class PrototypeLibrary(nn.Module):
                 nn.init.constant_(self.dim_head.bias, 0.0)
                 self.dim_head.bias.data.view(max_layers, num_dim_choices)[:, -1] = 3.0
             import math
+            # Init from the SAME layout that the slicers, extractor and CUDA
+            # offset vectors consume (mgn.layout), instead of a second
+            # hand-mirrored copy of the packing contract.
+            _total, layer_offsets, _info, wo_off, bo_off = get_prototype_layout(
+                max_layers, max_dim, output_dim, in_channels)
             with torch.no_grad():
                 for k in range(K):
-                    idx = 0
-                    for i in range(max_layers):
-                        in_c = in_channels if i == 0 else max_dim
-                        w1_numel = max_dim * in_c * 9
-                        w1 = torch.empty(max_dim, in_c, 3, 3)
-                        nn.init.kaiming_uniform_(w1, a=math.sqrt(5))
-                        self.proto_weights.data[k, idx:idx + w1_numel] = w1.flatten()
-                        idx += w1_numel
-                        self.proto_weights.data[k, idx:idx + max_dim] = 0.0
-                        idx += max_dim
-
-                    wo_numel = (16 * max_dim) * output_dim
+                    for (w_start, w_end, b_start, b_end, in_c) in layer_offsets:
+                        w_t = torch.empty(max_dim, in_c, 3, 3)
+                        nn.init.kaiming_uniform_(w_t, a=math.sqrt(5))
+                        self.proto_weights.data[k, w_start:w_end] = w_t.flatten()
+                        self.proto_weights.data[k, b_start:b_end] = 0.0
                     wo = torch.empty(output_dim, 16 * max_dim)
                     nn.init.kaiming_uniform_(wo, a=math.sqrt(5))
-                    self.proto_weights.data[k, idx:idx + wo_numel] = wo.flatten()
-                    idx += wo_numel
-                    self.proto_weights.data[k, idx:idx + output_dim] = 0.0
+                    self.proto_weights.data[k, wo_off:wo_off + wo.numel()] = wo.flatten()
+                    self.proto_weights.data[k, bo_off:bo_off + output_dim] = 0.0
         else:
             nn.init.normal_(self.proto_weights, std=0.02)
 
@@ -93,7 +91,9 @@ class ModelGenerator(nn.Module):
         self.max_layers = max_layers
         self.max_dim = max_dim
         self.dim_choices = dim_choices
-        self.noise_dim = noise_dim if noise_dim == latent_dim else latent_dim
+        # Retained for API compatibility only; the reparameterized noise head
+        # works in latent_dim space and reads nothing from this attribute.
+        self.noise_dim = noise_dim
         self.latent_dim = latent_dim
         self.use_conv = use_conv
         self.in_channels = in_channels
@@ -120,11 +120,11 @@ class ModelGenerator(nn.Module):
         )
 
         if self.use_conv:
-            weight_out = 0
-            for i in range(max_layers):
-                in_c = in_channels if i == 0 else max_dim
-                weight_out += max_dim * in_c * 9 + max_dim
-            weight_out += (16 * max_dim) * output_dim + output_dim
+            _total, _offs, _info, _wo, _bo = get_prototype_layout(
+                max_layers, max_dim, output_dim, in_channels)
+            weight_out = _total
+            self._proto_offsets = _offs
+            self._proto_head = (_wo, _bo)
         else:
             weight_out = (
                 input_dim * max_dim
@@ -140,7 +140,7 @@ class ModelGenerator(nn.Module):
             num_dim_choices=len(dim_choices),
             weight_dim=weight_out,
             use_conv=self.use_conv,
-            in_channels=getattr(self, "in_channels", 1),
+            in_channels=self.in_channels,
             max_dim=self.max_dim,
             output_dim=self.output_dim,
         )
@@ -179,12 +179,18 @@ class ModelGenerator(nn.Module):
 
         if self.use_conv:
             pi_logits = self.prototype_selector(z)
+            z_route = z
         else:
             log_var = self.noise_var_head(z).clamp(min=-10.0, max=10.0)
             sigma = torch.exp(0.5 * log_var).clamp(min=0.01, max=100.0)
-            eps = torch.randn_like(sigma) * noise_scale
-            z_noisy = z + eps * sigma
-            pi_logits = self.prototype_selector(z_noisy)
+            if self.training:
+                # Reparameterized exploration noise -- TRAINING ONLY. Like
+                # Gumbel, randn ignores module.eval(); two deterministic evals
+                # of the same weights must not disagree.
+                z_route = z + torch.randn_like(sigma) * noise_scale * sigma
+            else:
+                z_route = z
+            pi_logits = self.prototype_selector(z_route)
 
         # Routing is stochastic only while training. Gumbel noise does not
         # respect module.eval() on its own, so gate it explicitly -- otherwise
@@ -207,7 +213,7 @@ class ModelGenerator(nn.Module):
             dim_logits = base_dims + delta[:, L_max : L_max + L_max * nd]
             res_logits = base_res + delta[:, -1:]
         else:
-            delta = self.structure_delta(z_noisy)
+            delta = self.structure_delta(z_route)
             L_max = self.max_layers
             nd = len(self.dim_choices)
             layer_logits = base_layers + delta[:, :L_max]
@@ -223,8 +229,7 @@ class ModelGenerator(nn.Module):
         dim_logits = dim_logits.view(-1, self.max_layers, len(self.dim_choices))
         d_logit = dim_logits.mean(dim=-1, keepdim=True) + 2.0
         dim_fractions = torch.sigmoid(d_logit)
-        
-        batch_size = x.shape[0]
+
         d_lengths = dim_fractions * self.max_dim
         arange = torch.arange(self.max_dim, device=x.device).float().view(1, 1, self.max_dim)
         
@@ -246,20 +251,16 @@ class ModelGenerator(nn.Module):
             # tensors matching TaskNetwork's contract:
             #   c{i}.weight [B, max_dim, in_c, 3, 3], c{i}.bias [B, max_dim],
             #   out.weight [B, output_dim, 16*max_dim], out.bias [B, output_dim].
-            # Layout must mirror PrototypeLibrary's init loop exactly.
+            # Offsets come from the canonical mgn.layout (shared with init,
+            # the executor and the static extractor).
             D = self.max_dim
-            idx = 0
-            for i in range(self.max_layers):
-                in_c = self.in_channels if i == 0 else D
-                sz_w = D * in_c * 9
-                W[f"c{i+1}.weight"] = w_direct[:, idx:idx + sz_w].view(-1, D, in_c, 3, 3)
-                idx += sz_w
-                W[f"c{i+1}.bias"] = w_direct[:, idx:idx + D]
-                idx += D
+            for i, (w_start, w_end, b_start, b_end, in_c) in enumerate(self._proto_offsets):
+                W[f"c{i+1}.weight"] = w_direct[:, w_start:w_end].view(-1, D, in_c, 3, 3)
+                W[f"c{i+1}.bias"] = w_direct[:, b_start:b_end]
+            wo_off, bo_off = self._proto_head
             sz_w = (16 * D) * self.output_dim
-            W["out.weight"] = w_direct[:, idx:idx + sz_w].view(-1, self.output_dim, 16 * D)
-            idx += sz_w
-            W["out.bias"] = w_direct[:, idx:idx + self.output_dim]
+            W["out.weight"] = w_direct[:, wo_off:wo_off + sz_w].view(-1, self.output_dim, 16 * D)
+            W["out.bias"] = w_direct[:, bo_off:bo_off + self.output_dim]
         else:
             idx = 0
             for i in range(self.max_layers):

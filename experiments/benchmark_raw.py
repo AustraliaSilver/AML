@@ -11,12 +11,10 @@ import torch
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from scipy import stats
 
 from mgn import ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer
-from experiments.benchmark_datasets import get_dataset
-from experiments.benchmark_baselines import FixedMLP, FixedMoE, SmallCNN, train_torch, search_best_mlp
+from experiments.benchmark_datasets import get_dataset, cifar_hflip_flat
+from experiments.benchmark_baselines import SmallCNN, train_torch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
@@ -71,7 +69,8 @@ def run_benchmark(dataset_name, seeds=3, quick=False):
         loss = MetaLoss(lambda_p=1e-4, lambda_c=1e-7, lambda_m=1e-8,
                       lambda_balance=0.5, lambda_stability=0.1, lambda_design=1e-4).to(DEVICE)
         
-        trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=DEVICE)
+        trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=DEVICE,
+                              preprocess_fn=cifar_hflip_flat)
         
         # Add L2 regularization
         from torch.utils.data import DataLoader, TensorDataset

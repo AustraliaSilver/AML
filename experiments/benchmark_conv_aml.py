@@ -12,22 +12,23 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from scipy import stats
 
 from mgn import ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer, compute_aml_efficiency
-from experiments.benchmark_datasets import get_dataset
+from experiments.benchmark_datasets import get_dataset, cifar_hflip_flat
 from experiments.benchmark_baselines import SmallCNN, FixedMLP, ResNetBlockBaseline, train_torch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
 
 def set_seed(seed):
+    import random
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def make_conv_aml(input_dim, output_dim, in_channels):
-    num_p = 2
     lp = 0.0
     # Huge architecture: L=4, D=128 => p_allow inflated to accommodate very large nets
     p_allow = 562186.0 if in_channels == 3 else 506762.0
@@ -55,7 +56,7 @@ def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, tes
     # weight_decay=0.01: non-monotonic sweep found 0.05 too strong and 0
     # too weak (+0.9 vs both, round 6).
     trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device,
-                          weight_decay=0.01)
+                          weight_decay=0.01, preprocess_fn=cifar_hflip_flat)
     trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size)
     elapsed = time.time() - t0
     gen.eval()
@@ -97,9 +98,9 @@ def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, tes
         "entropy": entropy, "prototypes_used": n_used, "resnet_pct": resnet_pct, "vit_pct": vit_pct, "time": elapsed
     }
 
-def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, fast=False, full=False, disable_vit=False, fixed_arch=False, only_baselines=False):
+def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, fast=False, full=False, fixed_arch=False, only_baselines=False):
     print(f"\n{'='*70}")
-    print(f"ConvAML Benchmark: {dataset_name} (seeds={seeds}, full={full}, disable_vit={disable_vit}, fixed_arch={fixed_arch})")
+    print(f"ConvAML Benchmark: {dataset_name} (seeds={seeds}, full={full}, fixed_arch={fixed_arch})")
     print(f"{'='*70}")
     sys.stdout.flush()
 
@@ -112,7 +113,6 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         max_test = 400 if fast else (1000 if quick else 2000)
         epochs = 25 if fast else (60 if quick else 120)
 
-    import argparse
     # Check if a custom epochs value was passed globally
     if hasattr(args, "epochs") and args.epochs is not None:
         epochs = args.epochs
@@ -134,9 +134,6 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
             set_seed(42 + seed)
             gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
             
-            if disable_vit:
-                gen.disable_vit = True
-                
             if fixed_arch:
                 for p in gen.prototype_selector.parameters(): p.requires_grad = False
                 for p in gen.structure_delta.parameters(): p.requires_grad = False
@@ -180,9 +177,6 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
             gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
             loss.lambda_eff = 0.0
             
-            if disable_vit:
-                gen.disable_vit = True
-                
             if fixed_arch:
                 for p in gen.prototype_selector.parameters(): p.requires_grad = False
                 for p in gen.structure_delta.parameters(): p.requires_grad = False
@@ -287,7 +281,6 @@ if __name__ == "__main__":
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--disable-vit", action="store_true")
     parser.add_argument("--fixed-arch", action="store_true")
     parser.add_argument("--only-baselines", action="store_true")
     args = parser.parse_args()
@@ -295,15 +288,16 @@ if __name__ == "__main__":
     ds_names = [d.strip() for d in args.datasets.split(",")]
     all_res = []
     for ds in ds_names:
-        r = run_conv_aml_benchmark(ds, seeds=args.seeds, quick=args.quick, fast=args.fast, full=args.full, disable_vit=args.disable_vit, fixed_arch=args.fixed_arch, only_baselines=args.only_baselines)
+        r = run_conv_aml_benchmark(ds, seeds=args.seeds, quick=args.quick, fast=args.fast, full=args.full, fixed_arch=args.fixed_arch, only_baselines=args.only_baselines)
         all_res.append(r)
-        with open(f"experiments/conv_aml_{ds}.json", "w") as f:
+        out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"conv_aml_{ds}.json")
+        with open(out_path, "w") as f:
             json.dump(r, f, indent=2)
 
     # Upsert into the aggregate file by dataset so that running a single
     # dataset does not silently discard previously recorded results for
     # the others.
-    all_path = "experiments/conv_aml_all.json"
+    all_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conv_aml_all.json")
     try:
         with open(all_path) as f:
             merged = json.load(f)

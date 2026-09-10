@@ -18,6 +18,10 @@ bootstrap()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mgn.generator import ModelGenerator
+# Canonical flat prototype layout lives in mgn.layout; re-exported here so
+# long-standing importers (extract_static_model, validate_ext_in, train.py)
+# keep resolving get_prototype_layout from this module.
+from mgn.layout import get_prototype_layout
 import mgn.accel.functions as aml_ops
 
 try:
@@ -28,7 +32,7 @@ except ImportError:
 
 # InstanceNorm variant of the fused pipeline (per-channel norm statistics).
 try:
-    import mgn.accel._Cin as _Cin
+    import mgn.accel._Cin as _Cin  # noqa: F401  (import success sets the capability flag; bindings_in owns the symbols)
     from mgn.accel.fused_autograd_in import FusedPipelineFunctionIN
     _Cin_available = True
 except ImportError:
@@ -40,33 +44,6 @@ try:
 except ImportError:
     _fused_autograd_available = False
 
-
-def get_prototype_layout(max_layers, max_dim, num_classes):
-    # Per layer: conv weight [C_out*C_in*9] + bias [C_out].
-    # NOTE: legacy layouts reserved per-layer attention (qkv/proj) slices;
-    # they were never consumed by any executor and are removed.
-    offsets = []
-    layer_info = []
-    idx = 0
-    in_c = 3
-    for i in range(max_layers):
-        out_c = max_dim
-        w_size = out_c * in_c * 9
-        b_size = out_c
-        w_start, w_end = idx, idx + w_size
-        idx += w_size
-        b_start, b_end = idx, idx + b_size
-        idx += b_size
-
-        layer_info.append((w_start, w_end, b_start, b_end, in_c, out_c))
-        offsets.append((w_start, w_end, b_start, b_end, in_c))
-
-        in_c = out_c
-
-    wo_offset = idx
-    bo_offset = idx + (16 * max_dim) * num_classes
-    total_dim = bo_offset + num_classes
-    return total_dim, offsets, layer_info, wo_offset, bo_offset
 
 class AcceleratedCVNetwork(nn.Module):
     def __init__(self, max_layers=6, max_dim=64, num_classes=10, norm_mode="gn1"):
