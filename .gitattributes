@@ -1,0 +1,51 @@
+# Normalize line endings in the repo (blobs are LF; working tree policy below).
+* text=auto
+
+# Source & config: LF in repo and on checkout (torch/extensions build fine on
+# Windows; prevents the constant "LF will be replaced by CRLF" warning spam).
+*.py      text eol=lf
+*.pyi     text eol=lf
+*.txt     text eol=lf
+*.md      text eol=lf
+*.tex     text eol=lf
+*.json    text eol=lf
+*.toml    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.cfg     text eol=lf
+*.in      text eol=lf
+*.cu      text eol=lf
+*.cuh     text eol=lf
+*.cpp     text eol=lf
+*.c       text eol=lf
+*.h       text eol=lf
+*.hpp     text eol=lf
+
+# Windows-native scripts need CRLF to stay editable in Notepad/schedulers.
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+# Binary artifacts - never touch line endings.
+*.pth     binary
+*.pt      binary
+*.pyd     binary
+*.dll     binary
+*.so      binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
+*.pptx    binary
+*.zip     binary
+*.obj     binary
+*.o       binary
+*.lib     binary
+*.a       binary
+*.cache   binary
+
+# GitHub linguist overrides
+*.min.js  -diff linguist-generated
+*.csv     text
