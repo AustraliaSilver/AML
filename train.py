@@ -171,6 +171,11 @@ def get_args(argv=None):
                         help='cap train/eval batches per epoch (0 = full pass); '
                              'for CI smoke runs and quick sanity checks')
     parser.add_argument('--out', type=str, default='aml_core_best.pth')
+    parser.add_argument('--arch-reg', type=int, default=1,
+                        help='1 (default): apply the w_gate/w_bm/w_dim/w_pi structure '
+                             'regularizers to the ARCHITECTURE optimizer as well as the '
+                             'main one. 0: legacy behaviour (arch step = pure CE; those '
+                             'prune-phase terms reached no optimizer).')
     return parser.parse_args(argv)
 
 @torch.no_grad()
@@ -182,6 +187,7 @@ def eval_structure(model, loader, n_total, use_amp, amp_dtype, diag=True, max_st
     device = next(model.parameters()).device
     model.eval()
     correct, seen, eff_params_sum = 0, 0, 0
+    res_sum, res_n = 0.0, 0
     bm_sums = torch.zeros(model.max_layers, 2, device=device)
     pi_ent_sum, pi_ent_n = 0.0, 0
     gate_soft_list = []
@@ -197,6 +203,7 @@ def eval_structure(model, loader, n_total, use_amp, amp_dtype, diag=True, max_st
         if diag:
             eff_params_sum += struct.effective_params_formula().sum().item()
             bm_sums += struct.block_mode.sum(dim=0)
+            res_sum += struct.block_mode[:, :, 1].mean().item(); res_n += 1
             pi_f = pi_eval.float()
             pi_ent_sum += -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).sum().item()
             pi_ent_n += pi_f.shape[0]
@@ -204,6 +211,7 @@ def eval_structure(model, loader, n_total, use_amp, amp_dtype, diag=True, max_st
     n = seen if max_steps else n_total
     m = {"eff": eff_params_sum / max(n, 1),
          "pi_H": pi_ent_sum / max(pi_ent_n, 1),
+         "res_frac": res_sum / max(res_n, 1),
          "gate_std": torch.cat(gate_soft_list, dim=0).std(0).mean().item() if gate_soft_list else 0.0,
          "bm_str": ""}
     if diag:
@@ -212,6 +220,44 @@ def eval_structure(model, loader, n_total, use_amp, amp_dtype, diag=True, max_st
             f"L{i+1}: {bm_avg[i, 0] * 100:4.0f}/{bm_avg[i, 1] * 100:4.0f}"
             for i in range(model.max_layers))
     return correct / max(n, 1), m
+
+
+def structure_reg(loss, diag, pi, model, w_gate, w_bm, w_dim, w_pi):
+    """Structure-entropy / width-floor / routing-sharpening terms.
+
+    MUST be applied to BOTH the main objective (shapes the weights so they
+    adapt to whatever gates the arch side proposes) AND the architecture
+    objective. It used to be attached only to the main loss, whose
+    arch-parameter gradients are zero_grad()ed before optimizer_arch.step()
+    -> every hand-designed structure regularizer silently never reached
+    the architecture (width collapsed unopposed at unfreeze; block modes
+    had no counter-pressure against pure val CE, which always prefers the
+    residual branch)."""
+    if not (w_gate > 0.0 or w_bm > 0.0 or w_dim > 0.0 or w_pi > 0.0):
+        return loss
+    # fp32 + log1p: in bf16, (1 - 1e-6) rounds to 1.0, so a
+    # saturated gate (soft == 1.0 after noise/clamp) would give
+    # log(0) = -inf and 0 * -inf = NaN, poisoning all weights.
+    layer_soft = diag["layer_soft"].float().clamp(1e-6, 1.0 - 1e-6)
+    ent_gate = -(layer_soft * torch.log(layer_soft)
+                 + (1.0 - layer_soft) * torch.log1p(-layer_soft)).mean()
+    p_bm = F.softmax(diag["bm_logits"].float(), dim=-1).clamp(1e-6, 1.0 - 1e-6)
+    ent_bm = -(p_bm * torch.log(p_bm)).sum(dim=-1).mean()
+    dim_floor = F.relu(0.4 * model.max_dim - diag["d_lengths"].float().mean()).mean()
+    reg = -w_gate * ent_gate - w_bm * ent_bm + w_dim * dim_floor
+
+    if w_pi > 0.0:
+        # Per-sample specialization: sharpen each sample's
+        # prototype routing (low per-sample entropy) while
+        # keeping overall usage spread across prototypes
+        # (high usage entropy) -> samples pick DIFFERENT
+        # prototypes instead of all converging to uniform.
+        pi_f = pi.float()
+        ent_pi = -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).mean()
+        usage = pi_f.mean(0)
+        ent_usage = -(usage * torch.log(usage.clamp(min=1e-9))).sum()
+        reg = reg + w_pi * (ent_pi - ent_usage)
+    return loss + reg
 
 def main(argv=None):
     args = get_args(argv)
@@ -386,32 +432,8 @@ def main(argv=None):
                     model=gen_model, epoch_progress=epoch/args.epochs
                 )
 
-                loss = loss_dict["loss"]
-                if w_gate > 0.0 or w_bm > 0.0 or w_dim > 0.0 or w_pi > 0.0:
-                    # fp32 + log1p: in bf16, (1 - 1e-6) rounds to 1.0, so a
-                    # saturated gate (soft == 1.0 after noise/clamp) would give
-                    # log(0) = -inf and 0 * -inf = NaN, poisoning all weights.
-                    layer_soft = diag["layer_soft"].float().clamp(1e-6, 1.0 - 1e-6)
-                    ent_gate = -(layer_soft * torch.log(layer_soft)
-                                 + (1.0 - layer_soft) * torch.log1p(-layer_soft)).mean()
-                    p_bm = F.softmax(diag["bm_logits"].float(), dim=-1).clamp(1e-6, 1.0 - 1e-6)
-                    ent_bm = -(p_bm * torch.log(p_bm)).sum(dim=-1).mean()
-                    dim_floor = F.relu(0.4 * model.max_dim - diag["d_lengths"].float().mean()).mean()
-                    reg = -w_gate * ent_gate - w_bm * ent_bm + w_dim * dim_floor
-
-                    if w_pi > 0.0:
-                        # Per-sample specialization: sharpen each sample's
-                        # prototype routing (low per-sample entropy) while
-                        # keeping overall usage spread across prototypes
-                        # (high usage entropy) -> samples pick DIFFERENT
-                        # prototypes instead of all converging to uniform.
-                        pi_f = pi.float()
-                        ent_pi = -(pi_f * torch.log(pi_f.clamp(min=1e-9))).sum(-1).mean()
-                        usage = pi_f.mean(0)
-                        ent_usage = -(usage * torch.log(usage.clamp(min=1e-9))).sum()
-                        reg = reg + w_pi * (ent_pi - ent_usage)
-
-                    loss = loss + reg
+                loss = structure_reg(loss_dict["loss"], diag, pi, model,
+                                     w_gate, w_bm, w_dim, w_pi)
 
             if not torch.isfinite(loss):
                 print(f"  [warn] non-finite loss at epoch {epoch+1}, skipping batch")
@@ -430,12 +452,22 @@ def main(argv=None):
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
                 optimizer.step()
 
-            # ---- Architecture step: pure validation signal (DARTS-style) ----
+            # ---- Architecture step: validation signal + the SAME structure
+            # regularizers as the main loop. Without the reg here the arch
+            # optimizer only sees cross-entropy (w_gate/w_bm/w_dim/w_pi from
+            # the main loss are zeroed below), so the prune-phase schedule
+            # never reaches the parameters it governs -> mode degeneracy and
+            # width/routing collapse. Feeding them through lets dim_floor
+            # cap width decay, bm entropy keep Plain/ResNet both alive, and
+            # w_pi shape prototype routing.
             if epoch >= 5:
                 optimizer_arch.zero_grad(set_to_none=True)
                 with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    outputs_v, _, _, _ = model(inputs[n_v:], tau=tau)
+                    outputs_v, _sv, pi_v, diag_v = model(inputs[n_v:], tau=tau)
                     loss_arch = F.cross_entropy(outputs_v.float(), targets[n_v:], label_smoothing=0.1)
+                    if args.arch_reg:
+                        loss_arch = structure_reg(loss_arch, diag_v, pi_v, model,
+                                                  w_gate, w_bm, w_dim, w_pi)
 
                 if torch.isfinite(loss_arch):
                     if scaler is not None:
@@ -468,7 +500,7 @@ def main(argv=None):
             torch.save(model.state_dict(), args.out)
             print(f"  [*] Saved new best model to {args.out} (Val Acc: {val_acc*100:.2f}%)")
 
-        print(f"Epoch {epoch+1:2d}/{args.epochs} | {time.time()-t0:5.1f}s | Task Loss: {train_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Test Acc: {test_acc*100:.2f}% | Avg Used Params: {vm['eff']/1e6:.2f}M | pi_H: {vm['pi_H']:.3f}/{math.log(args.K):.3f} | gate_std: {vm['gate_std']:.4f} | Tau: {tau:.1f}")
+        print(f"Epoch {epoch+1:2d}/{args.epochs} | {time.time()-t0:5.1f}s | Task Loss: {train_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Test Acc: {test_acc*100:.2f}% | Avg Used Params: {vm['eff']/1e6:.2f}M | pi_H: {vm['pi_H']:.3f}/{math.log(args.K):.3f} | resMode: {vm['res_frac']*100:4.1f}% | gate_std: {vm['gate_std']:.4f} | Tau: {tau:.1f} | archReg: {int(bool(args.arch_reg))}")
         print(f"  -> Plain/ResNet% per layer: {vm['bm_str']}")
 
     # ---- Report the final TEST accuracy of the best-validation model ----
@@ -477,7 +509,7 @@ def main(argv=None):
     best_test_acc, bvm = eval_structure(model, testloader, len(testset), use_amp, amp_dtype,
                                         max_steps=args.steps)
     print(f"\n========== FINAL: Best Val: {best_val*100:.2f}% | Test acc of best-val model: {best_test_acc*100:.2f}% | "
-          f"Avg Used Params: {bvm['eff']/1e6:.2f}M | gate_std: {bvm['gate_std']:.4f} ==========")
+          f"Avg Used Params: {bvm['eff']/1e6:.2f}M | resMode: {bvm['res_frac']*100:.1f}% | gate_std: {bvm['gate_std']:.4f} ==========")
     print(f"  -> Plain/ResNet% per layer: {bvm['bm_str']}")
 
 if __name__ == '__main__':
