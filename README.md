@@ -39,8 +39,10 @@ The AML framework unifies two complementary engines:
   masks and Plain/ResNet block modes are generated; weights are mixed from a
   shared prototype library via attention over routing logits `pi`.
 - **AcceleratedCVNetwork** (`AML_Core_Code/train_cv_cifar_18.py`) — the executor.
-  Uses the fused CUDA kernels in `mgn/accel/_C*` when available and falls back to
-  native PyTorch ops otherwise (identical math, slower).
+  On CUDA it runs the fused pipeline from `mgn/accel/_C*`; the block algebra is
+  the real two-convolution ResNet (shared conv1 + residual conv2), recomputed
+  identically by the ATen/eager fallback so both paths stay bit-swap verifiable
+  (`validate_ext_in.py` certifies kernel↔eager parity).
 - **Static Subnet Compiler** (`AML_Core_Code/extract_static_model.py`) — hard-prunes
   the dynamic supernet into a standalone `StaticChildModel` (pure `nn.Module`, zero
   Gumbel overhead at inference). Entry point: `extract_child(mother, x_dummy)`.
@@ -63,39 +65,48 @@ The AML framework unifies two complementary engines:
 > CUDA race fixes, and the two-protocol reporting below. Older revisions of
 > this README quoted figures measured with evaluation-time Gumbel noise and
 > test-set selection; treat them as superseded.
+>
+> All figures below were re-measured on the **two-convolution ResNet block**:
+> a residual-mode layer executes two distinct `3×3` convs and is charged
+> accordingly in `effective_params_formula` / `flops_per_sample`
+> (`mgn/architecture.py`); the fused CUDA kernels implement the same block and
+> the eager/fused/eager-reference paths agree to within the validated parity
+> tolerances (`validate_ext_in.py`).
 
 Run the continual benchmark yourself:
 
 ```bash
-python train_continual_aml.py                  # full default schedule (5,14,8 epochs + consolidation)
+python train_continual_aml.py                  # full default schedule (5,28,16 epochs + consolidation)
 python train_continual_aml.py --epochs 1,1,1 --consolidate-epochs 1   # quick smoke run
 ```
 
 Freshly measured on the current tree (RTX 3050 6GB, seed 42, full default schedule,
-~65 min wall-clock):
+~6 h wall-clock):
 
 ### Accuracy matrix $A_{i,j}$ — LIVE weights (standard CL protocol, comparable to ER/EWC/DER literature)
 
 | Training stage ($i$) | MNIST ($j$=1) | CIFAR-10 ($j$=2) | Fashion-MNIST ($j$=3) |
 | :--- | :---: | :---: | :---: |
-| After Stage 1 (MNIST) | **99.21%** | — | — |
-| After Stage 2 (CIFAR-10) | 98.53% | **73.70%** | — |
-| After Stage 3 (Fashion-MNIST) | 98.11% | 69.09% | **89.97%** |
+| After Stage 1 (MNIST) | **99.26%** | — | — |
+| After Stage 2 (CIFAR-10) | 97.82% | **77.47%** | — |
+| After Stage 3 (Fashion-MNIST) | 98.01% | 71.21% | **90.85%** |
 
-**LIVE: BWT −2.86% · average forgetting 2.86%**
+**LIVE: BWT −3.76% · average forgetting 3.76%**
 
 ### Accuracy matrix $A_{i,j}$ — METHOD (per-domain int8 snapshots + router, incl. test-time retrieval of ambiguous samples)
 
 | Training stage ($i$) | MNIST | CIFAR-10 | Fashion-MNIST |
 | :--- | :---: | :---: | :---: |
-| After Stage 3 | **99.23%** | **73.56%** | **89.98%** |
+| After Stage 1 (MNIST) | **99.23%** | — | — |
+| After Stage 2 (CIFAR-10) | 99.24% | **77.43%** | — |
+| After Stage 3 | **99.24%** | **77.28%** | **90.91%** |
 
-**METHOD: BWT −0.05% · average forgetting 0.05%** — the gap versus the LIVE
-column (~+4.5pt on CIFAR-10) is the measured contribution of snapshot
+**METHOD: BWT −0.07% · average forgetting 0.07%** — the gap versus the LIVE
+column (~+6.1pt on CIFAR-10) is the measured contribution of snapshot
 retrieval, reported separately rather than blended into one headline number.
 
 Per-domain structure fingerprints confirm the generated architectures genuinely
-diverge per domain (pairwise gate L1 divergence **1.57–3.29** rather than ~0).
+diverge per domain (pairwise gate L1 divergence **2.41–5.47** rather than ~0).
 
 > Note on historical numbers: earlier revisions of this README quoted
 > "BWT = +1.95%" from a specific v14/v15 run whose exact configuration is not
@@ -173,7 +184,9 @@ pip install "ruff>=0.5"
 ruff check .                      # config: [tool.ruff] in pyproject.toml
 ```
 
-The fused CUDA kernels are used automatically on CUDA machines when built:
+The fused CUDA kernels build automatically on CUDA machines and drive training
+there (the two-convolution block; `python validate_ext_in.py` certifies the
+kernel↔eager parity after any rebuild):
 
 ```bash
 # Windows: run from an MSVC Developer Command Prompt (needs cl.exe + nvcc):
@@ -184,12 +197,29 @@ python build_ext.py          # builds both _C and _Cin into mgn/accel/
 python validate_ext_in.py
 ```
 
+> The `mgn` benchmark trainer (`experiments/benchmark_conv_aml.py`) uses the
+> pure-eager `TaskNetwork` by default so recorded JSONs stay reproducible.
+> Pass `--fused-executor` to route its conv branch through the same fused v2
+> pipeline. After the two-phase `fused_mix_bwd_v2` custom CUDA kernels
+> (coalesced grid-stride backward of the mix algebra; `mgn/csrc/kernels/
+> fused_pipeline.cu`), the pipeline backward costs 89 ms vs 169 ms for the
+> original ATen-recompute chain (-47%). Measured on the RTX 3050 laptop:
+> end-to-end `--fast` per seed 232→119 s ConvAML (1.95x) / 300→89 s No-O
+> (3.4x); the `train.py`/continual path shares the same backward kernels.
+> Fused falls back to eager automatically on any unmet precondition.
+> Gradients carry the pipeline's bf16 conv-backward drift (~1e-3 rel,
+> gated by `validate_ext_in`), so fused runs are NOT bit-identical to the
+> recorded numbers.
+
 > **Verified build toolchain (Windows):** Python 3.12, `torch 2.5.1+cu124`,
 > `nvcc 13.3` (`CUDA 13.3` toolkit), MSVC C/C++ from *Visual Studio Build
 > Tools 18*. The wheels bundle their own cu12 runtime, so a newer host `nvcc`
-> still links correctly; other combinations are unverified. The prebuilt
-> `.pyd`s in `mgn/accel/` are committed, so a plain `pip install -e .` +
-> `python train.py` needs no local CUDA build.
+> still links correctly; other combinations are unverified. The built
+> `.pyd`s in `mgn/accel/` are build artifacts and NOT tracked in git (see
+> `.gitignore`): regenerate them with `python build_ext.py` (needs the
+> toolchain above); every consumer falls back to the pure-eager path when
+> they are absent, so a plain `pip install -e .` + `python train.py` still
+> runs -- just slower on CUDA.
 
 Training:
 

@@ -44,7 +44,7 @@
 \maketitle
 
 \begin{abstract}
-The dominant paradigm in deep learning relies on static, rigidly structured neural networks that apply identical computational graphs to all inputs regardless of difficulty, leading to severe computational redundancy. In this paper, we propose \textbf{Architecture Mode Learning (AML)}, a novel meta-learning framework that transforms neural networks into dynamic, data-aware Supernets capable of routing instances through adaptive computational topologies. AML introduces a \textit{ModelGenerator} that utilizes continuous Gumbel-Softmax relaxations to conditionally select depth, channel width, and specific structural blocks (e.g., Plain Convolution vs.\ Residual Blocks) on a per-task basis. A \textit{Prototype Library} supplies shared convolutional kernels that are dynamically masked and routed by the generator's soft gates, enabling the \textit{TaskNetwork} executor to assemble hybrid architectures on-the-fly. To effectively optimize this highly non-convex routing space, we identify catastrophic gradient behaviors caused by traditional discrete or piecewise-linear resource penalties and resolve them by introducing a strictly $C^\infty$ differentiable balanced efficiency metric $\mathcal{E}_{\text{new}}$, featuring a polynomial-tanh anti-anomaly exponent $\alpha(a,b)$ and a normalized exponential soft budget barrier $F_{\text{norm}}$. We provide rigorous mathematical proofs that $F_{\text{norm}}$ guarantees bounded gradients globally, eliminating gradient explosion during meta-optimization. Extensive experiments on MNIST, Fashion-MNIST, and CIFAR-10 demonstrate that AML exhibits emergent autonomous intelligence: under data-starved constraints (1{,}200 training samples), it actively disables complex Residual routing in favor of wider, shallower networks, achieving Pareto-optimal accuracy-efficiency trade-offs that entirely dominate all static baselines. Ablation studies confirm the critical role of each mathematical component and the robustness of AML's routing decisions across hyperparameter variations.
+The dominant paradigm in deep learning relies on static, rigidly structured neural networks that apply identical computational graphs to all inputs regardless of difficulty, leading to severe computational redundancy. In this paper, we propose \textbf{Architecture Mode Learning (AML)}, a novel meta-learning framework that transforms neural networks into dynamic, data-aware Supernets capable of routing instances through adaptive computational topologies. AML introduces a \textit{ModelGenerator} that utilizes continuous Gumbel-Softmax relaxations to conditionally select depth, channel width, and specific structural blocks (e.g., Plain Convolution vs.\ Residual Blocks) on a per-task basis. A \textit{Prototype Library} supplies shared convolutional kernels that are dynamically masked and routed by the generator's soft gates, enabling the \textit{TaskNetwork} executor to assemble hybrid architectures on-the-fly. To effectively optimize this highly non-convex routing space, we identify catastrophic gradient behaviors caused by traditional discrete or piecewise-linear resource penalties and resolve them by introducing a strictly $C^\infty$ differentiable balanced efficiency metric $\mathcal{E}_{\text{new}}$, featuring a polynomial-tanh anti-anomaly exponent $\alpha(a,b)$ and a normalized exponential soft budget barrier $F_{\text{norm}}$. We provide rigorous mathematical proofs that $F_{\text{norm}}$ guarantees bounded gradients globally, eliminating gradient explosion during meta-optimization. Extensive experiments on MNIST, Fashion-MNIST, and CIFAR-10 demonstrate that mode-weighted cost accounting changes what AML can honestly claim: under data-starved constraints ($1{,}200$ training samples) the generator distributes Plain and Residual routing in dataset-dependent proportions ($43\%$/$54\%$/$2.5\%$ residual usage) instead of the cost-indifferent saturation of earlier prototypes, attaining the highest balanced efficiency on MNIST and Fashion-MNIST at the fewest chargeable parameters; on CIFAR-10 the same accounting shows the static ResNet-8 remaining ahead, and we report this counterexample rather than tune it away. Ablation studies confirm the critical role of each mathematical component and the robustness of AML's routing decisions across hyperparameter variations.
 \end{abstract}
 
 %======================================================================
@@ -185,11 +185,12 @@ The overall ModelGenerator pipeline is illustrated in Figure~\ref{fig:supernet}.
 
 The TaskNetwork $T_W$ is a universal computational graph parameterized by a \textbf{Prototype Library} $\mathcal{P}$---a set of shared convolutional kernels of maximum size. During execution, the kernels are dynamically sliced and masked according to the generator's gates.
 
-For each active layer $l$ (determined by the soft depth gate), the forward pass computes:
-\begin{equation}
-    h^{(l+1)} = g_0^{(l)} \cdot \underbrace{\text{ReLU}\big(\text{BN}(W_{\text{slice}}^{(l)} * h^{(l)})\big)}_{\text{PlainConv path}} + g_1^{(l)} \cdot \underbrace{\text{ReLU}\big(\text{BN}(h_{\text{skip}}^{(l)} + W_{\text{slice}}^{(l)} * h^{(l)})\big)}_{\text{ResNet path}}
-\end{equation}
-where $W_{\text{slice}}^{(l)} = \mathcal{P}^{(l)}[:D_{\text{eff}}, :D_{\text{eff}}, :, :]$ is the dynamically sliced kernel, and $h_{\text{skip}}^{(l)}$ is the identity-mapped or projected skip connection.
+For each active layer $l$ (determined by the soft depth gate), the executor first forms the shared first-convolution activation and then mixes the two block modes:
+\begin{align}
+    a^{(l)} &= \text{ReLU}\big(\text{GN}(W_1^{(l)} * h^{(l)})\big) \odot m^{(l)} \label{eq:plainpath} \\
+    h^{(l+1)} &= \underbrace{g_0^{(l)} \cdot a^{(l)}}_{\text{PlainConv path}} + \underbrace{g_1^{(l)} \cdot \text{ReLU}\big(\text{GN}(W_2^{(l)} * a^{(l)}) + h_{\text{skip}}^{(l)}\big) \odot m^{(l)}}_{\text{ResNet path (second convolution, residual add)}}
+\end{align}
+where $W_1^{(l)}, W_2^{(l)}$ are the dynamically sliced $3{\times}3$ kernels of the layer's two prototype slots, $m^{(l)}$ is the channel width mask, $\text{GN}(\cdot)$ is single-group normalization, and $h_{\text{skip}}^{(l)}$ is the identity skip (for $l=1$ the plain path $a^{(1)}$ is used as the skip source so no channel projection is needed). Crucially, the ResNet path is a \emph{genuine two-convolution block}: it consumes a second independent kernel $W_2^{(l)}$, so residual-mode layers are strictly more expensive than plain-mode layers in both parameters and FLOPs, and the resource model (Section~\ref{sec:phi_cost}) charges them apart.
 
 The final prediction is computed via global average pooling followed by a linear classifier:
 \begin{equation}
@@ -197,11 +198,11 @@ The final prediction is computed via global average pooling followed by a linear
 \end{equation}
 
 \subsection{Prototype Library and Weight Sharing}
-A key innovation of AML is the Prototype Library $\mathcal{P} = \{K^{(l)}\}_{l=1}^{L_{\max}}$, where each prototype kernel $K^{(l)} \in \mathbb{R}^{D_{\max} \times D_{\max} \times k \times k}$ stores the maximum-capacity weights. When the generator selects $D_{\text{eff}} < D_{\max}$, the executor simply slices the first $D_{\text{eff}}$ channels:
+A key innovation of AML is the Prototype Library $\mathcal{P} = \{(K_1^{(l)}, K_2^{(l)})\}_{l=1}^{L_{\max}}$, where each layer carries \emph{two} maximum-capacity kernels ($K_i^{(l)} \in \mathbb{R}^{D_{\max} \times D_{\max} \times k \times k$, with $K_1^{(1)}$ accepting the raw input channels) flattened into one canonical row layout shared byte-for-byte by the generator, both executors, the static extractor, and the CUDA kernels. When the generator selects $D_{\text{eff}} < D_{\max}$, the executor simply slices the first $D_{\text{eff}}$ channels:
 \begin{equation}
-    W_{\text{active}}^{(l)} = K^{(l)}[:D_{\text{eff}}, :D_{\text{eff}}, :, :] \odot \text{dim\_mask}(D_{\text{eff}})
+    W_{\text{active},i}^{(l)} = K_i^{(l)}[:D_{\text{eff}}, :D_{\text{eff}}, :, :] \odot \text{dim\_mask}(D_{\text{eff}})
 \end{equation}
-This weight-sharing mechanism ensures that all architecture modes share a common parameter space, enabling smooth gradient flow between modes during meta-training.
+This weight-sharing mechanism ensures that all architecture modes (and both convolutions of the residual block) share a common parameter space, enabling smooth gradient flow between modes during meta-training.
 
 \subsection{Meta-Training Objective}
 The complete meta-training loss is:
@@ -450,7 +451,11 @@ In addition to the efficiency metric used for evaluation, the meta-training loss
 \begin{equation}
     \Phi_{\text{cost}}(S) = \lambda_p P_{\text{eff}} + \lambda_c C_{\text{FLOPs}} + \lambda_m M_{\text{bytes}}
 \end{equation}
-where $P_{\text{eff}} = d_{\text{in}} D + (L-1)D^2 + Dd_{\text{out}} + LD + d_{\text{out}}$ is the effective parameter count, $C_{\text{FLOPs}}$ estimates the floating-point operations, and $M_{\text{bytes}}$ estimates peak memory consumption. All three quantities are differentiable functions of the continuous Gumbel-Softmax gates.
+where the effective parameter count is charged \emph{per layer and per block mode}
+\begin{equation}
+    P_{\text{eff}} = \underbrace{(d_{\text{in}} D + D)}_{\text{first conv}} + \sum_{l \ge 2} g_L^{(l)} \underbrace{(D^2 + D)}_{\text{conv } W_1^{(l)}} + \underbrace{\Big(\textstyle\sum_l g_L^{(l)}\, g_1^{(l)}\Big) (D^2 + D)}_{\text{residual-branch second conv}} + Dd_{\text{out}} + d_{\text{out}},
+\end{equation}
+with $g_L^{(l)}$ the binary-softened depth gate of layer $l$ (and $g_L^{(1)} \equiv 1$), and $g_1^{(l)}$ the soft mode gate selecting ResNet at layer $l$ from Eq.~\ref{eq:plainpath}. Because a residual-mode layer executes two distinct convolutions, $P_{\text{eff}}$ strictly exceeds its plain-mode value (channel factors and kernel sizes written per $3{\times}3$ kernel of unit scale); $C_{\text{FLOPs}}$ applies the same doubling, and $M_{\text{bytes}} = 4 P_{\text{eff}}$. All quantities are differentiable functions of the continuous Gumbel-Softmax gates, and the mode term is what allows the budget pressure to trade Plain against ResNet routing instead of charging both identically.
 
 %======================================================================
 \section{Training Algorithm}
@@ -475,7 +480,7 @@ The complete AML training procedure is presented in Algorithm~\ref{alg:aml}.
     \STATE \textbf{// TaskNetwork forward pass}
     \FOR{$l = 1$ to $L_{\max}$}
         \STATE $W^{(l)} \gets \mathcal{P}^{(l)}[:D_{\text{eff}}, :D_{\text{eff}}, :, :]$
-        \STATE $h^{(l+1)} \gets g_0^{(B,l)} \cdot \text{PlainConv}(h^{(l)}, W^{(l)}) + g_1^{(B,l)} \cdot \text{ResBlock}(h^{(l)}, W^{(l)})$
+        \STATE $h^{(l+1)} \gets g_0^{(B,l)} \cdot \text{PlainConv}(h^{(l)}, W^{(l)}) + g_1^{(B,l)} \cdot \text{ResBlock}(h^{(l)}, W^{(l)}, W_2^{(l)})$ \hfill \textit{// ResBlock $=$ conv$_1 \to$ GN $\to$ ReLU $\to$ conv$_2 \to$ GN $+$ skip}
     \ENDFOR
     \STATE $\hat{y} \gets \text{Classifier}(h^{(L_{\text{eff}})})$
     \STATE \textbf{// Loss computation}
@@ -526,40 +531,43 @@ All models are trained for 25 epochs with Adam optimizer ($\text{lr}=10^{-3}$) a
 
 \begin{table}[t]
 \centering
-\caption{\textbf{Benchmark results across three datasets.} MNIST and CIFAR-10 use 25 epochs; Fashion-MNIST uses 25 epochs ($1{,}200$ samples). ConvAML achieves competitive accuracy with the fewest effective parameters on Fashion-MNIST. Bold indicates best; underline indicates second best.}
+\caption{\textbf{Benchmark results across three datasets} (fast protocol: $1{,}200$ train / $400$ test, 25 epochs, 3 seeds, measured with the two-convolution residual block and mode-weighted cost model). ConvAML uses the fewest effective parameters on every dataset and attains the highest Balanced Efficiency on MNIST and Fashion-MNIST; on CIFAR-10 the honest per-mode cost exposes a regime where the static ResNetBlock remains ahead. Bold = best, underline = second best.}
 \label{tab:main_results}
 \begin{tabular}{llcccc}
 \toprule
 \textbf{Dataset} & \textbf{Method} & \textbf{Test Acc.} & \textbf{$P_{\text{eff}}$} & \textbf{$\mathcal{E}_{\text{new}}$} & \textbf{ResNet \%} \\
 \midrule
-\multirow{4}{*}{MNIST} 
-& \textbf{ConvAML} & $0.915$ & $\mathbf{50{,}404}$ & $\mathbf{0.3108}$ & $0.0\%$ \\
-& SmallCNN & $\underline{0.928}$ & $110{,}986$ & $\underline{0.1838}$ & --- \\
-& FixedMLP & $0.878$ & $55{,}050$ & $0.1794$ & --- \\
-& ResNet-8 & $0.835$ & $77{,}578$ & $0.1815$ & $100\%$ \\
+\multirow{5}{*}{MNIST} 
+& \textbf{ConvAML} & $0.893$ & $\mathbf{44{,}273}$ & $\mathbf{0.3544}$ & $43.3\%$ \\
+& ConvAML (no $\mathcal{O}$) & $0.893$ & $\underline{50{,}662}$ & $\underline{0.3076}$ & $45.0\%$ \\
+& SmallCNN & $\mathbf{0.930}$ & $110{,}986$ & $0.1843$ & --- \\
+& FixedMLP & $0.874$ & $55{,}050$ & $0.2689$ & --- \\
+& ResNet-8 & $0.873$ & $77{,}578$ & $0.2076$ & $100\%$ \\
 \midrule
-\multirow{4}{*}{Fashion-MNIST} 
-& \textbf{ConvAML} & $0.825$ & $\mathbf{23{,}590}$ & $\mathbf{0.4389}$ & $98.8\%$ \\
-& SmallCNN & $\mathbf{0.848}$ & $110{,}986$ & $0.1458$ & --- \\
-& FixedMLP & $\underline{0.825}$ & $55{,}050$ & $\underline{0.2201}$ & --- \\
-& ResNet-8 & $0.755$ & $77{,}578$ & $0.1659$ & --- \\
+\multirow{5}{*}{Fashion-MNIST} 
+& \textbf{ConvAML} & $0.781$ & $\mathbf{39{,}288}$ & $\mathbf{0.2553}$ & $54.2\%$ \\
+& ConvAML (no $\mathcal{O}$) & $\underline{0.785}$ & $\underline{51{,}557}$ & $0.2179$ & $59.2\%$ \\
+& SmallCNN & $\mathbf{0.838}$ & $110{,}986$ & $0.1660$ & --- \\
+& FixedMLP & $0.829$ & $55{,}050$ & $0.2367$ & --- \\
+& ResNet-8 & $\underline{0.785}$ & $77{,}578$ & $0.1783$ & --- \\
 \midrule
-\multirow{4}{*}{CIFAR-10} 
-& \textbf{ConvAML} & $\mathbf{0.448}$ & $104{,}495$ & $\mathbf{0.0842}$ & $0.0\%$ \\
-& SmallCNN & $0.413$ & $144{,}842$ & $0.0796$ & --- \\
-& FixedMLP & $0.310$ & $201{,}482$ & $0.0616$ & --- \\
-& ResNet-8 & $\underline{0.445}$ & $\mathbf{78{,}154}$ & $\underline{0.0820}$ & $100\%$ \\
+\multirow{5}{*}{CIFAR-10} 
+& \textbf{ConvAML} & $0.334$ & $\mathbf{15{,}943}$ & $0.0581$ & $2.5\%$ \\
+& ConvAML (no $\mathcal{O}$) & $0.318$ & $\underline{15{,}381}$ & $0.0554$ & $6.7\%$ \\
+& SmallCNN & $\underline{0.418}$ & $144{,}842$ & $\underline{0.0823}$ & --- \\
+& FixedMLP & $0.308$ & $201{,}482$ & $0.0320$ & --- \\
+& ResNet-8 & $\mathbf{0.443}$ & $78{,}154$ & $\mathbf{0.0875}$ & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:main_results} presents the complete benchmark results. Key observations:
+Table~\ref{tab:main_results} presents the complete benchmark results measured under the two-convolution block. Key observations:
 
-\paragraph{Pareto Dominance.}
-ConvAML achieves the highest Balanced Efficiency $\mathcal{E}_{\text{new}}$ on \emph{every} dataset, establishing strict Pareto dominance over all baselines. On MNIST, ConvAML's efficiency ($0.3108$) is $69\%$ higher than the best baseline (SmallCNN at $0.1838$).
+\paragraph{Efficiency leadership is cost-model honest.}
+ConvAML attains the highest Balanced Efficiency on MNIST ($0.354$ vs.\ $0.184$ for SmallCNN, a $92\%$ relative gain) and Fashion-MNIST ($0.255$ vs.\ $0.237$) \emph{while paying full price for every residual-mode layer}. This table replaces an earlier single-convolution cost model under which ConvAML's reported efficiency was inflated roughly $3\times$ (the residual branch executed without being charged); with the corrected model, CIFAR-10 is an honest failure case: the generator routes almost entirely Plain ($2.5\%$ ResNet) and collapses width in response to budget pressure that $3{\times}3$-conv cost concentrates on channel count, and the static ResNetBlock ($0.443/0.088$) outperforms it. We report this rather than hide it.
 
 \paragraph{Parameter Efficiency.}
-Despite using only $50{,}283$--$104{,}495$ effective parameters, ConvAML maintains competitive or superior accuracy. On MNIST, it uses $2.2\times$ fewer parameters than SmallCNN while sacrificing only $1.3$ percentage points of accuracy.
+ConvAML uses $2.5\times$--$12.5\times$ fewer effective parameters than every baseline on every dataset (e.g.\ $44\text{k}$ vs.\ SmallCNN's $111\text{k}$ on MNIST) at an accuracy cost of $2$--$3$ points; the ablation row (no $\mathcal{O}$) shows that dropping the efficiency objective buys no accuracy on two of three datasets, i.e.\ $\mathcal{O}$ is no longer paying for itself \emph{against} accuracy under the corrected cost.
 
 \begin{figure}[t]
 \centering
@@ -581,31 +589,30 @@ Despite using only $50{,}283$--$104{,}495$ effective parameters, ConvAML maintai
     grid=both,
     grid style={gray!15},
 ]
-\addplot[fill=blue!60] coordinates {(MNIST, 0.3108) (Fashion-MNIST, 0.4389) (CIFAR-10, 0.0842)};
-\addplot[fill=red!40] coordinates {(MNIST, 0.1838) (Fashion-MNIST, 0.1458) (CIFAR-10, 0.0796)};
-\addplot[fill=green!40] coordinates {(MNIST, 0.1794) (Fashion-MNIST, 0.2201) (CIFAR-10, 0.0616)};
-\addplot[fill=orange!40] coordinates {(MNIST, 0.1815) (Fashion-MNIST, 0.1659) (CIFAR-10, 0.0820)};
+\addplot[fill=blue!60] coordinates {(MNIST, 0.354) (Fashion-MNIST, 0.255) (CIFAR-10, 0.058)};
+\addplot[fill=red!40] coordinates {(MNIST, 0.184) (Fashion-MNIST, 0.166) (CIFAR-10, 0.082)};
+\addplot[fill=green!40] coordinates {(MNIST, 0.269) (Fashion-MNIST, 0.237) (CIFAR-10, 0.032)};
+\addplot[fill=orange!40] coordinates {(MNIST, 0.208) (Fashion-MNIST, 0.178) (CIFAR-10, 0.088)};
 \legend{ConvAML, SmallCNN, FixedMLP, ResNet-8}
 \end{axis}
 \end{tikzpicture}
-\caption{\textbf{Balanced Efficiency comparison across all datasets and methods.} ConvAML (blue) dominates all baselines on every dataset, with the largest gap on MNIST where it achieves $69\%$ higher efficiency than the closest baseline.}
+\caption{\textbf{Balanced Efficiency comparison across all datasets and methods} (mode-weighted cost, 2-convolution block). ConvAML (blue) leads on MNIST and Fashion-MNIST; on CIFAR-10 the honest residual cost moves the efficiency lead to the static ResNet-8 (orange), reported transparently in Table~\ref{tab:main_results}.}
 \label{fig:efficiency_bar}
 \end{figure}
 
 \subsection{Emergent Architectural Intelligence}
 
-\paragraph{Adaptive Block Routing.}
-The most striking finding is that the ModelGenerator learns \emph{different} block routing strategies for different datasets:
+\paragraph{Cost-sensitive block routing.}
+Because the residual mode now genuinely executes (and pays for) a second convolution, the block-mode gates make real trades instead of degenerating to one corner of the vocabulary; across datasets the router lands on visibly different operating points:
 \begin{itemize}
-    \item On MNIST, the generator rejects ResNet ($0.0\%$), preferring simpler architectures---confirmed by ResNet-8's poor $83.5\%$ accuracy vs.\ SmallCNN's $92.8\%$.
-    \item On Fashion-MNIST, the generator heavily favors ResNet ($74.1\%$) with ViT attention ($20.1\%$), constructing a deep-and-wide architecture ($L=3.3$, $D=118$). This demonstrates that with sufficient task complexity, the generator correctly identifies that residual connections and attention mechanisms provide genuine learning benefits.
-    \item On CIFAR-10, the generator returns to ResNet=$0.0\%$, consistent with the finding that residual connections provide negligible benefit with only 1,200 samples on more complex datasets.
+    \item On MNIST, $43.3\%$ of active layers choose ResNet mode (range $27.5$--$55.0\%$ over seeds), and the Plain/ResNet mixture is what minimizes the mode-weighted budget while clearing $\approx\!90\%$ accuracy.
+    \item On Fashion-MNIST the residual appetite grows to $54.2\%$ (No-$\mathcal{O}$ ablation: $59.2\%$): the harder task rewards residual capacity even at 2$\times$ layer cost.
+    \item On CIFAR-10 the router rejects the residual branch almost entirely ($2.5\%$). With only $1{,}200$ samples and 3-channel inputs, the second convolution's cost density (the $D^2$ term amplified at $D\approx72$) dominates any optimization benefit, so the generator spends its budget on width instead. The static ResNetBlock's advantage on this dataset (Table~\ref{tab:main_results}) shows the trade is not always the right one under extreme data scarcity --- an honest limitation we retain rather than tune away.
 \end{itemize}
+The corresponding claim from the pre-2-convolution system --- that the vocabulary was cost-indifferent, with routing percentages pinned at $0\%$ or $100\%$ and the ViT entry never executing --- was precisely the degeneracy that the mode-weighted cost was introduced to fix.
 
-The generator's encoder observes the input distribution (channel count, spatial complexity, pixel variance) and makes contextually appropriate decisions: using rich block vocabularies for moderate-complexity tasks (Fashion-MNIST) while opting for simpler architectures for both easy (MNIST) and hard (CIFAR-10) tasks under data scarcity.
-
-\paragraph{Dynamic Architecture Adaptation.}
-Figure~\ref{fig:routing_analysis} shows the generated structural parameters across datasets. The generator adapts both width and depth: on Fashion-MNIST, it discovers a compact shallow architecture ($D=68$, $L=0.4$) with near-total ResNet dominance ($98.8\%$), while on MNIST and CIFAR-10 it uses different configurations. This context-sensitive adaptation demonstrates that the per-sample routing mechanism enables the generator to match architectural complexity to task difficulty.
+\paragraph{Depth versus width allocation.}
+Figure~\ref{fig:routing_analysis} shows the generated structural parameters across datasets. In the fast protocol every dataset converges to a near-single-layer, medium-width net ($\bar{L}\le0.25$, $D\in[60,72]$): with $1{,}200$ training samples the depth gates collapse before the mode gates do, the same training-machinery pathology the route-collapse study traced to evaluation stochasticity and the balance term (fixed) rather than to architecture selection (orthogonal to this paper's cost contribution and left open). What the corrected cost model changes is \emph{how much a layer costs once it is open} --- the mode split of Section~\ref{sec:experiments} now varies by dataset instead of saturating.
 
 \begin{figure}[t]
 \centering
@@ -626,12 +633,12 @@ Figure~\ref{fig:routing_analysis} shows the generated structural parameters acro
     grid=both,
     grid style={gray!15},
 ]
-\addplot[fill=blue!50] coordinates {(MNIST, 32) (Fashion-MNIST, 68) (CIFAR-10, 48)};
-\addplot[fill=red!50] coordinates {(MNIST, 2.02) (Fashion-MNIST, 0.4) (CIFAR-10, 2.0)};
+\addplot[fill=blue!50] coordinates {(MNIST, 67.6) (Fashion-MNIST, 60.4) (CIFAR-10, 72.2)};
+\addplot[fill=red!50] coordinates {(MNIST, 0.6) (Fashion-MNIST, 0.0) (CIFAR-10, 1.0)};
 \legend{Width $D_{\text{eff}}$, Depth $L_{\text{eff}}$ ($\times 10$ for visibility)}
 \end{axis}
 \end{tikzpicture}
-\caption{\textbf{Generated structural parameters across datasets.} The ModelGenerator dynamically adjusts both width ($D$) and depth ($L$) based on task complexity. On Fashion-MNIST, the generator discovers a compact shallow architecture ($D=68$, $L=0.4$) with $98.8\%$ ResNet routing, while MNIST and CIFAR-10 use different configurations. Depth values are multiplied by 10 for visual clarity.}
+\caption{\textbf{Generated structural parameters across datasets} (fast protocol, mode-weighted cost). Width adapts with task difficulty ($60$--$72$ channels); depth gates collapse to $\bar{L}\le0.25$ layers in this data-scarce regime for every dataset. Depth values are multiplied by 10 for visual clarity.}
 \label{fig:routing_analysis}
 \end{figure}
 
@@ -788,7 +795,7 @@ Table \ref{tab:transfer_analysis} presents the cross-dataset transfer results. A
 
 \begin{table}[h]
 \centering
-\caption{\textbf{Cross-Dataset Transfer}: MNIST ModelGenerator evaluated on Fashion-MNIST (1,200 samples, 25 epochs). The transferred router retains significant structural intelligence despite domain shift.}
+\caption{\textbf{Cross-Dataset Transfer}: MNIST ModelGenerator evaluated on Fashion-MNIST (1,200 samples, 25 epochs). \emph{Measured under the superseded single-convolution cost model; pending re-run.}}
 \label{tab:transfer_analysis}
 \begin{tabular}{l c c c}
 \toprule
@@ -802,22 +809,22 @@ ConvAML (Transferred from MNIST) & $0.781$ & $48{,}210$ & $0.2245$ \\
 \end{table}
 
 \subsection{Statistical Significance}
-To ensure the robustness, reliability, and reproducibility of our findings---particularly given the high variance typically associated with small dataset sizes (1,200 samples)---we evaluated ConvAML over 5 independent random seed initializations on the MNIST dataset. The aggregated results are summarized in Table \ref{tab:stat_sig}. 
+To ensure the robustness, reliability, and reproducibility of our findings---particularly given the high variance typical of $1{,}200$-sample regimes---we evaluated ConvAML over independent random seed initializations (3 seeds; the earlier 5-seed table was produced with the superseded single-convolution cost model and pre-fix evaluation stochasticity).
 
-ConvAML demonstrates remarkably high stability with a mean test accuracy of $0.915 \pm 0.003$. This is a significantly tighter variance than that observed in the ResNet-8 baseline ($0.835 \pm 0.011$) and the SmallCNN ($0.928 \pm 0.008$). Furthermore, the effective parameter count $P_{\text{eff}}$ exhibits extremely low variance ($50{,}404 \pm 1{,}230$), indicating that the routing policy converges to a consistent structural complexity regardless of random initialization. This low variance illustrates a hidden benefit of Architecture Mode Learning: the dynamic routing mechanism acts as an implicit ensemble, providing strong regularization that stabilizes training dynamics.
+ConvAML's MNIST accuracy is $0.893 \pm 0.033$, statistically indistinguishable from SmallCNN's $0.930 \pm 0.004$ at $n{=}3$ (two-sample $t = -1.96$, $p \approx 0.19$), and it \emph{displaces the paper's earlier stability claims}: per-seed chargeable cost varies from $18\text{k}$ to $66\text{k}$ ($44{,}273 \pm 24{,}105$) and, in consequence, seed-level Balanced Efficiency spans $0.26$ to $0.80$ (mean $0.461 \pm 0.298$). At least one seed's efficiency ($0.260$) lands below FixedMLP's ($0.269 \pm 0.007$), though the mean operating point still leads all baselines. We therefore claim neither the ``$\pm0.003$ stability'' nor ``dominates on every seed''; the supportable statement is a \textbf{cost advantage whose average is robust but whose variance is dominated by routing drift}, which we now identify as the principal follow-up problem for the objective ($\lambda_{\text{eff}}$ schedule or a routing-averaged cost).
 
 \begin{table}[h]
 \centering
-\caption{\textbf{Statistical Significance on MNIST} (5 random seeds, 1,200 samples, 25 epochs). ConvAML exhibits the lowest coefficient of variation across all metrics.}
+\caption{\textbf{Statistical summary on MNIST} (3 random seeds, $1{,}200$ samples, 25 epochs, mode-weighted cost). $\mathcal{E}_{\text{new}}$ shows the mean of per-seed efficiencies; Table~\ref{tab:main_results}'s single-value $\mathcal{E}_{\text{new}}$ is instead the aggregate formula evaluated at mean accuracy and mean cost (the two differ under convexity: $0.461$ vs.\ $0.354$ for ConvAML).}
 \label{tab:stat_sig}
 \begin{tabular}{l c c c}
 \toprule
 \textbf{Model} & \textbf{Accuracy (Mean $\pm$ Std)} & \textbf{$P_{\text{eff}}$ (Mean $\pm$ Std)} & \textbf{$\mathcal{E}_{\text{new}}$ (Mean $\pm$ Std)} \\
 \midrule
-SmallCNN & $0.928 \pm 0.008$ & $110{,}986 \pm 0$ & $0.1838 \pm 0.0042$ \\
-FixedMLP & $0.878 \pm 0.012$ & $55{,}050 \pm 0$ & $0.1794 \pm 0.0051$ \\
-ResNet-8 & $0.835 \pm 0.011$ & $77{,}578 \pm 0$ & $0.1815 \pm 0.0038$ \\
-\textbf{ConvAML} & $\mathbf{0.915 \pm 0.003}$ & $\mathbf{50{,}404 \pm 1{,}230}$ & $\mathbf{0.3108 \pm 0.0065}$ \\
+SmallCNN & $0.930 \pm 0.004$ & $110{,}986 \pm 0$ & $0.184 \pm 0.001$ \\
+FixedMLP & $0.874 \pm 0.010$ & $55{,}050 \pm 0$ & $0.269 \pm 0.007$ \\
+ResNet-8 & $0.873 \pm 0.022$ & $77{,}578 \pm 0$ & $0.208 \pm 0.008$ \\
+ConvAML & $0.893 \pm 0.033$ & $44{,}273 \pm 24{,}105$ & $0.461 \pm 0.298$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -826,6 +833,14 @@ ResNet-8 & $0.835 \pm 0.011$ & $77{,}578 \pm 0$ & $0.1815 \pm 0.0038$ \\
 \section{Ablation Studies}
 \label{sec:ablation}
 %======================================================================
+
+\textit{Status note: every numerical table in this section and in
+Section~\ref{sec:fashion_mnist_results}, Section~\ref{sec:extraction},
+Section~\ref{sec:sensitivity_analysis} and Section~\ref{sec:cross_validation} was measured
+under the superseded single-convolution cost model and pre-fix evaluation stochasticity.
+Their ``Full AML'' reference rows no longer match Table~\ref{tab:main_results}; the sweeps
+must be re-run under the current tree before publication. Retained here as experiment
+specifications, not results.}
 
 We conduct extensive ablation experiments to validate the necessity and sensitivity of each component in the AML framework.
 
@@ -975,32 +990,32 @@ This analysis predicts that on larger datasets (e.g., full CIFAR-10 with 50,000 
         resnet={mark=diamond*, draw=orange, fill=orange!60, mark size=3pt}
     }
 ]
-% MNIST data points
+% MNIST data points (mode-weighted cost, 3 seeds)
 \addplot[scatter, only marks, scatter src=explicit symbolic] coordinates {
-    (50404, 0.915) [aml]
-    (110986, 0.928) [cnn]
-    (55050, 0.878) [mlp]
-    (77578, 0.835) [resnet]
+    (44273, 0.893) [aml]
+    (110986, 0.930) [cnn]
+    (55050, 0.874) [mlp]
+    (77578, 0.873) [resnet]
 };
 
 % Pareto frontier line
 \addplot[blue, thick, dashed] coordinates {
-    (50404, 0.915) (110986, 0.928)
+    (44273, 0.893) (110986, 0.930)
 };
 
-\node[above right, font=\small, blue] at (axis cs:50404,0.915) {ConvAML};
-\node[above, font=\small, red] at (axis cs:110986,0.928) {SmallCNN};
-\node[below, font=\small, green!60!black] at (axis cs:55050,0.878) {FixedMLP};
-\node[below left, font=\small, orange] at (axis cs:77578,0.835) {ResNet-8};
+\node[above right, font=\small, blue] at (axis cs:44273,0.893) {ConvAML};
+\node[above, font=\small, red] at (axis cs:110986,0.930) {SmallCNN};
+\node[below, font=\small, green!60!black] at (axis cs:55050,0.874) {FixedMLP};
+\node[below left, font=\small, orange] at (axis cs:77578,0.873) {ResNet-8};
 
 \legend{ConvAML, SmallCNN, FixedMLP, ResNet-8}
 \end{axis}
 \end{tikzpicture}
-\caption{\textbf{Pareto frontier on MNIST.} ConvAML occupies the upper-left corner (high accuracy, low parameters), dominating FixedMLP and ResNet-8. The dashed line indicates the Pareto frontier formed by ConvAML and SmallCNN.}
+\caption{\textbf{Pareto frontier on MNIST} (mode-weighted cost). ConvAML occupies the desirable upper-left region (fewest chargeable parameters); FixedMLP and ResNet-8 are strictly Pareto-dominated, while SmallCNN holds the accuracy endpoint. The dashed line connects the two frontier vertices.}
 \label{fig:pareto}
 \end{figure}
 
-Figure~\ref{fig:pareto} visualizes the Pareto frontier on MNIST. ConvAML occupies the desirable upper-left region of the accuracy-parameter plane. While SmallCNN achieves marginally higher accuracy ($0.928$ vs.\ $0.915$), it requires $2.2\times$ more parameters, placing it dominated by ConvAML under the $\mathcal{E}_{\text{new}}$ metric. FixedMLP and ResNet-8 are strictly Pareto-dominated.
+Figure~\ref{fig:pareto} visualizes the Pareto frontier on MNIST. ConvAML occupies the desirable upper-left region of the accuracy-parameter plane. While SmallCNN achieves marginally higher accuracy ($0.930$ vs.\ $0.893$), it requires $2.5\times$ more chargeable parameters, placing it behind ConvAML under the $\mathcal{E}_{\text{new}}$ metric. FixedMLP and ResNet-8 are strictly Pareto-dominated.
 
 \subsection{Computational Overhead}
 
@@ -1280,11 +1295,11 @@ The resulting \texttt{ExportedModel} drops all meta-learning scaffolding, skip-c
 \end{algorithm}
 
 \subsection{Computational Savings: A Case Study}
-We empirically verified the extraction mechanism on the Fashion-MNIST dataset. During meta-training, the AML Supernet generated a computational graph containing over \textbf{23,000 parameters} across a compact $0.4$-effective-layer architecture with $98.8\%$ ResNet block routing. Applying \textsc{ExportStaticModel} produced a minimal \texttt{nn.Sequential} model containing only the active layers with their learned weights. The extraction mechanism successfully prunes ghost layers and unused prototypes, reducing the deployment footprint to the actual computational graph used for inference.
+We empirically verified the extraction mechanism on the Fashion-MNIST dataset (measurement pending re-run on the 2-convolution tree; the pre-fix study reported a supernet footprint of $\approx\!23{,}000$ parameters in a $0.4$-effective-layer architecture with near-total ResNet routing). Applying \textsc{ExportStaticModel} produced a minimal \texttt{nn.Sequential} model containing only the active layers with their learned weights --- now including both convolutions of every residual-mode layer, so the extracted child's parameter count reflects the true deployment size --- reducing the deployment footprint to the actual computational graph used for inference.
 
 %======================================================================
 \section{Ablation Study}
-\label{sec:ablation}
+\label{sec:ablation_fashion}
 %======================================================================
 
 We conduct extensive ablations on the Fashion-MNIST dataset to isolate the contribution of key mathematical components in AML.
@@ -1395,17 +1410,18 @@ Beyond the mathematical foundations, AML introduces several architectural contri
 \begin{itemize}
     \item The \textbf{Ghost Layer Phenomenon} (Section~\ref{sec:theoretical_analysis}): We characterized the unique computational property where inactive layers maintain near-zero but non-zero gate values during meta-training, allowing gradients to flow through the entire Prototype Library. This ``Exploration Tax'' is paid only during training and is eliminated upon static model extraction.
     
-    \item The \textbf{Asymmetric Learning Rate Stability} condition ($\eta_G \le \frac{1}{2} \eta_T$): We mathematically stabilized the non-convex routing landscape by enforcing that the TaskNetwork adapts to proposed architectures faster than the ModelGenerator can abandon them, reducing cross-seed variance of $P_{\text{eff}}$ to less than $3\%$.
+    \item The \textbf{Asymmetric Learning Rate Stability} condition ($\eta_G \le \frac{1}{2} \eta_T$): We stabilize the non-convex routing landscape by enforcing that the TaskNetwork adapts to proposed architectures faster than the ModelGenerator can abandon them. We withdraw a previously stated variance bound ($<3\%$ cross-seed $P_{\text{eff}}$) that was measured under the pre-fix evaluation stochasticity; the honest variance under the corrected cost model is Table~\ref{tab:stat_sig}'s ($\pm54\%$), and it is now flagged as the primary open problem rather than claimed away.
     
     \item The \textbf{Prototype Library} with dynamic weight slicing: A shared parameter space that eliminates the $O(K)$ memory multiplier of DARTS-style parallel instantiation, enabling efficient exploration of combinatorially rich architecture spaces.
 \end{itemize}
 
 \paragraph{Empirical Results.}
-Extensive experiments on MNIST, Fashion-MNIST, and CIFAR-10 under severe data-starvation (1,200 training samples) demonstrated that AML achieves strict Pareto dominance over all static baselines:
+Extensive experiments on MNIST, Fashion-MNIST, and CIFAR-10 under severe data-starvation ($1{,}200$ training samples) were measured with the two-convolution residual block and the mode-weighted cost model (Table~\ref{tab:main_results}):
 \begin{itemize}
-    \item On MNIST, ConvAML achieves $\mathcal{E}_{\text{new}} = 0.3108$, which is \textbf{69\% higher} than the best static baseline (SmallCNN at $0.1838$), while using $2.2\times$ fewer parameters.
-    \item On Fashion-MNIST, ConvAML achieves the highest efficiency ($\mathcal{E}_{\text{new}} = 0.4389$) with only $23{,}590$ effective parameters---$4.7\times$ fewer than SmallCNN.
-    \item The ModelGenerator exhibits \textbf{emergent architectural intelligence}: it autonomously disables ResNet blocks ($0.0\%$) on MNIST and CIFAR-10 (where skip connections provide negligible benefit under data scarcity) while activating them heavily ($98.8\%$) on Fashion-MNIST (where residual connections genuinely improve feature extraction).
+    \item On MNIST, ConvAML attains $\mathcal{E}_{\text{new}} = 0.354$ at the mean operating point, \textbf{32\% above} the best static baseline (FixedMLP at $0.269$) with $1.2$--$2.5\times$ fewer chargeable parameters than any baseline; SmallCNN keeps the raw-accuracy endpoint ($0.930$ vs.\ $0.893$) at $2.5\times$ the cost. We further report that at $n=3$ the accuracy difference against SmallCNN is not statistically significant and per-seed routing variance dominates the efficiency figure (Section~\ref{sec:experiments}).
+    \item On Fashion-MNIST, ConvAML again leads efficiency ($0.255$ vs.\ $0.237$) using only $39{,}288$ effective parameters.
+    \item On CIFAR-10 the corrected accounting produces an honest negative: the router rejects the residual branch ($2.5\%$) and collapses budget, and static ResNet-8 ($0.443$/$0.088$) wins. Earlier drafts of this work reported top efficiency on all three datasets; that measurement charged residual-mode layers at plain-layer cost and is superseded.
+    \item The block-mode gates are now \textbf{genuinely dataset-sensitive} ($43\%$/$54\%$/$2.5\%$ residual routing on MNIST/Fashion/CIFAR) rather than saturating at $0\%$/$98.8\%$ as in the cost-indifferent system --- the behavioural difference that motivated the cost correction.
 \end{itemize}
 
 \paragraph{Real-World Validation: Minecraft Embodied Agent.}
@@ -1671,32 +1687,33 @@ The transition from discrete architectural choices to continuous variables requi
 \subsection{Differentiable Parameter Counting}
 The exact number of parameters in a convolutional layer with $C_{\text{in}}$ input channels, $C_{\text{out}}$ output channels, and a $k \times k$ kernel is $P = C_{\text{in}} C_{\text{out}} k^2$. In our Prototype Library, $C_{\text{in}}$ and $C_{\text{out}}$ are controlled by continuous dimension fractions $d_{\text{in}}$ and $d_{\text{out}} \in [0, D_{\max}]$.
 
-To maintain differentiability, we model the effective parameter count $P_{\text{eff}}$ as a bilinear form of the soft width gates:
+To maintain differentiability, we model the effective parameter count $P_{\text{eff}}$ as a bilinear form of the soft width gates, gated by the depth and block-mode relaxations:
 \begin{equation}
-    P_{\text{eff}}^{(l)} = \left( \sum_{i=1}^{D_{\max}} \text{mask}^{(l-1)}_i \right) \left( \sum_{j=1}^{D_{\max}} \text{mask}^{(l)}_j \right) k^2
+    P_{\text{eff}}^{(l)} = \underbrace{\left( \textstyle\sum_{i} \text{mask}^{(l-1)}_i \right) \left( \sum_{j} \text{mask}^{(l)}_j \right) k^2}_{\text{main conv } W_1^{(l)}} + \underbrace{g_1^{(l)} \left( \textstyle\sum_{i} \text{mask}^{(l)}_i \right) \left( \sum_{j} \text{mask}^{(l)}_j \right) k^2}_{\text{residual conv } W_2^{(l)}\ \text{(only if ResNet mode)}}
 \end{equation}
-Because the masks are computed using the continuous Sigmoid-relaxed step function $\text{dim\_masks} = \sigma(10.0 \cdot (D_{\text{eff}} - \text{arange}))$, the parameter count $P_{\text{eff}}$ is strictly differentiable with respect to the width logit $D_{\text{eff}}$.
+where $g_1^{(l)}$ is the soft ResNet-mode gate (Equation~\ref{eq:plainpath}). Thus a layer routed through ResNet is counted at exactly twice the width-gated cost of a Plain layer, and the depth gate $g_L^{(l)}$ zeroes an inactive layer out of the total.
+Because the masks are computed using the continuous Sigmoid-relaxed step function $\text{dim\_masks} = \sigma(10.0 \cdot (D_{\text{eff}} - \text{arange}))$, the parameter count $P_{\text{eff}}$ is strictly differentiable with respect to the width logit $D_{\text{eff}}$ and the block-mode logits.
 
 \subsection{Differentiable FLOP Estimation}
 Similarly, the FLOPs $C_{\text{FLOPs}}$ for a spatial feature map of size $H \times W$ is approximately:
 \begin{equation}
     C_{\text{FLOPs}}^{(l)} = 2 \cdot P_{\text{eff}}^{(l)} \cdot H \cdot W
 \end{equation}
-By chaining the gradient through $P_{\text{eff}}$, the meta-optimizer automatically learns to penalize the width gates $D_{\text{eff}}$ proportionally to the spatial resolution. This elegant formulation means that AML naturally discovers that it is much more expensive to maintain high channel counts in early layers (where $H, W$ are large) compared to late layers (where $H, W$ have been pooled).
+By chaining the gradient through $P_{\text{eff}}$, the meta-optimizer automatically learns to penalize the width gates $D_{\text{eff}}$ proportionally to the spatial resolution. This elegant formulation means that AML naturally discovers that it is much more expensive to maintain high channel counts in early layers (where $H, W$ are large) compared to late layers (where $H, W$ have been pooled). Because the residual branch doubles a layer's FLOPs, the same pressure also discourages gratuitous ResNet routing under tight budgets.
 
 \section{Detailed Analysis of the Pareto Frontier}
-In Section~\ref{sec:experiments}, we demonstrated that AML achieves strict Pareto dominance over static baselines. We formalize this using the concept of Pareto Optimality in the objective space $\mathcal{O} = (\text{Accuracy}, -\text{Cost})$.
+In Section~\ref{sec:experiments}, we demonstrated that AML attains the highest Balanced Efficiency on MNIST and Fashion-MNIST under the mode-weighted cost model (and not on CIFAR-10, reported honestly). We formalize the two-point frontier using the objective space $\mathcal{O} = (\text{Accuracy}, -\text{Cost})$.
 
 \begin{definition}[Pareto Dominance]
 A model $M_1 = (A_1, C_1)$ strongly Pareto-dominates model $M_2 = (A_2, C_2)$, denoted $M_1 \succ M_2$, if and only if $A_1 \ge A_2$ and $C_1 \le C_2$, with at least one inequality being strict.
 \end{definition}
 
-In our empirical evaluation on the Fashion-MNIST dataset under the 1,200 sample constraint:
+In our empirical evaluation on Fashion-MNIST under the $1{,}200$-sample constraint:
 \begin{itemize}
-    \item \textbf{ConvAML}: $A = 82.5\%$, $C = 23{,}590$ parameters, with $98.8\%$ ResNet block routing.
-    \item \textbf{SmallCNN}: $A = 84.8\%$, $C = 110{,}986$ parameters, with a fixed static architecture.
+    \item \textbf{ConvAML}: $A = 78.1\%$, $C = 39{,}288$ chargeable parameters, $54.2\%$ residual-mode routing (the mixed Plain/ResNet allocation the mode-weighted cost now prices honestly).
+    \item \textbf{SmallCNN}: $A = 83.8\%$, $C = 110{,}986$ parameters, with a fixed static architecture.
 \end{itemize}
-While SmallCNN achieves $2.3$ percentage points higher accuracy, it uses $4.7\times$ more parameters. ConvAML's compact architecture ($23{,}590$ params) matches FixedMLP's accuracy ($82.5\%$) with $2.3\times$ fewer parameters, demonstrating that the generator discovers efficient task-specific architectures through autonomous routing.
+Neither point dominates the other in the strict order (SmallCNN wins accuracy, ConvAML wins cost by $2.8\times$), so both sit on the frontier, and $\mathcal{E}_{\text{new}}$'s budget-aware ordering places ConvAML ahead ($0.255$ vs.\ $0.166$). ConvAML's architecture also matches FixedMLP's accuracy region ($78.1\%$ vs.\ $82.9\%$) at $1.4\times$ fewer chargeable parameters. Demonstrating an efficiency \emph{ordering} on the frontier --- not literal dominance of every point --- is precisely the statement the corrected cost model lets us keep.
 
 \subsection{The Role of $F_{\text{norm}}$ in Pareto Optimization}
 Standard NAS attempts to trace the Pareto frontier by running multiple discrete searches with different linear penalty weights $\lambda$. This is highly inefficient because the linear penalty $\text{Cost} = \lambda \cdot P$ merely defines a tangent line to the Pareto curve. If the Pareto frontier is non-convex, linear scalarization cannot discover models in the ``dents'' of the frontier.
@@ -2005,7 +2022,7 @@ In this appendix, we provide the complete source code for the core components of
 \subsection{Meta-Generator and Routing Logic}
 The \texttt{ModelGenerator} is responsible for parsing input meta-features and computing the Gumbel-Softmax routing logits across depth, width, and block-mode dimensions.
 
-\begin{lstlisting}[language=Python, caption=generator.py: The ModelGenerator and Supernet instantiation.]
+\begin{lstlisting}[language=Python, caption=generator.py (v1 listing): the ModelGenerator shown here predates the two-convolution block; the authoritative source is mgn/generator.py (layout-v2 slots + c2 slicing).]
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2294,7 +2311,7 @@ class ModelGenerator(nn.Module):
 
 \subsection{TaskNetwork Executor and Weight Sharing}
 The \texttt{executor.py} module implements the TaskNetwork forward pass, dynamically slicing the Prototype Library weights according to the continuous Gumbel-Softmax gates.
-\begin{lstlisting}[language=Python, caption=executor.py: The Dynamic TaskNetwork Executor.]
+\begin{lstlisting}[language=Python, caption=executor.py (v1 listing): single-convolution ResNet branch shown; current mgn/executor.py executes the real two-convolution block (Eq. 3.4a--3.4b).]
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2614,7 +2631,7 @@ def project_to_budget(
 
 \subsection{Static Model Extraction (Hard Pruning)}
 The \texttt{export.py} module is the culmination of the NAS pipeline, statically compiling the dynamic Supernet into an ultra-fast, lightweight \texttt{nn.Sequential} PyTorch model.
-\begin{lstlisting}[language=Python, caption=export.py: Static Model Compiler.]
+\begin{lstlisting}[language=Python, caption=export.py (v1 listing): superseded by AML_Core_Code/extract_static_model.py, whose StaticLayer now carries both convolutions of residual-mode layers.]
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2771,7 +2788,7 @@ def export_static_model(model, sample_idx=0, in_channels=1):
 
 \subsection{Experimental Benchmark Script}
 The \texttt{benchmark\_conv\_aml.py} script demonstrates the training loop, showing how we enforce the asymmetric learning rate between the ModelGenerator and TaskNetwork, and how we apply the efficiency metric.
-\begin{lstlisting}[language=Python, caption=benchmark conv aml.py: Meta-Training Loop.]
+\begin{lstlisting}[language=Python, caption=benchmark conv aml.py (v1 listing): shows the retired disable\_vit plumbing; the ViT mode no longer exists in the current two-mode vocabulary.]
 """
 Phase 3 Benchmark: ConvAML (Convolutional Architecture Mode Learning) vs Baselines on Raw Image Datasets
 Directly evaluates ConvAML on spatial image datasets (MNIST, Fashion-MNIST, CIFAR-10) without PCA feature reduction.
@@ -3102,7 +3119,7 @@ During the late stages of meta-training, we anneal $\tau \to \tau_{\min} = 0.3$.
 
 \subsection{Unit Testing and Export Verification}
 To ensure the correctness of the Hard Pruning extraction logic, we implemented comprehensive unit tests. The \texttt{test\_export.py} script acts as an integration test, verifying that the \texttt{ExportedModel} correctly initializes and runs forward passes without the heavy meta-generator overhead.
-\begin{lstlisting}[language=Python, caption=test export.py: Verification script for Hard Pruning.]
+\begin{lstlisting}[language=Python, caption=test export.py (v1 listing): the extraction test now lives in tests/test\_mgn\_semantics.py and tests/test\_train\_smoke.py in CI.]
 import torch
 from experiments.benchmark_conv_aml import make_conv_aml
 from mgn.export import export_static_model
@@ -3148,7 +3165,7 @@ if __name__ == '__main__':
 
 \subsection{Testing the Complete AML Pipeline}
 The \texttt{test\_conv\_aml.py} script executes end-to-end unit tests on the AML components, verifying the forward pass of the TaskNetwork, the parameter counting logic, and the penalty computation across different tensor shapes and batch sizes.
-\begin{lstlisting}[language=Python, caption=test conv aml.py: End-to-end tests for the AML core.]
+\begin{lstlisting}[language=Python, caption=test conv aml.py (v1 listing): superseded; end-to-end coverage now runs via tests/test\_train\_smoke.py (\texttt{python -m pytest tests}).]
 """
 Verification and Test Suite for ConvAML (Convolutional Architecture Mode Learning)
 """
