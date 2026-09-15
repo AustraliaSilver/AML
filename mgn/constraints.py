@@ -67,7 +67,11 @@ def compute_aml_efficiency_torch(accuracy: torch.Tensor, p_allowance: float, q_u
     alpha_bal = term1 + term2 + 0.05
 
     p2_q = (p * p) / q
-    denom = torch.clamp(torch.where(p2_q > 1.0, torch.log10(p2_q), torch.tensor(1e-3, device=accuracy.device)), min=1e-3)
+    # clamp(log10, 1e-3) == where(p2_q>1, log10, 1e-3) clamped: for
+    # p2_q<=1 log10<=0 so the clamp floor produces the identical 1e-3.
+    # The old form built a fresh CUDA tensor scalar PER CALL -- every H2D
+    # scalar constructor serializes the stream behind queued work.
+    denom = torch.clamp(torch.log10(p2_q), min=1e-3)
     ratio_term = torch.clamp(b ** alpha_bal, min=0.01, max=100.0)
     
     # Apply C^inf Normalized Exponential Soft Barrier

@@ -5,7 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .architecture import GeneratedModel
-from .constraints import ResourceBudget, phi_cost
+from .constraints import (
+    ResourceBudget,
+    compute_aml_efficiency_torch,
+    phi_cost,
+)
 from .regularization import arch_distance, contrastive_architecture_loss
 
 
@@ -40,6 +44,21 @@ class MetaLoss(nn.Module):
         self.lambda_eff = lambda_eff
         self.p_allowance = p_allowance
         self.resource_budget = resource_budget
+        # Per-device cached zero scalars. forward() used to build
+        # torch.tensor(0.0, device=...) up to 6x per call; each CUDA-side
+        # construction is a blocking copy that stalls the CPU behind the
+        # whole queued stream (~50-90 ms a pop in profiles -- ~65% of
+        # train time). These are loop-invariant constants, so build once.
+        self._zero_cache = {}
+        self._default_task_loss = None
+
+    def _zero(self, device) -> torch.Tensor:
+        key = str(device)
+        z = self._zero_cache.get(key)
+        if z is None:
+            z = torch.tensor(0.0, device=device)
+            self._zero_cache[key] = z
+        return z
 
     def forward(
         self,
@@ -56,7 +75,11 @@ class MetaLoss(nn.Module):
         **kwargs
     ) -> dict:
         if task_loss_fn is None:
-            task_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+            # Hoisted: the old code constructed a fresh CrossEntropyLoss
+            # module on every forward call.
+            if self._default_task_loss is None:
+                self._default_task_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
+            task_loss_fn = self._default_task_loss
 
         L_task = task_loss_fn(logits_train, targets_train)
         
@@ -76,7 +99,7 @@ class MetaLoss(nn.Module):
             gap_denominator = F.softplus(ln_Y - L_task.detach())
             G_gap = gap_numerator / (gap_denominator + 1e-4)
         else:
-            G_gap = torch.tensor(0.0, device=logits_train.device)
+            G_gap = self._zero(logits_train.device)
 
         L_resource = phi_cost(
             model.structure,
@@ -88,8 +111,8 @@ class MetaLoss(nn.Module):
             lambda_e=self.lambda_e,
         ).mean()
 
-        L_eff = torch.tensor(0.0, device=logits_train.device)
-        O_val = torch.tensor(0.0, device=logits_train.device)
+        L_eff = self._zero(logits_train.device)
+        O_val = self._zero(logits_train.device)
         if getattr(self, "lambda_eff", 0.0) > 0:
             if self.p_allowance is None:
                 raise ValueError(
@@ -97,7 +120,6 @@ class MetaLoss(nn.Module):
                     "p_allowance (parameter budget of the static baseline "
                     "you compete against); the library ships no default.")
             p_allow = float(self.p_allowance)
-            from .constraints import compute_aml_efficiency_torch
             probs = F.softmax(logits_train, dim=-1)
             true_probs = probs.gather(1, targets_train.to(logits_train.device).unsqueeze(1)).squeeze(1).mean()
             P_eff = model.structure.effective_params_formula()
@@ -159,24 +181,24 @@ class MetaLoss(nn.Module):
             over_budget = torch.relu(r_raw - 1.0)
             L_eff = L_eff + current_lambda_eff * over_budget * over_budget
 
-        L_design = torch.tensor(0.0, device=logits_train.device)
+        L_design = self._zero(logits_train.device)
         if self.lambda_design > 0:
             L_design = self.lambda_design * (
                 model.structure.effective_params_formula().mean() / 100
             )
 
-        L_stability = torch.tensor(0.0, device=logits_train.device)
+        L_stability = self._zero(logits_train.device)
         if self.lambda_stability > 0 and prev_model is not None:
             L_stability = self.lambda_stability * arch_distance(model, prev_model)
 
-        L_balance = torch.tensor(0.0, device=logits_train.device)
+        L_balance = self._zero(logits_train.device)
         if self.lambda_balance > 0 and pi_logits is not None:
             pi = F.softmax(pi_logits, dim=-1)
             pi_avg = pi.mean(dim=0)
             entropy = -(pi_avg * torch.log(pi_avg + 1e-8)).sum()
             L_balance = -self.lambda_balance * entropy
 
-        L_contrastive = torch.tensor(0.0, device=logits_train.device)
+        L_contrastive = self._zero(logits_train.device)
         if self.lambda_contrastive > 0 and models_batch is not None and task_ids is not None:
             L_contrastive = self.lambda_contrastive * contrastive_architecture_loss(
                 models_batch, task_ids

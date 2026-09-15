@@ -23,11 +23,27 @@ class MetaTrainer:
         optimizer: str = "adamw",
         weight_decay: float = 0.05,
         preprocess_fn=None,
+        stability_interval: int = 25,
+        compile: bool = False,
+        compile_mode: str = "default",
     ):
         """preprocess_fn: optional callable applied to every TRAIN x-batch
         (e.g. dataset-side horizontal flip for flat CIFAR). The library keeps
         no dataset-specific augmentation policy of its own; use torch RNG
-        inside the fn so torch.manual_seed keeps the run reproducible."""
+        inside the fn so torch.manual_seed keeps the run reproducible.
+        stability_interval: refresh cadence (in optimizer steps) of the
+        slow-target snapshot used by the lambda_stability term. Refreshing
+        every step deep-copies the whole generated model per batch for a
+        ~1e-6-weighted term; a slow target is standard practice and
+        removes ~95% of that memcpy overhead.
+        compile: torch.compile() the generator and executor to fuse the
+        thousands of per-iteration micro-kernels (the profiled bottleneck:
+        ~2k empty/mul/select/add launches per batch). Falls back to eager
+        with a warning if compilation fails. Off by default so recorded
+        trajectories stay bitwise comparable; enable explicitly for speed.
+        compile_mode: dynamo/inductor mode, e.g. "default" (safe, tolerates
+        the partial last batch) or "reduce-overhead" (CUDA graphs; needs
+        static shapes, i.e. drop_last loaders)."""
         self.preprocess_fn = preprocess_fn
         self.generator = generator.to(device)
         self.executor = executor.to(device)
@@ -48,15 +64,79 @@ class MetaTrainer:
 
         self.history = {"loss": [], "task_loss": [], "resource_cost": [], "acc": []}
         self._prev_model = None
+        self.stability_interval = max(1, stability_interval)
+        self._train_step = 0
+        self.compiled = False
+        if compile:
+            import warnings
+            try:
+                # NOTE (Windows/torch 2.5): inductor is unusable on this
+                # box -- even a 3-layer MLP fails with a WinError 183
+                # TOCTOU race in codecache.write_atomic (os.rename cannot
+                # overwrite). Use --compile on Linux; here it reliably
+                # falls back to eager via the dry run below.
+                # Fresh per-process cache dir (the supported knob is the
+                # env var; assigning config.cache_dir does nothing).
+                try:
+                    import os
+                    import tempfile
+                    os.environ.setdefault(
+                        "TORCHINDUCTOR_CACHE_DIR",
+                        tempfile.mkdtemp(prefix="torchinductor_aml_"))
+                    import torch._inductor.config as _ind_cfg
+                    if hasattr(_ind_cfg, "force_disable_caches"):
+                        _ind_cfg.force_disable_caches = True
+                except Exception:
+                    pass
+                self.generator = torch.compile(self.generator, mode=compile_mode)
+                self.executor = torch.compile(self.executor, mode=compile_mode)
+                self._compile_dry_run(device)
+                self.compiled = True
+            except Exception as e:  # inductor/triton unavailable -> eager
+                warnings.warn(f"MetaTrainer: torch.compile failed ({e}); "
+                              f"continuing in eager mode.")
+        # NOTE: self.generator/self.executor may now be OptimizedModule
+        # wrappers; .parameters() still resolves to the original tensors,
+        # so the optimizer below trains the same weights either way.
+
+    def _compile_dry_run(self, device, batch_size: int = 64):
+        """Force inductor compilation of forward+backward up front so a
+        backend failure falls back to eager HERE (with identical weights)
+        instead of mid-training. RNG state is saved/restored so the dry
+        run does not perturb the training trajectory."""
+        in_dim = getattr(self.generator, "input_dim", 784)
+        out_dim = getattr(self.generator, "output_dim", 10)
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = None
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            cuda_rng = torch.cuda.get_rng_state(device)
+        try:
+            self.generator.train()
+            self.executor.train()
+            x = torch.randn(batch_size, in_dim, device=device)
+            y = torch.randint(0, out_dim, (batch_size,), device=device)
+            model = self.generator(x, tau=1.0)
+            logits = self.executor(x, model)
+            logits.sum().backward()
+            self.optimizer.zero_grad(set_to_none=True)
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device)
 
     def train_epoch(self, dataloader: DataLoader, val_dataloader: DataLoader = None,
                     tau: float = 1.0, epoch_progress: float = 0.0,
                     task_loss_fn: nn.Module = None) -> dict:
         self.generator.train()
         self.executor.train()
-        total_metrics = {"loss": 0.0, "task_loss": 0.0, "resource_cost": 0.0, "acc": 0.0}
+        # GPU-side running sums: a single .item() per metric at epoch end
+        # instead of 5 device syncs per batch. Values logged are identical;
+        # only the sync points move.
+        run_sums = {"loss": 0.0, "task_loss": 0.0, "resource_cost": 0.0,
+                    "acc": 0.0, "aml_objective": 0.0}
         num_batches = 0
         val_iter = iter(val_dataloader) if val_dataloader is not None else None
+        use_stability = self.meta_loss.lambda_stability > 0
 
         for batch in dataloader:
             if len(batch) == 3:
@@ -64,10 +144,10 @@ class MetaTrainer:
             else:
                 x_batch, y_batch = batch
                 task_ids = None
-            x_batch = x_batch.to(self.device)
+            x_batch = x_batch.to(self.device, non_blocking=True)
             if self.preprocess_fn is not None and self.generator.training:
                 x_batch = self.preprocess_fn(x_batch)
-            y_batch = y_batch.to(self.device)
+            y_batch = y_batch.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad()
 
@@ -87,8 +167,8 @@ class MetaTrainer:
                 if val_x.dim() == 4 and val_x.shape[2] == 32:
                     val_x = val_x.view(-1, 3072)
                 
-                val_x = val_x.to(self.device)
-                val_y = val_y.to(self.device)
+                val_x = val_x.to(self.device, non_blocking=True)
+                val_y = val_y.to(self.device, non_blocking=True)
                 
                 x_train = x_batch
                 y_train = y_batch
@@ -123,7 +203,7 @@ class MetaTrainer:
                 n_contrast = min(16, x_train.shape[0])
                 models_batch = [self.generator(x_train[i:i+1], tau=tau) for i in range(n_contrast)]
                 kwargs["models_batch"] = models_batch
-                kwargs["task_ids"] = task_ids[:n_contrast].to(self.device)
+                kwargs["task_ids"] = task_ids[:n_contrast].to(self.device, non_blocking=True)
 
             metrics = self.meta_loss(logits_train, y_train, logits_val, y_val, model, **kwargs)
             total_loss = metrics["loss"]
@@ -131,9 +211,16 @@ class MetaTrainer:
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=5.0)
             self.optimizer.step()
+            self._train_step += 1
 
-            with torch.no_grad():
-                self._prev_model = GeneratedModel(
+            # Slow-target refresh: the stability snapshot is a full deep copy
+            # of the generated model, so rebuild it every stability_interval
+            # steps instead of every batch. Skipped entirely when the
+            # stability term is off (it was still cloned per batch before).
+            if use_stability and (self._prev_model is None
+                                  or self._train_step % self.stability_interval == 0):
+                with torch.no_grad():
+                    self._prev_model = GeneratedModel(
                     structure=ModelStructure(
                         layer_gates=model.structure.layer_gates.clone(),
                         dim_weights=model.structure.dim_weights.clone(),
@@ -152,17 +239,23 @@ class MetaTrainer:
             preds = logits_train.argmax(dim=-1)
             acc = (preds == y_train).float().mean()
 
-            total_metrics["loss"] += total_loss.item()
-            total_metrics["task_loss"] += metrics["task_loss"].item()
-            total_metrics["resource_cost"] += metrics["resource_cost"].item()
-            total_metrics["acc"] += acc.item()
-            total_metrics.setdefault("aml_objective", 0.0)
-            total_metrics["aml_objective"] += metrics.get("aml_objective", 0.0).item()
+            # Detached GPU-side accumulation; synced once at epoch end below.
+            run_sums["loss"] = run_sums["loss"] + total_loss.detach()
+            _tl = metrics["task_loss"]
+            run_sums["task_loss"] = run_sums["task_loss"] + (_tl.detach() if torch.is_tensor(_tl) else _tl)
+            _rc = metrics["resource_cost"]
+            run_sums["resource_cost"] = run_sums["resource_cost"] + (_rc.detach() if torch.is_tensor(_rc) else _rc)
+            run_sums["acc"] = run_sums["acc"] + acc.detach()
+            _ao = metrics.get("aml_objective", 0.0)
+            run_sums["aml_objective"] = run_sums["aml_objective"] + (_ao.detach() if torch.is_tensor(_ao) else _ao)
             num_batches += 1
 
         if num_batches == 0:
-            return {k: 0.0 for k in dict(total_metrics, aml_objective=0.0)}
-        avg = {k: v / num_batches for k, v in total_metrics.items()}
+            return {k: 0.0 for k in ("loss", "task_loss", "resource_cost", "acc", "aml_objective")}
+        avg = {}
+        for k, v in run_sums.items():
+            v = v.item() if torch.is_tensor(v) else v
+            avg[k] = v / num_batches
         for k, v in avg.items():
             self.history.setdefault(k, []).append(v)
         return avg
@@ -176,22 +269,67 @@ class MetaTrainer:
         epochs: int = 100,
         batch_size: int = 32,
         tau_schedule: bool = True,
+        gate_floor_start: float = 0.0,
+        gate_floor_end: float = 0.0,
+        freeze_arch_at: float = None,
     ):
         dataset = TensorDataset(x, y)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        
+        _pin = str(self.device).startswith("cuda")
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            pin_memory=_pin)
+
         val_loader = None
         if val_x is not None and val_y is not None:
             val_dataset = TensorDataset(val_x, val_y)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True,
+                                    pin_memory=_pin)
 
         self._prev_model = None
+        self._train_step = 0
+        # Depth keep-alive: linearly anneal the generator's gate_floor
+        # (see ModelGenerator docs) so deep paths stay gradient-alive while
+        # the efficiency penalty ramps. Defaults 0->0 = original behaviour.
+        # NOTE: compiled generators re-specialize when the attribute
+        # changes; keep the schedule coarse under torch.compile.
+        _gen = getattr(self.generator, "_orig_mod", self.generator)
 
         import sys
         print_every = 1
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=1e-5)
+        # Two-phase (DARTS-style): search the architecture for the first
+        # fraction of training, then freeze it and finetune weights only.
+        # Single-phase joint search overfits the structure to train noise
+        # (measured -11pt test on CIFAR-10 fast/seed0 vs frozen arch at
+        # identical train fit). None = original single-phase behaviour.
+        arch_frozen = False
+        freeze_ep = (int(freeze_arch_at * epochs) if freeze_arch_at is not None
+                     and 0.0 < freeze_arch_at < 1.0 else None)
         for epoch in range(epochs):
             epoch_progress = epoch / max(1, epochs - 1)
+            if freeze_ep is not None and not arch_frozen and epoch >= freeze_ep:
+                _g = getattr(self.generator, "_orig_mod", self.generator)
+                n_frozen = 0
+                for mod_name in ("prototype_selector", "structure_delta",
+                                 "block_mode_head"):
+                    mod = getattr(_g, mod_name, None)
+                    if mod is not None:
+                        for p in mod.parameters():
+                            p.requires_grad_(False)
+                            n_frozen += 1
+                arch_frozen = True
+                # Drop frozen tensors from the optimizer: some foreach
+                # kernels do not accept a mix of None/non-None grads.
+                for group in self.optimizer.param_groups:
+                    group["params"] = [p for p in group["params"]
+                                       if p.requires_grad]
+                print(f"  [MetaTrainer] arch frozen at epoch {epoch+1}/{epochs} "
+                      f"({n_frozen} tensors) -- finetune weights only")
+                sys.stdout.flush()
+            if gate_floor_start != 0.0 or gate_floor_end != 0.0:
+                if hasattr(_gen, "gate_floor"):
+                    _gen.gate_floor = (gate_floor_start
+                                       + (gate_floor_end - gate_floor_start)
+                                       * epoch_progress)
             tau = max(0.5, 1.0 - epoch / 30.0) if tau_schedule else 1.0
             metrics = self.train_epoch(loader, val_dataloader=val_loader, tau=tau, epoch_progress=epoch_progress)
             scheduler.step()

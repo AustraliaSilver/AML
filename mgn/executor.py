@@ -5,10 +5,70 @@ import torch.nn.functional as F
 from .architecture import GeneratedModel
 
 
+def _load_fused_pipeline():
+    """Lazily import the fused v2 pipeline (first attempt only). Native
+    extensions must NOT be loaded at `import mgn` time: CI/CPU-only
+    consumers of this package never touch CUDA DLLs. Returns the
+    FusedPipelineFunction class or None."""
+    global _FUSED_PIPELINE
+    if _FUSED_PIPELINE is _FUSED_UNTRIED:
+        try:
+            from .accel.dllsetup import bootstrap
+            bootstrap()
+            from .accel.fused_autograd import FusedPipelineFunction
+            _FUSED_PIPELINE = FusedPipelineFunction
+        except Exception:
+            _FUSED_PIPELINE = None
+    return _FUSED_PIPELINE
+
+
+_FUSED_UNTRIED = object()
+_FUSED_PIPELINE = _FUSED_UNTRIED
+
+
 class TaskNetwork(nn.Module):
-    def __init__(self, dropout=0.0):
+    def __init__(self, dropout=0.0, fused=False):
+        """fused: route the conv-branch layer stack through the single-call
+        fused CUDA pipeline (mgn.accel._C, v2 two-conv block algebra).
+        Requires CUDA, a model carrying pi + raw prototypes, 2-mode block
+        routing, <=5 layers (the pipeline pools internally after layers 5
+        and 11) and the v2 prototype layout. When any precondition is not
+        met the pure-eager path runs unchanged. Off by default: recorded
+        benchmark numbers were produced eager."""
         super().__init__()
         self.dropout = dropout
+        self.fused = fused
+        self._fused_layout_cache = None
+
+    def _fusable(self, x, model, S, W, L_max, batch):
+        if not self.fused or not x.is_cuda or batch <= 0:
+            return None
+        pipeline = _load_fused_pipeline()
+        if pipeline is None:
+            return None
+        protos = getattr(model, "prototypes", None)
+        pi = getattr(model, "pi", None)
+        if protos is None or pi is None or pi.shape[0] != batch:
+            return None
+        if S.dim_masks is None or S.dim_masks.dim() != 3:
+            return None
+        if S.block_mode is None or S.block_mode.shape[-1] != 2:
+            return None
+        if L_max > 5 or "c1.weight2" not in W:
+            return None  # legacy single-conv layout has no v2 pipeline
+        from .layout import get_prototype_layout, get_second_conv_layout
+        key = (S.max_layers, S.max_dim, S.output_dim, S.in_channels)
+        layout = self._fused_layout_cache
+        if layout is None or layout[0] != key:
+            total, offs, _info, _wo, _bo = get_prototype_layout(
+                S.max_layers, S.max_dim, S.output_dim, S.in_channels)
+            offs2 = get_second_conv_layout(
+                S.max_layers, S.max_dim, S.output_dim, S.in_channels)
+            layout = (key, total, offs, offs2)
+            self._fused_layout_cache = layout
+        if protos.shape[1] != layout[1]:
+            return None  # layout mismatch -> eager, never corrupt math
+        return pipeline, layout
 
     def forward(self, x: torch.Tensor, model: GeneratedModel) -> torch.Tensor:
         S = model.structure
@@ -43,7 +103,30 @@ class TaskNetwork(nn.Module):
                     side = int((x.shape[1] // in_ch) ** 0.5)
                     x = x.reshape(-1, in_ch, side, side)
             batch = x.shape[0]
-            
+
+            fused = self._fusable(x, model, S, W, L_max, batch)
+            if fused is not None:
+                pipeline, (  # noqa: E501 - early-return path, loop below untouched
+                    _key, _total, offs, offs2) = fused
+                H_img = x.shape[2]
+                h = pipeline.apply(
+                    x, model.prototypes, model.pi,
+                    S.layer_gates, S.dim_masks, S.block_mode,
+                    [o[0] for o in offs], [o[2] for o in offs],
+                    [o[0] for o in offs2], [o[2] for o in offs2],
+                    [o[4] for o in offs], [S.max_dim] * L_max,
+                    [H_img] * L_max, [H_img] * L_max, S.max_dim,
+                )
+                # Head below is the exact copy of the eager branch's tail.
+                h_pool = F.adaptive_avg_pool2d(h, (4, 4)).reshape(batch, -1)
+                h_pool = F.layer_norm(h_pool, [h_pool.shape[-1]])
+                h_pool = F.dropout(h_pool, p=0.3, training=self.training)
+                if W["out.weight"].shape[0] == 1 and batch > 1:
+                    return F.linear(h_pool, W["out.weight"][0], W["out.bias"][0])
+                return (torch.bmm(h_pool.unsqueeze(1),
+                                  W["out.weight"].transpose(1, 2)).squeeze(1)
+                        + W["out.bias"])
+
             h = x
             
             for i in range(L_max):
@@ -77,8 +160,31 @@ class TaskNetwork(nn.Module):
                     g_plain = S.block_mode[:, i, 0].view(-1, 1, 1, 1)
                     g_resnet = S.block_mode[:, i, 1].view(-1, 1, 1, 1)
                     g_trans = S.block_mode[:, i, 2].view(-1, 1, 1, 1) if S.block_mode.shape[-1] > 2 else 0.0
-                    
-                    h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
+
+                    # Real 2-conv residual block: the plain output feeds a
+                    # second 3x3 conv (+GN); the skip is added AFTER it, so
+                    # ResNet mode genuinely costs/computes more than Plain.
+                    # Structures built without c2 weights (legacy) fall back
+                    # to the old single-conv skip.
+                    w2 = W.get(f"c{i+1}.weight2", None)
+                    if w2 is not None:
+                        b2 = W[f"c{i+1}.bias2"]
+                        c2_in = h_plain_raw.shape[1]
+                        if w2.shape[0] == 1 and batch > 1:
+                            h_conv2 = F.conv2d(h_plain_raw, w2[0], b2[0], padding=1)
+                        else:
+                            w2_flat = w2.reshape(batch * c2_in, c2_in, 3, 3)
+                            b2_flat = b2.reshape(batch * c2_in)
+                            h2_flat = h_plain_raw.view(1, batch * c2_in,
+                                                        h_plain_raw.shape[2], h_plain_raw.shape[3])
+                            h_conv2 = F.conv2d(h2_flat, w2_flat, b2_flat,
+                                               groups=batch, padding=1)
+                            h_conv2 = h_conv2.view(batch, c2_in,
+                                                   h_conv2.shape[2], h_conv2.shape[3])
+                        h_norm2 = F.group_norm(h_conv2, num_groups=1)
+                        h_resnet = F.relu(h_expand + h_norm2) * dim_mask_c
+                    else:
+                        h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
                     w_qkv = W.get(f"attn{i+1}.qkv.weight", None)
                     if w_qkv is not None and g_trans.sum() > 0:
                         attn_dim = out_c // 4

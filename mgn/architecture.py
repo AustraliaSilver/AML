@@ -32,6 +32,21 @@ class ModelStructure:
             choices = torch.tensor(self.dim_choices, device=self.dim_weights.device, dtype=torch.float32)
             return (self.dim_weights * choices).sum(dim=-1)
 
+    def _resnet_layer_count(self) -> Optional[torch.Tensor]:
+        """Layers routed through the RESIDUAL mode, gate-weighted [B].
+
+        A residual-mode layer spends a second 3x3 conv (mgn.layout v2 slot).
+        Layer 0 always executes (the executor skips its depth gate), so its
+        mode counts unconditionally; layers l>=1 count once per active gate.
+        Returns None when block modes are unavailable.
+        """
+        bm = getattr(self, "block_mode", None)
+        if bm is None or not getattr(self, "use_conv", False) or bm.shape[-1] < 2:
+            return None
+        gates = self.layer_gates
+        active = torch.cat([torch.ones_like(gates[:, :1]), gates[:, 1:]], dim=-1)
+        return (active * bm[:, :, 1]).sum(dim=-1)
+
     def effective_params_formula(self) -> torch.Tensor:
         L = self.num_layers
         D = self.hidden_dim
@@ -41,7 +56,13 @@ class ModelStructure:
             c2 = torch.clamp(L - 1.0, min=0.0) * (D_mean * D_mean * 9 + D_mean)
             # Classifier consumes 16*D features (AdaptiveAvgPool2d((4,4)))
             out = (16 * D_mean) * self.output_dim + self.output_dim
-            return c1 + c2 + out
+            total = c1 + c2 + out
+            n_res = self._resnet_layer_count()
+            if n_res is not None:
+                # One extra max_dim*max_dim*9+max_dim conv per residual-mode
+                # layer -- the per-layer Plain/ResNet model-cost split.
+                total = total + n_res * (D_mean * D_mean * 9 + D_mean)
+            return total
         else:
             weights = self.input_dim * D_mean + (L - 1) * D_mean * D_mean + D_mean * self.output_dim
             bias = L * D_mean + self.output_dim
@@ -58,6 +79,11 @@ class ModelStructure:
                   + torch.clamp(L - 5.0, min=0.0, max=6.0) * 256.0
                   + torch.clamp(L - 11.0, min=0.0) * 64.0)
             conv_flops = 9.0 * D_mean * D_mean * sp
+            n_res = self._resnet_layer_count()
+            if n_res is not None:
+                # Residual-mode layers pay their second conv at the stage's
+                # bulk spatial size (same approximation the plain term uses).
+                conv_flops = conv_flops * (1.0 + n_res / torch.clamp(L, min=1.0))
             head_flops = (16.0 * D_mean) * self.output_dim
             return conv_flops + head_flops
         return self.input_dim * D_mean + (L - 1) * D_mean * D_mean + D_mean * self.output_dim
@@ -96,6 +122,15 @@ class GeneratedModel:
     weights: Dict[str, torch.Tensor]
     embedding: Optional[torch.Tensor] = None
     pi_logits: Optional[torch.Tensor] = None
+    # Exact routing probabilities used to mix self.weights (pi =
+    # softmax/gumbel(pi_logits)). The fused CUDA executor path consumes
+    # (pi, raw prototypes) directly; reusing THIS tensor (never a re-draw)
+    # is what keeps fused and eager bit-identical at the routing input.
+    pi: Optional[torch.Tensor] = None
+    # Raw prototype library matrix [K, weight_dim] (conv mode only). The
+    # fused pipeline re-mixes per-layer weights from (prototypes, pi); the
+    # sliced per-sample tensors in .weights are kept for the eager path.
+    prototypes: Optional[torch.Tensor] = None
 
     def to(self, device):
         self.structure.layer_gates = self.structure.layer_gates.to(device)
@@ -104,4 +139,8 @@ class GeneratedModel:
         self.weights = {k: v.to(device) for k, v in self.weights.items()}
         if self.embedding is not None:
             self.embedding = self.embedding.to(device)
+        if self.pi is not None:
+            self.pi = self.pi.to(device)
+        # prototypes is a reference to a module parameter; it moves with the
+        # generator itself, never with individual models.
         return self

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .architecture import ModelStructure, GeneratedModel
-from .layout import get_prototype_layout
+from .layout import get_prototype_layout, get_second_conv_layout
 
 
 class PrototypeLibrary(nn.Module):
@@ -32,9 +32,13 @@ class PrototypeLibrary(nn.Module):
                 self.dim_head.bias.data.view(max_layers, num_dim_choices)[:, -1] = 3.0
             import math
             # Init from the SAME layout that the slicers, extractor and CUDA
-            # offset vectors consume (mgn.layout), instead of a second
-            # hand-mirrored copy of the packing contract.
+            # offsets consume (mgn.layout), instead of a second hand-mirrored
+            # copy of the packing contract. Both convolutions of every layer
+            # (main branch w1 + residual-branch w2) are initialized here so a
+            # residual-mode layer draws genuinely trained second-conv weights.
             _total, layer_offsets, _info, wo_off, bo_off = get_prototype_layout(
+                max_layers, max_dim, output_dim, in_channels)
+            layer_offsets2 = get_second_conv_layout(
                 max_layers, max_dim, output_dim, in_channels)
             with torch.no_grad():
                 for k in range(K):
@@ -43,6 +47,11 @@ class PrototypeLibrary(nn.Module):
                         nn.init.kaiming_uniform_(w_t, a=math.sqrt(5))
                         self.proto_weights.data[k, w_start:w_end] = w_t.flatten()
                         self.proto_weights.data[k, b_start:b_end] = 0.0
+                    for (w2_start, w2_end, b2_start, b2_end) in layer_offsets2:
+                        w2_t = torch.empty(max_dim, max_dim, 3, 3)
+                        nn.init.kaiming_uniform_(w2_t, a=math.sqrt(5))
+                        self.proto_weights.data[k, w2_start:w2_end] = w2_t.flatten()
+                        self.proto_weights.data[k, b2_start:b2_end] = 0.0
                     wo = torch.empty(output_dim, 16 * max_dim)
                     nn.init.kaiming_uniform_(wo, a=math.sqrt(5))
                     self.proto_weights.data[k, wo_off:wo_off + wo.numel()] = wo.flatten()
@@ -124,6 +133,8 @@ class ModelGenerator(nn.Module):
                 max_layers, max_dim, output_dim, in_channels)
             weight_out = _total
             self._proto_offsets = _offs
+            self._proto_offsets2 = get_second_conv_layout(
+                max_layers, max_dim, output_dim, in_channels)
             self._proto_head = (_wo, _bo)
         else:
             weight_out = (
@@ -257,6 +268,11 @@ class ModelGenerator(nn.Module):
             for i, (w_start, w_end, b_start, b_end, in_c) in enumerate(self._proto_offsets):
                 W[f"c{i+1}.weight"] = w_direct[:, w_start:w_end].view(-1, D, in_c, 3, 3)
                 W[f"c{i+1}.bias"] = w_direct[:, b_start:b_end]
+            for i, (w2_start, w2_end, b2_start, b2_end) in enumerate(self._proto_offsets2):
+                # Residual-branch 3x3 (max_dim -> max_dim); consumed by
+                # TaskNetwork only when the layer routes through ResNet mode.
+                W[f"c{i+1}.weight2"] = w_direct[:, w2_start:w2_end].view(-1, D, D, 3, 3)
+                W[f"c{i+1}.bias2"] = w_direct[:, b2_start:b2_end]
             wo_off, bo_off = self._proto_head
             sz_w = (16 * D) * self.output_dim
             W["out.weight"] = w_direct[:, wo_off:wo_off + sz_w].view(-1, self.output_dim, 16 * D)
@@ -293,6 +309,10 @@ class ModelGenerator(nn.Module):
             in_channels=self.in_channels
         )
         # Persist the latent so ModelEvaluator.score_candidate can score the
-        # candidate without re-running the encoder.
+        # candidate without re-running the encoder. pi/prototypes feed the
+        # fused CUDA executor path (see GeneratedModel docs): pi is the SAME
+        # tensor used to slice W, and prototypes is the raw library matrix.
         return GeneratedModel(structure=struct, weights=W, pi_logits=pi_logits,
-                              embedding=z)
+                              embedding=z, pi=pi,
+                              prototypes=(self.prototype_lib.proto_weights
+                                          if self.use_conv else None))

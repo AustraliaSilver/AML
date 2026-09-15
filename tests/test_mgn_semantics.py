@@ -13,7 +13,7 @@ from mgn.architecture import ModelStructure, project_architecture
 from mgn.constraints import (
     ResourceBudget, phi_cost, compute_aml_efficiency, compute_aml_efficiency_torch,
 )
-from mgn.layout import get_prototype_layout
+from mgn.layout import get_prototype_layout, get_second_conv_layout
 from mgn.generator import ModelGenerator
 from mgn.executor import TaskNetwork
 from mgn.losses import MetaLoss
@@ -166,13 +166,23 @@ class TestConstraints(unittest.TestCase):
 
 class TestLayout(unittest.TestCase):
     def test_layout_offsets_are_dense_and_ordered(self):
+        """v2 row: per layer [w1 b1 w2 b2], then head; nothing may gap or
+        overlap -- the fused kernels treat these bounds as a packing
+        contract, so the WHOLE chain (incl. the residual-branch slots) must
+        be dense and strictly increasing."""
         total, offs, info, wo, bo = get_prototype_layout(4, 16, 10, in_channels=3)
+        offs2 = get_second_conv_layout(4, 16, 10, in_channels=3)
         prev_end = 0
-        for (ws, we, bs, be, ic) in offs:
+        for (ws, we, bs, be, ic), (w2s, w2e, b2s, b2e) in zip(offs, offs2):
             self.assertEqual(ws, prev_end)
             self.assertEqual(we - ws, 16 * ic * 9)
+            self.assertEqual(bs, we)
             self.assertEqual(be - bs, 16)
-            prev_end = be
+            self.assertEqual(w2s, be)                      # w2 follows b1
+            self.assertEqual(w2e - w2s, 16 * 16 * 9)      # 2nd conv: D x D
+            self.assertEqual(b2s, w2e)
+            self.assertEqual(b2e - b2s, 16)
+            prev_end = b2e
         self.assertEqual(wo, prev_end)
         self.assertEqual(bo, wo + (16 * 16) * 10)
         self.assertEqual(total, bo + 10)
@@ -195,10 +205,87 @@ class TestLayout(unittest.TestCase):
                                         gen.prototype_lib.proto_weights[1, ws:we]))
             # layer biases are zero-initialised in the conv layout
             self.assertEqual(float(wdir[0, bs:be].abs().max()), 0.0)
+        for (w2s, w2e, b2s, b2e) in get_second_conv_layout(3, 8, 10, 3):
+            self.assertTrue(torch.equal(wdir[0, w2s:w2e],
+                                        gen.prototype_lib.proto_weights[1, w2s:w2e]))
+            self.assertGreater(float(wdir[0, w2s:w2e].abs().max()), 0.0)  # w2 kaiming-init
+            self.assertEqual(float(wdir[0, b2s:b2e].abs().max()), 0.0)    # b2 zero-init
         head = wdir[0, wo:wo + (16 * 8) * 10]
         self.assertTrue(torch.equal(head,
                                     gen.prototype_lib.proto_weights[1, wo:wo + head.numel()]))
         self.assertEqual(float(wdir[0, bo:bo + 10].abs().max()), 0.0)  # head bias
+
+
+class TestTwoConvResidualBlock(unittest.TestCase):
+    """v2: Plain and ResNet block modes must be genuinely distinct -- in
+    EXECUTION (second conv), in COST (effective_params/flops), and in
+    GRADIENT FLOW (the w2 slots train)."""
+
+    def _conv_pair(self):
+        gen = ModelGenerator(input_dim=3072, output_dim=10, max_layers=3,
+                             max_dim=8, dim_choices=(8,), latent_dim=8,
+                             num_prototypes=2, use_conv=True, in_channels=3)
+        return gen, TaskNetwork()
+
+    def test_generator_exposes_second_conv_weights(self):
+        gen, ex = self._conv_pair()
+        m = gen(torch.randn(4, 3, 32, 32))
+        for i in range(1, 4):
+            self.assertEqual(tuple(m.weights[f"c{i}.weight2"].shape), (4, 8, 8, 3, 3))
+            self.assertEqual(tuple(m.weights[f"c{i}.bias2"].shape), (4, 8))
+
+    def test_plain_and_resnet_outputs_differ(self):
+        from dataclasses import replace
+        from mgn.architecture import GeneratedModel
+        gen, ex = self._conv_pair()
+        gen.eval(); ex.eval()
+        x = torch.randn(2, 3, 32, 32)
+        m = gen(x)
+        bm_pl = torch.zeros(2, 3, 2); bm_pl[:, :, 0] = 1.0
+        bm_rs = torch.zeros(2, 3, 2); bm_rs[:, :, 1] = 1.0
+        with torch.no_grad():
+            o_pl = ex(x, GeneratedModel(structure=replace(m.structure, block_mode=bm_pl),
+                                        weights=m.weights, pi_logits=m.pi_logits))
+            o_rs = ex(x, GeneratedModel(structure=replace(m.structure, block_mode=bm_rs),
+                                        weights=m.weights, pi_logits=m.pi_logits))
+        self.assertGreater(float((o_pl - o_rs).abs().max()), 1e-4)
+
+    def test_residual_mode_costs_more(self):
+        B, D, L, out = 2, 8, 3, 10
+        gates = torch.tensor([[1., 1., 1.], [1., 1., 0.]])
+        onehot = (gates > 0.5).float()
+        zero = torch.zeros(B, L, 2); one = torch.zeros(B, L, 2)
+        one[:, :, 0] = 1.0; zero[:, :, 1] = 1.0
+        kw = dict(dim_weights=torch.full((B, L, 1), 0.5),
+                  dim_masks=torch.sigmoid(torch.zeros(B, L, D)),
+                  residual=torch.zeros(B, 1), use_conv=True, in_channels=3,
+                  max_layers=L, max_dim=D, dim_choices=(D,), output_dim=out)
+        pl = ModelStructure(layer_gates=onehot.clone(), block_mode=one, **kw)
+        rs = ModelStructure(layer_gates=onehot.clone(), block_mode=zero, **kw)
+        leg = ModelStructure(layer_gates=onehot.clone(), block_mode=None, **kw)
+        Pp, Pr = pl.effective_params_formula(), rs.effective_params_formula()
+        Dm = 0.5 * D
+        extra = Dm * Dm * 9 + Dm
+        expect = torch.tensor([3.0, 2.0])  # row1 layer-2 gate closed
+        self.assertTrue(torch.allclose(Pp, Pr - expect * extra))
+        self.assertTrue(torch.allclose(Pp, leg.effective_params_formula()))  # legacy = plain
+        self.assertTrue(bool((rs.flops_per_sample() > pl.flops_per_sample()).all()))
+        self.assertTrue(bool((Pr > Pp).all()))
+
+    def test_second_conv_receives_gradients(self):
+        gen, ex = self._conv_pair()
+        gen.train()
+        x = torch.randn(2, 3, 32, 32)
+        m = gen(x)
+        onehot = torch.zeros_like(m.structure.block_mode)
+        onehot[:, :, 1] = 1.0  # force residual mode everywhere
+        m.structure.block_mode = onehot
+        ex(x, m).sum().backward()
+        _t, offs, _i, wo, bo = get_prototype_layout(3, 8, 10, 3)
+        (w2s, w2e, b2s, b2e) = get_second_conv_layout(3, 8, 10, 3)[1]
+        grad = gen.prototype_lib.proto_weights.grad
+        self.assertIsNotNone(grad)
+        self.assertGreater(float(grad[:, w2s:w2e].abs().max()), 0.0)
 
 
 class TestStructureProjection(unittest.TestCase):
@@ -248,6 +335,77 @@ class TestStructureProjection(unittest.TestCase):
         over = phi_cost(S, 0, 0, 0, budget=ResourceBudget(P_max=1.0))
         self.assertGreater(over.item(), base.item() * 0)  # budget adds relu(P-1)
         self.assertGreater(over.item(), 0.0)
+
+
+@unittest.skipUnless(torch.cuda.is_available() and
+                     __import__("importlib").util.find_spec("mgn.accel._C"),
+                     "requires CUDA + built fused kernels")
+class TestFusedExecutorParity(unittest.TestCase):
+    """The fused v2 executor (--fused-executor) must match the eager
+    TaskNetwork to within the pipeline's bf16 conv-backward tolerance.
+    Guards the native_group_norm_backward / gemv reductions rewrite of
+    pipeline_backward against algebraic drift."""
+
+    def _fused_applicable(self):
+        from mgn.accel.fused_autograd import FusedPipelineFunction  # noqa
+        return True
+
+    def test_fused_logits_and_grads(self):
+        from mgn.accel.fused_autograd import FusedPipelineFunction  # noqa: F401
+        # The benchmark's REAL fused-eligible shape (make_conv_aml). The
+        # pipeline mixes conv weights in bf16 BY DESIGN (same convention as
+        # validate_ext_in.py's reference), so absolute tolerances are tuned
+        # to that: measured at this config ~6e-3 logit / ~2e-2 grad rel.
+        gen = ModelGenerator(input_dim=784, output_dim=10, max_layers=4,
+                             max_dim=128, dim_choices=(32, 64, 96, 128),
+                             latent_dim=64, noise_dim=64, num_prototypes=4,
+                             use_conv=True, in_channels=1).cuda().train()
+        x = torch.randn(64, 784, device="cuda")
+        eager = TaskNetwork(fused=False).cuda()
+        fused = TaskNetwork(fused=True).cuda()
+        # eval(): the head's p=0.3 dropout draws fresh masks per call -- with
+        # two forwards of the SAME model the "drift" would be pure dropout
+        # noise (~1.0 on unit-scale logits), not pipeline error.
+        eager.eval(); fused.eval()
+        # identical routing draw reused for both executors (see GeneratedModel.pi)
+        torch.manual_seed(0)
+        m = gen(x)
+        out_e = eager(x, m)
+        out_f = fused(x, m)
+        scale = out_e.abs().max().item()
+        self.assertLess((out_e - out_f).abs().max().item(), 0.02 * scale,
+                        "fused forward drifted beyond bf16 tolerance")
+        g = torch.randn_like(out_e)
+        # conv-mode freezes weight_delta / noise_var_head; autograd.grad
+        # rejects params that don't require grad, so filter to trainable.
+        # prototype_lib.residual_head feeds struct.residual, which neither
+        # executor branch consumes -> allow_unused (grad None on BOTH sides,
+        # asserted equal below).
+        trainable = [p for p in gen.parameters() if p.requires_grad]
+        ge = torch.autograd.grad(out_e, trainable, g, retain_graph=True,
+                                 allow_unused=True)
+        gf = torch.autograd.grad(out_f, trainable, g, retain_graph=True,
+                                 allow_unused=True)
+        for a, b in zip(ge, gf):
+            if (a is None) != (b is None):
+                self.fail("fused/eager disagree on which params receive grad")
+        worst = max(((a - b).abs().max() / (a.abs().max() + 1e-9)).item()
+                    for a, b in zip(ge, gf) if a is not None)
+        # bf16 weight-mixing noise floor: ~3-5e-2 on the deepest param
+        # (encoder through the ST gate/dim-mask chain). An ALGEBRA error
+        # (e.g. a single-conv backward against the v2 block) shows up at
+        # O(0.5+) drift, so this gate still catches real regressions.
+        self.assertLess(worst, 8e-2,
+                        f"fused backward rel-drift {worst:.2e} > 8e-2")
+
+    def test_fused_falls_back_without_cuda_tensors(self):
+        # CPU model must never call into the pipeline (guards _fusable).
+        gen = _mlp_generator()
+        ex = TaskNetwork(fused=True)   # fused requested...
+        x = torch.randn(4, 12)
+        m = gen(x)
+        out = ex(x, m)                 # ...but MLP branch ignores it
+        self.assertEqual(out.shape, (4, 5))
 
 
 if __name__ == "__main__":
