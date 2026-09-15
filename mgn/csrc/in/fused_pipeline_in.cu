@@ -12,8 +12,57 @@
  */
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdio>
 
 #define IN_THREADS 256
+
+/* v2 block-mode mix (see kernels/fused_pipeline.cu for the contract):
+ * purely elementwise, norm-agnostic (GN/IN run in the ATen driver). */
+__global__ void in_fused_mix_conv_kernel(
+    const float* __restrict__ hp,
+    const float* __restrict__ n2,
+    const float* __restrict__ h_prev,
+    const float* __restrict__ dim_mask,
+    const float* __restrict__ block_mode,
+    const float* __restrict__ layer_gate,
+    float* __restrict__ out,
+    int B, int C, long spatial, int D, int is_layer0
+) {
+    long idx = (long)blockIdx.x * IN_THREADS + threadIdx.x;
+    long total = (long)B * C * spatial;
+    if (idx >= total) return;
+
+    int b = (int)(idx / ((long)C * spatial));
+    int c = (int)((idx / spatial) % C);
+
+    float dm  = (c < D) ? dim_mask[b * D + c] : 0.0f;
+    float g_p = block_mode[b * 2];
+    float g_r = block_mode[b * 2 + 1];
+    float l_g = layer_gate[b];
+
+    float hpv = hp[idx];
+    float he  = is_layer0 ? hpv : h_prev[idx] * dm;
+    float hr  = fmaxf(he + n2[idx], 0.0f) * dm;
+    float ha  = g_p * hpv + g_r * hr;
+    out[idx]  = is_layer0 ? ha : l_g * ha + (1.0f - l_g) * he;
+}
+
+void in_fused_mix_conv_launcher(
+    const float* hp, const float* n2, const float* h_prev,
+    const float* dim_mask, const float* block_mode, const float* layer_gate,
+    float* out, int B, int C, long spatial, int D, int is_layer0
+) {
+    long total = (long)B * C * spatial;
+    int blocks = (int)((total + IN_THREADS - 1) / IN_THREADS);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    in_fused_mix_conv_kernel<<<blocks, IN_THREADS, 0, stream>>>(
+        hp, n2, h_prev, dim_mask, block_mode, layer_gate,
+        out, B, C, spatial, D, is_layer0
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        fprintf(stderr, "AML kernel launch error (in_fused_mix_conv): %s\n", cudaGetErrorString(err));
+}
 
 __global__ void in_fused_post_conv_kernel(
     float* __restrict__ h_conv,

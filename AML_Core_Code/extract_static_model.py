@@ -23,20 +23,25 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 sys.path.insert(0, _ROOT)
 
-from train_cv_cifar_18 import get_prototype_layout
+from train_cv_cifar_18 import get_prototype_layout, get_second_conv_layout
 
 
 class StaticLayer(nn.Module):
-    """Static replica of fused_dynamic_conv2d + groupnorm + relu + gates."""
+    """Static replica of one 2-conv AML block (plain + residual mix)."""
 
-    def __init__(self, conv_w, conv_b, gate_c, dim_mask, g_plain, g_resnet, is_first_layer=False):
+    def __init__(self, conv_w, conv_b, conv2_w, conv2_b, gate_c, dim_mask,
+                 g_plain, g_resnet, is_first_layer=False):
         super().__init__()
         self.is_first_layer = is_first_layer
         self.conv = nn.Conv2d(conv_w.shape[1], conv_w.shape[0], 3, padding=1)
         self.conv.weight.data = conv_w
         self.conv.bias.data = conv_b
+        self.conv2 = nn.Conv2d(conv2_w.shape[1], conv2_w.shape[0], 3, padding=1)
+        self.conv2.weight.data = conv2_w
+        self.conv2.bias.data = conv2_b
 
         self.norm = nn.GroupNorm(1, conv_w.shape[0])
+        self.norm2 = nn.GroupNorm(1, conv2_w.shape[0])
 
         self.register_buffer('gate_c', gate_c)
         self.register_buffer('dim_mask', dim_mask)
@@ -53,7 +58,7 @@ class StaticLayer(nn.Module):
         else:
             h_expand = x * self.dim_mask
 
-        h_resnet = F.relu(h_expand + h_norm) * self.dim_mask
+        h_resnet = F.relu(h_expand + self.norm2(self.conv2(h_plain))) * self.dim_mask
 
         h_active = self.g_plain * h_plain + self.g_resnet * h_resnet
         return self.gate_c * h_active + (1.0 - self.gate_c) * h_expand
@@ -95,15 +100,19 @@ def _build_child(prototypes, pi, layer_gates, dim_masks, block_probs,
     """Generic child builder from averaged structure tensors."""
     total_dim, offsets, layer_info, wo_offset, bo_offset = layout_fn(
         max_layers, max_dim, num_classes)
+    offsets2 = get_second_conv_layout(max_layers, max_dim, num_classes)
     assert prototypes.shape[1] == total_dim, \
         f"prototype width {prototypes.shape[1]} != layout {total_dim}"
 
     layers = []
     for i in range(max_layers):
         w_start, w_end, b_start, b_end, in_c = offsets[i]
+        w2_start, w2_end, b2_start, b2_end = offsets2[i]
 
         w_mix = (pi @ prototypes[:, w_start:w_end]).view(max_dim, in_c, 3, 3)
         b_mix = (pi @ prototypes[:, b_start:b_end]).view(max_dim)
+        w2_mix = (pi @ prototypes[:, w2_start:w2_end]).view(max_dim, max_dim, 3, 3)
+        b2_mix = (pi @ prototypes[:, b2_start:b2_end]).view(max_dim)
 
         if i == 0:
             gate_c = torch.tensor([1.0], device=device)
@@ -119,8 +128,8 @@ def _build_child(prototypes, pi, layer_gates, dim_masks, block_probs,
             g_plain = torch.tensor([1.0], device=device)
             g_resnet = torch.tensor([0.0], device=device)
 
-        layers.append(StaticLayer(w_mix, b_mix, gate_c, mask, g_plain, g_resnet,
-                                  is_first_layer=(i == 0)))
+        layers.append(StaticLayer(w_mix, b_mix, w2_mix, b2_mix, gate_c, mask,
+                                  g_plain, g_resnet, is_first_layer=(i == 0)))
 
     w_out = (pi @ prototypes[:, wo_offset:bo_offset]).view(num_classes, 16 * max_dim)
     b_out = (pi @ prototypes[:, bo_offset:bo_offset + num_classes]).view(num_classes)

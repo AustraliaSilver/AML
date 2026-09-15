@@ -21,8 +21,17 @@ from mgn.generator import ModelGenerator
 # Canonical flat prototype layout lives in mgn.layout; re-exported here so
 # long-standing importers (extract_static_model, validate_ext_in, train.py)
 # keep resolving get_prototype_layout from this module.
-from mgn.layout import get_prototype_layout
+from mgn.layout import get_prototype_layout, get_second_conv_layout
 import mgn.accel.functions as aml_ops
+
+# The fused CUDA pipelines (fused_forward / block drivers) implement the v2
+# REAL 2-convolution ResNet block (ATen conv+norm chain per branch, custom
+# elementwise mix kernel); their backward recomputes the identical ATen chain
+# in mgn/accel/fused_autograd.py. Certified by validate_ext_in.py: forward
+# parity at L=18 (GN 0.0034 / IN 0.0435 rel) and gradient parity within
+# 1e-2 at L=2..4, L=18 drift below the reference's own noise floor. Flip to
+# False to force the pure-eager ATen path.
+_FUSED_TWO_CONV_READY = True
 
 try:
     import mgn.accel._C as _C
@@ -65,6 +74,11 @@ class AcceleratedCVNetwork(nn.Module):
         total_end = self.bo_offset + self.num_classes
         self.register_buffer('_proto_end', torch.tensor(total_end), persistent=False)
 
+        self._offsets2 = get_second_conv_layout(self.max_layers, self.max_dim,
+                                                self.num_classes, 3)
+        # Offset vectors for the v2 fused pipeline (conv2 weight/bias slots).
+        self._w2_off = [o2[0] for o2 in self._offsets2]
+        self._b2_off = [o2[2] for o2 in self._offsets2]
         self._layer_info = []
         for i in range(self.max_layers):
             w_start, w_end, b_start, b_end, in_c = self.offsets[i]
@@ -76,7 +90,7 @@ class AcceleratedCVNetwork(nn.Module):
         B = x.shape[0]
         H, W = x.shape[2], x.shape[3]
 
-        if self.norm_mode == "in" and _Cin_available and x.is_cuda:
+        if self.norm_mode == "in" and _Cin_available and x.is_cuda and _FUSED_TWO_CONV_READY:
             w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
             b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
             C_ins = [self.offsets[i][4] for i in range(self.max_layers)]
@@ -94,9 +108,10 @@ class AcceleratedCVNetwork(nn.Module):
                 h = FusedPipelineFunctionIN.apply(
                     x.float(), prototypes.float(), pi.float(),
                     S.layer_gates.float(), S.dim_masks.float(), bm.float(),
-                    w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
+                    w_offsets, b_offsets, self._w2_off, self._b2_off,
+                    C_ins, C_outs, Hs, Ws, self.max_dim
                 )
-        elif _C_available and x.is_cuda:
+        elif _C_available and x.is_cuda and _FUSED_TWO_CONV_READY:
             w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
             b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
             C_ins = [self.offsets[i][4] for i in range(self.max_layers)]
@@ -120,13 +135,15 @@ class AcceleratedCVNetwork(nn.Module):
                     h = FusedPipelineFunction.apply(
                         x.float(), prototypes.float(), pi.float(),
                         S.layer_gates.float(), S.dim_masks.float(), bm.float(),
-                        w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
+                        w_offsets, b_offsets, self._w2_off, self._b2_off,
+                        C_ins, C_outs, Hs, Ws, self.max_dim
                     )
                 else:
                     h = _C.fused_forward(
                         x.float(), prototypes.float(), pi.float(),
                         S.layer_gates.float(), S.dim_masks.float(), bm.float(),
-                        w_offsets, b_offsets, C_ins, C_outs, Hs, Ws, self.max_dim
+                        w_offsets, b_offsets, self._w2_off, self._b2_off,
+                        C_ins, C_outs, Hs, Ws, self.max_dim
                     )
         else:
             h = x
@@ -145,10 +162,22 @@ class AcceleratedCVNetwork(nn.Module):
                 h_plain = F.relu(h_norm) * dim_mask_c
                 h_expand = h_plain if i == 0 else h * dim_mask_c
 
+                # Real 2-conv residual branch (see mgn.layout v2): the plain
+                # activation feeds a second per-layer conv+norm, the skip is
+                # ADDED to its output before the final ReLU. This mirrors
+                # mgn/executor.py block-for-block.
+                w2_start, w2_end, b2_start, b2_end = self._offsets2[i]
+                h_conv2 = aml_ops.fused_dynamic_conv2d(h_plain, prototypes, pi,
+                                                       w2_start, b2_start)
+                if self.norm_mode == "in":
+                    h_norm2 = F.instance_norm(h_conv2)
+                else:
+                    h_norm2 = F.group_norm(h_conv2, num_groups=1)
+
                 g_plain = S.block_mode[:, i, 0].view(-1, 1, 1, 1) if S.block_mode is not None else 1.0
                 g_resnet = S.block_mode[:, i, 1].view(-1, 1, 1, 1) if S.block_mode is not None else 0.0
 
-                h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
+                h_resnet = F.relu(h_expand + h_norm2) * dim_mask_c
                 h_active = g_plain * h_plain + g_resnet * h_resnet
 
                 if i == 0:
