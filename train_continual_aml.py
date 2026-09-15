@@ -471,7 +471,6 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
 
         w_pi = 0.0 if epoch < epochs // 2 else w_pi_final
         t0, tot_loss = time.time(), 0.0
-
         for new_x, new_y in trainloader:
             new_x = new_x.to(device, non_blocking=True)
             new_y = new_y.to(device, non_blocking=True)
@@ -510,6 +509,10 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 # replay samples carry their original task id.
                 # z is L2-normalized so the random-init router can't blow up
                 # the loss scale (raw-z logits started ~10x too large).
+                # NOTE: the valid-column count is constant within a task
+                # (new samples carry task_idx, replay ids are older), so it
+                # is hoisted: the old per-batch task_lbl.max().item() was a
+                # needless device sync on every iteration.
                 if dom_head is not None and diag.get("z", None) is not None:
                     task_lbl = torch.full((inputs.size(0),), task_idx,
                                           device=device, dtype=torch.long)
@@ -517,8 +520,7 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                         task_lbl[inputs.size(0) - re_t.numel():] = re_t
                     z_norm = F.normalize(diag["z"].float(), dim=1)
                     dom_logits = dom_head(z_norm)
-                    valid = int(task_lbl.max().item()) + 1
-                    loss = loss + 0.3 * F.cross_entropy(dom_logits[:, :valid], task_lbl)
+                    loss = loss + 0.3 * F.cross_entropy(dom_logits[:, :task_idx + 1], task_lbl)
 
                 # L2-SP anchor on shared encoder/router
                 if anchor_pairs is not None:
@@ -562,7 +564,9 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                         torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
                         opt_arch.step()
 
-            tot_loss += loss.item()
+            # Detached GPU-side sum (fp32: loss itself is bf16 under
+            # autocast); synced once at epoch end. Log-only change.
+            tot_loss = tot_loss + loss.detach().float()
 
         sch.step()
         # The architecture optimizer does not step while the structure is
@@ -572,8 +576,9 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
         if not freeze:
             sch_arch.step()
         acc, _ = evaluate(model, testloader, device, amp_dtype)
+        avg_loss = (tot_loss / len(trainloader)).item()
         print(f"  {log_prefix}ep {epoch+1}/{epochs} | {time.time()-t0:5.1f}s | "
-              f"loss {tot_loss/len(trainloader):.4f} | {name} acc {acc*100:.2f}%"
+              f"loss {avg_loss:.4f} | {name} acc {acc*100:.2f}%"
               f"{' [frozen]' if freeze else ''}", flush=True)
 
 
@@ -583,7 +588,7 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tasks', type=str, default='mnist,cifar10,fashion')
-    ap.add_argument('--epochs', type=str, default='5,14,8', help='per-task epochs')
+    ap.add_argument('--epochs', type=str, default='5,28,16', help='per-task epochs')
     ap.add_argument('--K', type=int, default=48,
                     help='prototype count; split across tasks (16 rows/task at K=48,T=3)')
     ap.add_argument('--norm', type=str, default='gn1', choices=['gn1', 'in'],

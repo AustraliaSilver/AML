@@ -28,7 +28,7 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def make_conv_aml(input_dim, output_dim, in_channels):
+def make_conv_aml(input_dim, output_dim, in_channels, fused=False):
     lp = 0.0
     # Huge architecture: L=4, D=128 => p_allow inflated to accommodate very large nets
     p_allow = 562186.0 if in_channels == 3 else 506762.0
@@ -38,7 +38,7 @@ def make_conv_aml(input_dim, output_dim, in_channels):
         latent_dim=64, noise_dim=64, num_prototypes=4,
         use_conv=True, in_channels=in_channels
     )
-    exec_ = TaskNetwork()
+    exec_ = TaskNetwork(fused=fused)
     # lambda_balance=0: the -entropy(pi_avg) routing-balance term (weight 1.0)
     # fought the task objective and cost ~3 points in controlled ablations
     # (probes/probe_gate_collapse.py, round 2); diversity emerges without it.
@@ -48,7 +48,7 @@ def make_conv_aml(input_dim, output_dim, in_channels):
                     lambda_eff=0.2, p_allowance=p_allow)
     return gen, exec_, loss
 
-def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, test_y, epochs=100, batch_size=64, device=DEVICE):
+def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, test_y, epochs=100, batch_size=64, device=DEVICE, compile=False, compile_mode="default", gate_floor=0.0, gate_floor_end=0.0, freeze_arch_at=None):
     t0 = time.time()
     # lr=1e-3: matches the plain baselines' optimizer scale; +2 points over
     # the old 5e-4 in controlled ablation (probes/probe_gate_collapse.py,
@@ -56,8 +56,11 @@ def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, tes
     # weight_decay=0.01: non-monotonic sweep found 0.05 too strong and 0
     # too weak (+0.9 vs both, round 6).
     trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device,
-                          weight_decay=0.01, preprocess_fn=cifar_hflip_flat)
-    trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size)
+                          weight_decay=0.01, preprocess_fn=cifar_hflip_flat,
+                          compile=compile, compile_mode=compile_mode)
+    trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size,
+                  gate_floor_start=gate_floor, gate_floor_end=gate_floor_end,
+                  freeze_arch_at=freeze_arch_at)
     elapsed = time.time() - t0
     gen.eval()
     exec_.eval()  # executor carries dropout; leaving it in train mode
@@ -98,7 +101,7 @@ def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, tes
         "entropy": entropy, "prototypes_used": n_used, "resnet_pct": resnet_pct, "vit_pct": vit_pct, "time": elapsed
     }
 
-def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, fast=False, full=False, fixed_arch=False, only_baselines=False):
+def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, fast=False, full=False, fixed_arch=False, only_baselines=False, compile=False, compile_mode="default", batch_size=64, gate_floor=0.0, gate_floor_end=0.0, freeze_arch_at=None, fused_executor=False):
     print(f"\n{'='*70}")
     print(f"ConvAML Benchmark: {dataset_name} (seeds={seeds}, full={full}, fixed_arch={fixed_arch})")
     print(f"{'='*70}")
@@ -124,6 +127,10 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
     sys.stdout.flush()
 
     results = {"dataset": dataset_name, "seeds": seeds, "methods": {}}
+    ctag = ((" [compiled]" if compile else "")
+            + (" [fused-exec]" if fused_executor else "")
+            + (f" [gf={gate_floor}->{gate_floor_end}]" if gate_floor or gate_floor_end else "")
+            + (f" [frz@{freeze_arch_at}]" if freeze_arch_at else ""))
 
     if not only_baselines:
         # 1. ConvAML
@@ -132,7 +139,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         conv_list = []
         for seed in range(seeds):
             set_seed(42 + seed)
-            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
+            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels, fused=fused_executor)
             
             if fixed_arch:
                 for p in gen.prototype_selector.parameters(): p.requires_grad = False
@@ -150,9 +157,9 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
             vx = data["train_x"][val_idx]
             vy = data["train_y"][val_idx]
                 
-            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs)
+            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs, batch_size=batch_size, compile=compile, compile_mode=compile_mode, gate_floor=gate_floor, gate_floor_end=gate_floor_end, freeze_arch_at=freeze_arch_at)
             conv_list.append(res)
-            print(f"  [ConvAML Seed {seed}] Test Acc={res['test_acc']:.4f} | P_eff={int(res['P'])} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | ViT={res.get('vit_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={int(res['time'])}s")
+            print(f"  [ConvAML Seed {seed}]{ctag} Test Acc={res['test_acc']:.4f} (train {res['train_acc']:.4f}) | P_eff={int(res['P'])} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | ViT={res.get('vit_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={int(res['time'])}s")
             sys.stdout.flush()
 
         results["methods"]["ConvAML"] = {
@@ -162,6 +169,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
             "P_std": float(np.std([r["P"] for r in conv_list], ddof=1)) if seeds > 1 else 0.0,
             "time_mean": float(np.mean([r["time"] for r in conv_list])),
             "all_test_accs": [r["test_acc"] for r in conv_list],
+            "all_train_accs": [r["train_acc"] for r in conv_list],
             "all_Ps": [r["P"] for r in conv_list],
             "avg_L": float(np.mean([r.get("L", 0.0) for r in conv_list])),
             "avg_entropy": float(np.mean([r.get("entropy", 0.0) for r in conv_list])),
@@ -174,7 +182,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         conv_no_o_list = []
         for seed in range(seeds):
             set_seed(42 + seed)
-            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
+            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels, fused=fused_executor)
             loss.lambda_eff = 0.0
             
             if fixed_arch:
@@ -192,9 +200,9 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
             vx = data["train_x"][val_idx]
             vy = data["train_y"][val_idx]
                 
-            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs)
+            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs, batch_size=batch_size, compile=compile, compile_mode=compile_mode, gate_floor=gate_floor, gate_floor_end=gate_floor_end, freeze_arch_at=freeze_arch_at)
             conv_no_o_list.append(res)
-            print(f"  [ConvAML No O Seed {seed}] Test Acc={res['test_acc']:.4f} | P_eff={res['P']:.0f} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={res['time']:.0f}s")
+            print(f"  [ConvAML No O Seed {seed}] Test Acc={res['test_acc']:.4f} (train {res['train_acc']:.4f}) | P_eff={res['P']:.0f} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={res['time']:.0f}s")
             sys.stdout.flush()
 
         results["methods"]["ConvAML_No_O"] = {
@@ -203,6 +211,8 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
             "P_mean": float(np.mean([r["P"] for r in conv_no_o_list])),
             "P_std": float(np.std([r["P"] for r in conv_no_o_list], ddof=1)) if seeds > 1 else 0.0,
             "time_mean": float(np.mean([r["time"] for r in conv_no_o_list])),
+            "all_test_accs": [r["test_acc"] for r in conv_no_o_list],
+            "all_train_accs": [r["train_acc"] for r in conv_no_o_list],
         }
 
     # 2. SmallCNN Baseline
@@ -214,7 +224,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         cnn = SmallCNN(in_channels, data["input_dim"], data["output_dim"])
         res = train_torch(cnn, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
         cnn_list.append(res)
-        print(f"  [SmallCNN Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
+        print(f"  [SmallCNN Seed {seed}] Test Acc={res['test_acc']:.4f} (train {res['train_acc']:.4f}) | P={res['P']} | t={res['time']:.0f}s")
         sys.stdout.flush()
 
     results["methods"]["SmallCNN"] = {
@@ -224,6 +234,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         "P_std": float(np.std([r["P"] for r in cnn_list], ddof=1)) if seeds > 1 else 0.0,
         "time_mean": float(np.mean([r["time"] for r in cnn_list])),
         "all_test_accs": [r["test_acc"] for r in cnn_list],
+        "all_train_accs": [r["train_acc"] for r in cnn_list],
         "all_Ps": [r["P"] for r in cnn_list],
     }
 
@@ -236,7 +247,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         mlp = FixedMLP(data["input_dim"], 64, 2, data["output_dim"])
         res = train_torch(mlp, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
         mlp_list.append(res)
-        print(f"  [FixedMLP Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
+        print(f"  [FixedMLP Seed {seed}] Test Acc={res['test_acc']:.4f} (train {res['train_acc']:.4f}) | P={res['P']} | t={res['time']:.0f}s")
         sys.stdout.flush()
 
     results["methods"]["FixedMLP"] = {
@@ -258,7 +269,7 @@ def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, f
         resnet = ResNetBlockBaseline(in_channels, data["input_dim"], data["output_dim"], base_channels=32)
         res = train_torch(resnet, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
         resnet_list.append(res)
-        print(f"  [ResNetBlock Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
+        print(f"  [ResNetBlock Seed {seed}] Test Acc={res['test_acc']:.4f} (train {res['train_acc']:.4f}) | P={res['P']} | t={res['time']:.0f}s")
         sys.stdout.flush()
 
     results["methods"]["ResNetBlock"] = {
@@ -283,12 +294,45 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--fixed-arch", action="store_true")
     parser.add_argument("--only-baselines", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile generator+executor (fuses micro-kernels; "
+                             "same math, faster; compile cost paid once). "
+                             "Requires working inductor (Linux). On Windows "
+                             "torch 2.5 inductor is broken (WinError 183) and "
+                             "the run falls back to eager with a warning.")
+    parser.add_argument("--compile-mode", type=str, default="default",
+                        help="dynamo mode, e.g. default | reduce-overhead | max-autotune")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="ConvAML batch size (baselines keep their own). "
+                             "Larger batches raise arithmetic intensity: fewer "
+                             "kernel launches per epoch on launch-bound GPUs.")
+    parser.add_argument("--gate-floor", type=float, default=0.0,
+                        help="Depth keep-alive: starting floor for layer gates, "
+                             "linearly annealed to --gate-floor-end over the run "
+                             "(0.0 = off, original behaviour). Keeps deep paths "
+                             "gradient-alive while the efficiency penalty ramps.")
+    parser.add_argument("--gate-floor-end", type=float, default=0.0,
+                        help="Final gate floor (default 0 = full prune allowed). "
+                             "Set equal to --gate-floor for constant keep-alive.")
+    parser.add_argument("--freeze-arch-at", type=float, default=None,
+                        help="Two-phase training: freeze structure params "
+                             "(prototype_selector, structure_delta, "
+                             "block_mode_head) at this fraction of epochs, "
+                             "then finetune weights only. E.g. 0.5. "
+                             "Single-phase search overfits the arch to train "
+                              "noise; freezing recovers generalization.")
+    parser.add_argument("--fused-executor", action="store_true",
+                        help="Route the TaskNetwork conv branch through the "
+                             "fused CUDA v2 pipeline (mgn.accel._C). ~1.7-2x "
+                             "faster fwd+bwd on the benchmark configs; eager "
+                             "fallback on any unmet precondition (CPU, 3-mode "
+                             "blocks, >5 layers, layout mismatch).")
     args = parser.parse_args()
 
     ds_names = [d.strip() for d in args.datasets.split(",")]
     all_res = []
     for ds in ds_names:
-        r = run_conv_aml_benchmark(ds, seeds=args.seeds, quick=args.quick, fast=args.fast, full=args.full, fixed_arch=args.fixed_arch, only_baselines=args.only_baselines)
+        r = run_conv_aml_benchmark(ds, seeds=args.seeds, quick=args.quick, fast=args.fast, full=args.full, fixed_arch=args.fixed_arch, only_baselines=args.only_baselines, compile=args.compile, compile_mode=args.compile_mode, batch_size=args.batch_size, gate_floor=args.gate_floor, gate_floor_end=args.gate_floor_end, freeze_arch_at=args.freeze_arch_at, fused_executor=args.fused_executor)
         all_res.append(r)
         out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"conv_aml_{ds}.json")
         with open(out_path, "w") as f:
