@@ -207,9 +207,22 @@ python validate_ext_in.py
 > end-to-end `--fast` per seed 232→119 s ConvAML (1.95x) / 300→89 s No-O
 > (3.4x); the `train.py`/continual path shares the same backward kernels.
 > Fused falls back to eager automatically on any unmet precondition.
-> Gradients carry the pipeline's bf16 conv-backward drift (~1e-3 rel,
-> gated by `validate_ext_in`), so fused runs are NOT bit-identical to the
-> recorded numbers.
+> Gradients carry the pipeline's bf16 forward-mix rounding and reduction-
+> order drift vs eager: ~4e-3 rel on prototype weights, up to ~5e-2 on the
+> ill-conditioned structure gradients (gated by `validate_ext_in` and the
+> parity unit test). A fp32 conv-backward variant was measured and rejected
+> -- it changed neither the drift nor the conclusion (see the `_conv_bwd`
+> docstring), so fused runs are NOT bit-identical to the recorded numbers.
+>
+> **CUDA Graphs were evaluated and rejected (2026-09-15):** a half-batch
+> A/B (same launch count, half GPU work) shows the fused step is ~8.5%
+> CPU-launch/python overhead (~25 ms of a 293 ms step) -- that is the
+> absolute ceiling graphs could recover on the benchmark path. The continual
+> path cannot be graphed at all without redesigning `ProtoIsolator` (its
+> grad-mask hook runs *between* backward and `opt.step()` inside the
+> captured region) and tensorizing the per-epoch LR/pi schedules; the
+> benchmark path additionally needs static shapes (last val batch is 48).
+> Cost/loss > gain; not pursued.
 
 > **Verified build toolchain (Windows):** Python 3.12, `torch 2.5.1+cu124`,
 > `nvcc 13.3` (`CUDA 13.3` toolkit), MSVC C/C++ from *Visual Studio Build
