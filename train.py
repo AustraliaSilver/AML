@@ -101,9 +101,18 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
         weight_dim, offsets, layer_info, wo_offset, bo_offset = get_prototype_layout(self.max_layers, self.max_dim, 10)
         self.proto_weights = nn.Parameter(torch.zeros(self.K, weight_dim))
 
-        # We can just use a global kaiming uniform for simplicity, or zero out biases if we want to be strict.
-        # For simplicity and correctness with the new layout, a global init is sufficient and less error-prone.
-        nn.init.kaiming_uniform_(self.proto_weights, a=math.sqrt(5))
+        # Fix Kaiming Init bug: fan_in is incorrectly determined as weight_dim
+        # We compute proper fan_in per spatial slice.
+        with torch.no_grad():
+            for i in range(self.max_layers):
+                w_start, w_end, b_start, b_end, in_c = offsets[i]
+                fan_in = in_c * 3 * 3
+                bound = math.sqrt(6.0 / fan_in)
+                self.proto_weights.data[:, w_start:w_end].uniform_(-bound, bound)
+            # Head (linear)
+            fan_in_head = 16 * self.max_dim
+            bound_head = math.sqrt(6.0 / fan_in_head)
+            self.proto_weights.data[:, wo_offset:bo_offset].uniform_(-bound_head, bound_head)
 
     def caf_attention(self, features):
         return torch.softmax(features, dim=-1).clamp(min=1e-8)
@@ -483,7 +492,6 @@ def main(argv=None):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
                 scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
@@ -512,17 +520,20 @@ def main(argv=None):
                         scaler.unscale_(optimizer_arch)
                         torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
                         scaler.step(optimizer_arch)
-                        scaler.update()
                     else:
                         loss_arch.backward()
                         torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
                         optimizer_arch.step()
+                        
+            if scaler is not None:
+                scaler.update()
 
             total_loss += loss_dict["task_loss"].item() * x_w.size(0)
 
 
         scheduler.step()
-        scheduler_arch.step()
+        if epoch >= 5:
+            scheduler_arch.step()
         train_loss = total_loss / max(x_w.size(0) * (step + 1), 1)
 
         val_acc, vm = eval_structure(model, valloader, len(valset), use_amp, amp_dtype,

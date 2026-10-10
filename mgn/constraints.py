@@ -78,8 +78,10 @@ def compute_aml_efficiency_torch(accuracy: torch.Tensor, p_allowance: float, q_u
     beta = 20.0
     lam = 2.0
     r = q / p
-    r_clamped = torch.clamp(r, max=4.5)  # beta * (4.5 - 1.0) = 70.0 (safe from float32 exp overflow)
-    F_norm = ( (1.0 + torch.exp(beta * (r_clamped - 1.0))) / 2.0 ) ** (-lam / beta)
+    # Replace clamp + exp with numerically stable softplus to prevent gradient plateaus for r > 4.5
+    # (1 + exp(x))/2 ^ (-lam/beta) == exp(-lam/beta * softplus(x)) * 2^(lam/beta)
+    import torch.nn.functional as F
+    F_norm = torch.exp((-lam / beta) * F.softplus(beta * (r - 1.0))) * (2.0 ** (lam / beta))
     
     return (a / denom) * ratio_term * F_norm
 

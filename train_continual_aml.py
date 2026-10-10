@@ -423,10 +423,8 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
     arch_names = ("structure_prototypes", "block_mode_prototypes")
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
     other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names) and p.requires_grad]
-    for p in arch_params:
-        p.requires_grad_(False)
-
     opt = optim.AdamW(other_params, lr=lr, weight_decay=1e-4)
+    opt_arch = optim.AdamW(arch_params, lr=lr * 0.2, weight_decay=1e-4)
     if dom_head is not None:
         opt_dom = optim.AdamW(dom_head.parameters(), lr=1e-3, weight_decay=0.0)
     ce = lambda lg, tg: F.cross_entropy(lg.float(), tg, label_smoothing=0.1)
@@ -435,6 +433,7 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
         for xb, yb, tb in replay.loader(batch_size=64):
             xb, yb, tb = xb.to(device), yb.to(device), tb.to(device)
             opt.zero_grad(set_to_none=True)
+            opt_arch.zero_grad(set_to_none=True)
             if dom_head is not None:
                 opt_dom.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=amp_dtype is not None,
@@ -452,14 +451,14 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
             if isolator is not None:
                 isolator.mask_grad()
             torch.nn.utils.clip_grad_norm_(other_params, 5.0)
+            torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
             opt.step()
+            opt_arch.step()
             if dom_head is not None:
                 torch.nn.utils.clip_grad_norm_(dom_head.parameters(), 5.0)
                 opt_dom.step()
             if isolator is not None:
                 isolator.restore()
-    for p in arch_params:
-        p.requires_grad_(True)
 
 
 # ----------------------------------------------------------------------
@@ -512,14 +511,19 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             x_a, y_a = new_x[n_v:], new_y[n_v:]
             inputs, targets = new_x[:n_v], new_y[:n_v]
 
-            # Replay mixing: exemplars are appended to the WEIGHT half so
-            # anti-forgetting supervision never leaks into the arch signal.
+            # Replay mixing: exemplars are appended to both the WEIGHT half
+            # and the ARCHITECTURE half to prevent architectural forgetting
             re_t = None
             if replay is not None and len(replay) > 0:
                 n_re = min(48, inputs.size(0), len(replay))
                 re_x, re_y, re_t = replay.sample(n_re, device)
                 inputs = torch.cat([inputs, re_x])
                 targets = torch.cat([targets, re_y])
+                
+                n_re_a = min(48, x_a.size(0), len(replay))
+                re_x_a, re_y_a, _ = replay.sample(n_re_a, device)
+                x_a = torch.cat([x_a, re_x_a])
+                y_a = torch.cat([y_a, re_y_a])
 
             opt.zero_grad(set_to_none=True)
             opt_arch.zero_grad(set_to_none=True)
@@ -566,7 +570,6 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                     isolator.mask_grad()
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
                 scaler.step(opt)
-                scaler.update()
             else:
                 loss.backward()
                 if isolator is not None:
@@ -587,11 +590,13 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                         scaler.unscale_(opt_arch)
                         torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
                         scaler.step(opt_arch)
-                        scaler.update()
                     else:
                         loss_a.backward()
                         torch.nn.utils.clip_grad_norm_(arch_params, 5.0)
                         opt_arch.step()
+                        
+            if scaler is not None:
+                scaler.update()
 
             # Detached GPU-side sum (fp32: loss itself is bf16 under
             # autocast); synced once at epoch end. Log-only change.
