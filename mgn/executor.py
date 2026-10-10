@@ -43,6 +43,9 @@ class TaskNetwork(nn.Module):
     def _fusable(self, x, model, S, W, L_max, batch):
         if not self.fused or not x.is_cuda or batch <= 0:
             return None
+        # Fused pipeline ignores HtS adapters; must fallback to eager if present
+        if hasattr(model, 'hts_adapters') or hasattr(model, 'hts_adapters2'):
+            return None
         pipeline = _load_fused_pipeline()
         if pipeline is None:
             return None

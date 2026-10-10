@@ -134,14 +134,15 @@ void maxpool2x2_launcher(float* X, float* Y, int B, int C, int H, int W_) {
 #define MB_THREADS 256
 #define MB_MAX_C   256
 
-__device__ __forceinline__ float mb_tree_sum(float v, float* scratch) {
+template<typename T>
+__device__ __forceinline__ T mb_tree_sum(T v, T* scratch) {
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     for (int off = 16; off > 0; off >>= 1)
         v += __shfl_down_sync(0xffffffff, v, off);
     if (lane == 0) scratch[wid] = v;
     __syncthreads();
     if (threadIdx.x == 0) {
-        float s = 0.0f;
+        T s = (T)0;
         #pragma unroll
         for (int i = 0; i < MB_THREADS / 32; i++) s += scratch[i];
         scratch[0] = s;
@@ -173,14 +174,14 @@ __global__ void fused_mix_bwd_v2_a_kernel(
     const float gr = block_mode[b * 2 + 1];
     const float lgv = is_layer0 ? 1.0f : layer_gate[b];
 
-    __shared__ float s_gdm[MB_MAX_C];
-    __shared__ float s_part[MB_THREADS / 32];
-    for (int t = threadIdx.x; t < C; t += MB_THREADS) s_gdm[t] = 0.0f;
+    __shared__ double s_gdm[MB_MAX_C];
+    __shared__ double s_part[MB_THREADS / 32];
+    for (int t = threadIdx.x; t < C; t += MB_THREADS) s_gdm[t] = 0.0;
     __syncthreads();
 
     const long base = (long)b * C * spatial;
     const int CS = C * spatial;
-    float ab0 = 0.0f, ab1 = 0.0f, alg = 0.0f;
+    double ab0 = 0.0, ab1 = 0.0, alg = 0.0;
 
     for (int j = threadIdx.x; j < CS; j += MB_THREADS) {
         const int i = (int)(base + j);
@@ -207,14 +208,14 @@ __global__ void fused_mix_bwd_v2_a_kernel(
         d_he[i] = dhe;
         d_hp_pre[i] = dha * gp + (is_layer0 ? dhe : 0.0f);
 
-        ab0 += dha * hp;
-        ab1 += dha * hr;
-        if (!is_layer0) alg += g * (ha - he);
-        atomicAdd(&s_gdm[c], dhr * r2);
+        ab0 += (double)(dha * hp);
+        ab1 += (double)(dha * hr);
+        if (!is_layer0) alg += (double)(g * (ha - he));
+        atomicAdd(&s_gdm[c], (double)(dhr * r2));
     }
     __syncthreads();
     for (int t = threadIdx.x; t < C; t += MB_THREADS)
-        gdm_a[(long)b * C + t] = s_gdm[t];
+        gdm_a[(long)b * C + t] = (float)s_gdm[t];
 
     float f0 = mb_tree_sum(ab0, s_part);
     __syncthreads();
@@ -242,8 +243,8 @@ __global__ void fused_mix_bwd_v2_b_kernel(
     const int b = blockIdx.x;
     const float* dm_row = dim_mask + (long)b * D;
 
-    __shared__ float s_gdm[MB_MAX_C];
-    for (int t = threadIdx.x; t < C; t += MB_THREADS) s_gdm[t] = 0.0f;
+    __shared__ double s_gdm[MB_MAX_C];
+    for (int t = threadIdx.x; t < C; t += MB_THREADS) s_gdm[t] = 0.0;
     __syncthreads();
 
     const long base = (long)b * C * spatial;
@@ -262,11 +263,11 @@ __global__ void fused_mix_bwd_v2_b_kernel(
             dh_skip[i] = dhe * dm;
             term += dhe * hpv[i];
         }
-        atomicAdd(&s_gdm[c], term);
+        atomicAdd(&s_gdm[c], (double)term);
     }
     __syncthreads();
     for (int t = threadIdx.x; t < C; t += MB_THREADS)
-        gdm_b[(long)b * C + t] = s_gdm[t];
+        gdm_b[(long)b * C + t] = (float)s_gdm[t];
 }
 
 void fused_mix_bwd_v2_a_launcher(

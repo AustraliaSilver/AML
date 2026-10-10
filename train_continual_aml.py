@@ -372,6 +372,11 @@ class ProtoIsolator:
         self.future_lo = self.K     # rows [future_lo, K) frozen (future)
         self.snapshot = None
 
+        self.mask = torch.ones_like(self.p)
+        def hook(grad):
+            return grad * self.mask
+        self.p.register_hook(hook)
+
     def begin_task(self, task_idx, num_tasks, reinit=True):
         s = round(task_idx * self.K / num_tasks)
         e = round((task_idx + 1) * self.K / num_tasks)
@@ -385,31 +390,23 @@ class ProtoIsolator:
                 w = torch.empty_like(self.p.data[s:e])
                 _nn.init.kaiming_uniform_(w, a=_math.sqrt(5))
                 self.p.data[s:e] = w
+        
+        self.mask.fill_(1.0)
+        if self.frozen_hi > 0: self.mask[:self.frozen_hi] = 0.0
+        if self.future_lo < self.K: self.mask[self.future_lo:] = 0.0
         return s, e
 
     @torch.no_grad()
     def mask_grad(self):
-        """Zero the .grad of every frozen row BEFORE the optimizer step.
-        Without this, gradients flow into frozen rows every step (pi-mixing
-        touches all rows), so Adam momentum/variance accumulate behind the
-        per-step restore() and silently prime the optimizer to move a row
-        far more than intended the moment it is exposed."""
-        g = self.p.grad
-        if g is None:
-            return
-        if self.frozen_hi > 0:
-            g[:self.frozen_hi] = 0
-        if self.future_lo < self.K:
-            g[self.future_lo:] = 0
+        # Now handled automatically by the backward hook.
+        pass
 
     @torch.no_grad()
     def restore(self):
         if self.snapshot is None:
             return
-        if self.frozen_hi > 0:
-            self.p.data[:self.frozen_hi] = self.snapshot[:self.frozen_hi]
-        if self.future_lo < self.K:
-            self.p.data[self.future_lo:] = self.snapshot[self.future_lo:]
+        # Tensorized restore: capturable by CUDA Graphs
+        self.p.data.copy_(torch.where(self.mask > 0, self.p.data, self.snapshot))
 
 
 def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-4,

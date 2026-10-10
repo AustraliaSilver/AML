@@ -33,17 +33,15 @@ CSRC = os.path.join(ROOT, "mgn", "csrc")
 ACCEL = os.path.join(ROOT, "mgn", "accel")
 
 EXTENSIONS = {
-    # Source set is the exact dependency closure of bindings.cpp. Four other
-    # .cu files used to live in kernels/ and were removed as dead code:
-    # fused_post_conv.cu and fused_chain_conv.cu duplicated symbols already
-    # fused_norm_relu_gate.cu was only consumed by fused_chain_conv.cu, and
-    # batched_hyper_linear.cu was never referenced. fused_chain_conv.cu also
-    # did not compile (it used torch::nn::functional::UnfoldOptions, which
-    # does not exist; the type lives in torch::nn).
+    # (Restored these files and fixed compilation per user request)
     "_C": [
         os.path.join(CSRC, "bindings.cpp"),
-        os.path.join(CSRC, "kernels", "fused_pipeline.cu"),             # fused_post_conv_launcher, maxpool2x2_launcher
-        os.path.join(CSRC, "kernels", "fused_backward.cu"),             # *_bwd_launcher, grouped_conv_bwd_launcher
+        os.path.join(CSRC, "kernels", "fused_pipeline.cu"),
+        os.path.join(CSRC, "kernels", "fused_backward.cu"),
+        os.path.join(CSRC, "kernels", "fused_chain_conv.cu"),
+        os.path.join(CSRC, "kernels", "batched_hyper_linear.cu"),
+        os.path.join(CSRC, "kernels", "fused_post_conv.cu"),
+        os.path.join(CSRC, "kernels", "fused_norm_relu_gate.cu"),
     ],
     "_Cin": [
         os.path.join(CSRC, "in", "bindings_in.cpp"),
