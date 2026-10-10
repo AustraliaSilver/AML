@@ -105,7 +105,6 @@ class MetaTrainer:
         instead of mid-training. RNG state is saved/restored so the dry
         run does not perturb the training trajectory."""
         in_dim = getattr(self.generator, "input_dim", 784)
-        out_dim = getattr(self.generator, "output_dim", 10)
         cpu_rng = torch.get_rng_state()
         cuda_rng = None
         if str(device).startswith("cuda") and torch.cuda.is_available():
@@ -114,7 +113,6 @@ class MetaTrainer:
             self.generator.train()
             self.executor.train()
             x = torch.randn(batch_size, in_dim, device=device)
-            y = torch.randint(0, out_dim, (batch_size,), device=device)
             model = self.generator(x, tau=1.0)
             logits = self.executor(x, model)
             logits.sum().backward()
@@ -162,10 +160,6 @@ class MetaTrainer:
                     val_x, val_y, _ = val_batch
                 else:
                     val_x, val_y = val_batch
-                
-                # Data augmentation for val_batch to match format
-                if val_x.dim() == 4 and val_x.shape[2] == 32:
-                    val_x = val_x.view(-1, 3072)
                 
                 val_x = val_x.to(self.device, non_blocking=True)
                 val_y = val_y.to(self.device, non_blocking=True)

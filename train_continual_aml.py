@@ -104,7 +104,7 @@ def get_task_data(name, data_root, workers=3, aug="basic"):
 # ----------------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
-             snaps=None, route_tau=None):
+             snaps=None, route_tau=None, dom_truth=None):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -112,20 +112,37 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     old-domain inference immune to shared-weight drift (probe: pair-swap
     80.01% -> +protos 99.42%). Samples whose router margin < route_tau are
     evaluated under ALL seen snapshots and the highest-confidence prediction
-    wins (open-set / ambiguous-input fallback)."""
+    wins (open-set / ambiguous-input fallback). dom_truth (optional): true
+    domain id of the loader, for router diagnostics (fp["route_acc"])."""
     model.eval()
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
     bm_res_sum = torch.zeros(model.max_layers, device=device)
     pi_ent_sum, n = 0.0, 0
     gate_list = []
+    route_hits = route_n = 0
+    route_hist = torch.zeros(max(len(slots) if slots else 1, 1), device=device)
     use_route = dom_head is not None and slots is not None
     use_snaps = use_route and snaps is not None
     cur_enc = cur_sel = cur_protos = deq_protos = None
+    cur_sdelta = cur_bhead = None
     if use_snaps:
         cur_enc = {k: v.detach().clone() for k, v in model.vision_encoder.state_dict().items()}
         cur_sel = {k: v.detach().clone() for k, v in model.prototype_selector.state_dict().items()}
         cur_protos = model.proto_weights.detach().clone()
+        # Structure heads (structure_delta / block_mode_head) set layer gates,
+        # width masks and block modes. Without restoring them the LIVE
+        # (post-later-task) heads reinterpret the old rows -> the 26.4% ->
+        # 11.9% CIFAR drop measured under METHOD. Optional key so existing
+        # callers that never captured them keep working.
+        _sheads = snaps[0].get("struct_heads") if snaps else None
+        if not _sheads or not hasattr(model, "structure_delta"):
+            _sheads = None
+        else:
+            cur_sdelta = {k: v.detach().clone() for k, v in
+                          model.structure_delta.state_dict().items()}
+            cur_bhead = {k: v.detach().clone() for k, v in
+                         model.block_mode_head.state_dict().items()}
         deq_protos = []
         for d in range(len(snaps)):
             pr = snaps[d]["protos"]
@@ -147,6 +164,10 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             top2 = pd.topk(min(2, pd.shape[1]), dim=-1).values
             margin = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else torch.zeros_like(top2[:, 0]))
             d_pred = dom_logits.argmax(-1)                         # [B]
+            route_hits += int((d_pred == dom_truth).sum())
+            route_n += d_pred.numel()
+            route_hist += torch.bincount(d_pred.clamp(max=route_hist.numel() - 1),
+                                         minlength=route_hist.numel())
             if use_snaps and route_tau is not None:
                 amb = margin < route_tau                           # ambiguous -> try all domains
             g = torch.stack([slots[d]["gate"] for d in range(len(slots))])   # [T,L]
@@ -173,6 +194,9 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 model.vision_encoder.load_state_dict(snaps[d]["enc"])
                 model.prototype_selector.load_state_dict(snaps[d]["sel"])
                 model.proto_weights.data.copy_(deq_protos[d])
+                if _sheads is not None:
+                    model.structure_delta.load_state_dict(snaps[d]["struct_heads"]["delta"])
+                    model.block_mode_head.load_state_dict(snaps[d]["struct_heads"]["block"])
                 if idx_c.any():
                     with torch.amp.autocast('cuda', **ac):
                         o, st, p, dg = model(x[idx_c], tau=0.1,
@@ -201,6 +225,9 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             model.vision_encoder.load_state_dict(cur_enc)
             model.prototype_selector.load_state_dict(cur_sel)
             model.proto_weights.data.copy_(cur_protos)
+            if _sheads is not None:
+                model.structure_delta.load_state_dict(cur_sdelta)
+                model.block_mode_head.load_state_dict(cur_bhead)
             ref_o = outs_conf[0][1] if outs_conf else best_out
             out = torch.empty(x.shape[0], ref_o.shape[1], device=x.device, dtype=ref_o.dtype)
             pi = torch.zeros(x.shape[0], (pi_conf[0][1] if pi_conf else best_pi).shape[1],
@@ -238,6 +265,8 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
         "bm_res": (bm_res_sum / len(loader)).cpu(),
         "pi_H": pi_ent_sum / n,
         "gate_tensor": torch.cat(gate_list, 0),
+        "route_acc": (route_hits / route_n) if route_n else None,
+        "route_hist": route_hist.cpu(),
     }
     return correct / total, fp
 
@@ -391,9 +420,9 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
     if len(replay) == 0:
         return
     model.train()
-    arch_names = ("structure_delta", "block_mode_head")
+    arch_names = ("structure_prototypes", "block_mode_prototypes")
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
-    other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names)]
+    other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names) and p.requires_grad]
     for p in arch_params:
         p.requires_grad_(False)
 
@@ -443,9 +472,9 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
     trainloader, _ = get_task_data(name, os.path.join(_ROOT, "data"), aug=aug)
     _, testloader = get_task_data(name, os.path.join(_ROOT, "data"))
 
-    arch_names = ("structure_delta", "block_mode_head")
+    arch_names = ("structure_prototypes", "block_mode_prototypes")
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
-    other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names)]
+    other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names) and p.requires_grad]
 
     opt = optim.AdamW(other_params, lr=1e-3, weight_decay=1e-4)
     opt_arch = optim.AdamW(arch_params, lr=2e-4, weight_decay=1e-4)
@@ -633,7 +662,7 @@ def main():
     fingerprints = {}
     replay = ReplayBuffer()
     isolator = ProtoIsolator(model)
-    dom_head = torch.nn.Linear(128, T).to(device)
+    dom_head = torch.nn.Linear(1024, T).to(device)
     slots = [None] * T          # per-domain structure slots
     dom_snaps = [None] * T      # per-domain frozen (encoder, selector) snapshots
     anchor_snap = None          # L2-SP snapshot of shared encoder/router

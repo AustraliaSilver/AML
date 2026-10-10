@@ -95,13 +95,8 @@ class TaskNetwork(nn.Module):
         if getattr(S, "use_conv", False) or "c1.weight" in W:
             in_ch = getattr(S, "in_channels", 1)
             if x.dim() == 2:
-                if x.shape[1] == 3072:
-                    x = x.reshape(-1, 3, 32, 32)
-                elif x.shape[1] == 784:
-                    x = x.reshape(-1, 1, 28, 28)
-                else:
-                    side = int((x.shape[1] // in_ch) ** 0.5)
-                    x = x.reshape(-1, in_ch, side, side)
+                side = int((x.shape[1] // in_ch) ** 0.5)
+                x = x.reshape(-1, in_ch, side, side)
             batch = x.shape[0]
 
             fused = self._fusable(x, model, S, W, L_max, batch)
@@ -151,7 +146,7 @@ class TaskNetwork(nn.Module):
                     h_conv = F.conv2d(h_flat, w_conv_flat, b_conv_flat, groups=batch, padding=1)
                     h_conv = h_conv.view(batch, out_c, h_conv.shape[2], h_conv.shape[3])
                 
-                h_norm = F.group_norm(h_conv, num_groups=1)
+                h_norm = F.layer_norm(h_conv, h_conv.shape[1:])
                 h_plain_raw = F.relu(h_norm) * dim_mask_c
                 h_plain = h_plain_raw
                 h_expand = h_plain_raw if i == 0 else h * dim_mask_c
@@ -181,7 +176,7 @@ class TaskNetwork(nn.Module):
                                                groups=batch, padding=1)
                             h_conv2 = h_conv2.view(batch, c2_in,
                                                    h_conv2.shape[2], h_conv2.shape[3])
-                        h_norm2 = F.group_norm(h_conv2, num_groups=1)
+                        h_norm2 = F.layer_norm(h_conv2, h_conv2.shape[1:])
                         h_resnet = F.relu(h_expand + h_norm2) * dim_mask_c
                     else:
                         h_resnet = F.relu(h_expand + h_norm) * dim_mask_c
@@ -220,7 +215,7 @@ class TaskNetwork(nn.Module):
                             out_proj = F.conv2d(out_trans.reshape(1, batch * attn_dim, out_trans.shape[2], out_trans.shape[3]), w_proj_flat, b_proj_flat, groups=batch)
                             
                         out_proj = out_proj.view(batch, out_c, out_trans.shape[2], out_trans.shape[3])
-                        out_proj = F.group_norm(out_proj, num_groups=1)
+                        out_proj = F.layer_norm(out_proj, out_proj.shape[1:])
                         h_trans = F.relu(h_expand + h_norm + out_proj) * dim_mask_c
                     else:
                         h_trans = 0.0

@@ -1,3 +1,9 @@
+import sys
+import os
+try:
+    from hts_lib.models.basis import HtSLowRankAdapter
+except ImportError:
+    HtSLowRankAdapter = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,8 +11,6 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 import time
-import os
-import sys
 
 # Register CUDA/torch DLL directories and harden the inductor cache before
 # any native extension import. Paths are derived from the live environment
@@ -55,7 +59,7 @@ except ImportError:
 
 
 class AcceleratedCVNetwork(nn.Module):
-    def __init__(self, max_layers=6, max_dim=64, num_classes=10, norm_mode="gn1"):
+    def __init__(self, max_layers=6, max_dim=64, num_classes=10, norm_mode="gn1", K=32):
         super().__init__()
         self.max_layers = max_layers
         self.max_dim = max_dim
@@ -69,6 +73,19 @@ class AcceleratedCVNetwork(nn.Module):
         self.total_dim, self.offsets, self._layer_info, self.wo_offset, self.bo_offset = get_prototype_layout(self.max_layers, self.max_dim, self.num_classes)
         
         self._build_slices()
+        
+        # HtS Low-Rank Integration
+        self.use_hts_low_rank = (HtSLowRankAdapter is not None)
+        if self.use_hts_low_rank:
+            # K is passed via __init__
+            self.hts_adapters = nn.ModuleList()
+            for i in range(self.max_layers):
+                in_c = self.offsets[i][4]
+                self.hts_adapters.append(HtSLowRankAdapter(K, self.max_dim, in_c))
+            self.hts_adapters2 = nn.ModuleList()
+            for i in range(self.max_layers):
+                self.hts_adapters2.append(HtSLowRankAdapter(K, self.max_dim, self.max_dim))
+
 
     def _build_slices(self):
         total_end = self.bo_offset + self.num_classes
@@ -90,7 +107,80 @@ class AcceleratedCVNetwork(nn.Module):
         B = x.shape[0]
         H, W = x.shape[2], x.shape[3]
 
-        if self.norm_mode == "in" and _Cin_available and x.is_cuda and _FUSED_TWO_CONV_READY:
+        if getattr(self, 'use_hts_low_rank', False):
+            # Bypass fused ops when using Low-Rank updates
+            h = x
+            w_mix = pi @ prototypes
+            for i in range(self.max_layers):
+                w_start, w_end, b_start, b_end, in_c, C_out = self._layer_info[i]
+                
+                # Get base weights
+                w_base = w_mix[:, w_start:w_end].view(B, C_out, in_c, 3, 3)
+                b_base = w_mix[:, b_start:b_end]
+                
+                # Add Low-Rank update
+                w_hts = self.hts_adapters[i](pi) # [B, C_out, in_c, 3, 3]
+                w_final = w_base + w_hts
+                
+                # Group convolution trick for batched weights
+                h_flat = h.view(1, B * in_c, h.shape[2], h.shape[3])
+                w_flat = w_final.reshape(B * C_out, in_c, 3, 3)
+                b_flat = b_base.reshape(B * C_out)
+                
+                h_conv = F.conv2d(h_flat, w_flat, b_flat, groups=B, padding=1)
+                h_conv = h_conv.view(B, C_out, h_conv.shape[2], h_conv.shape[3])
+
+                gate_c = S.layer_gates[:, i:i+1].view(-1, 1, 1, 1)
+                dim_mask_c = S.dim_masks[:, i].view(-1, S.dim_masks.shape[-1], 1, 1)
+
+                if self.norm_mode == "in":
+                    h_norm = F.instance_norm(h_conv)
+                else:
+                    h_norm = F.group_norm(h_conv, num_groups=1)
+                h_plain = F.relu(h_norm) * dim_mask_c
+                h_expand = h_plain if i == 0 else h * dim_mask_c
+
+                w2_start = self._w2_off[i]
+                b2_start = self._b2_off[i]
+                w2_base = w_mix[:, w2_start:w2_start + self.max_dim * self.max_dim * 9].view(B, self.max_dim, self.max_dim, 3, 3)
+                b2_base = w_mix[:, b2_start:b2_start + self.max_dim]
+                
+                w2_hts = self.hts_adapters2[i](pi)
+                w2_final = w2_base + w2_hts
+                
+                h_plain_flat = h_plain.view(1, B * self.max_dim, h_plain.shape[2], h_plain.shape[3])
+                w2_flat = w2_final.reshape(B * self.max_dim, self.max_dim, 3, 3)
+                b2_flat = b2_base.reshape(B * self.max_dim)
+                
+                h_conv2 = F.conv2d(h_plain_flat, w2_flat, b2_flat, groups=B, padding=1)
+                h_conv2 = h_conv2.view(B, self.max_dim, h_conv2.shape[2], h_conv2.shape[3])
+
+                if self.norm_mode == "in":
+                    h_norm2 = F.instance_norm(h_conv2)
+                else:
+                    h_norm2 = F.group_norm(h_conv2, num_groups=1)
+                h_resnet = F.relu(h_expand + h_norm2) * dim_mask_c
+
+                g_plain = S.block_mode[:, i, 0].view(-1, 1, 1, 1)
+                g_resnet = S.block_mode[:, i, 1].view(-1, 1, 1, 1)
+                h_active = g_plain * h_plain + g_resnet * h_resnet
+
+                if i == 0:
+                    h = h_active
+                else:
+                    h = gate_c * h_active + (1.0 - gate_c) * h_expand
+                    
+                if i == 5 or i == 11:
+                    if h.shape[2] > 1:
+                        h = F.max_pool2d(h, 2, 2)
+            
+            # Classifier
+            h_pool = self.pool(h).reshape(B, -1)
+            wo = w_mix[:, self.wo_offset:self.wo_offset + self.num_classes * 16 * self.max_dim].view(B, self.num_classes, 16 * self.max_dim)
+            bo = w_mix[:, self.bo_offset:self.bo_offset + self.num_classes]
+            out = torch.bmm(h_pool.unsqueeze(1), wo.transpose(1, 2)).squeeze(1) + bo
+            return out
+        elif self.norm_mode == "in" and _Cin_available and x.is_cuda and _FUSED_TWO_CONV_READY:
             w_offsets = [self.offsets[i][0] for i in range(self.max_layers)]
             b_offsets = [self.offsets[i][2] for i in range(self.max_layers)]
             C_ins = [self.offsets[i][4] for i in range(self.max_layers)]

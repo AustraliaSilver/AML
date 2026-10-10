@@ -75,6 +75,11 @@ class TestProtoIsolator(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.proto_weights = torch.nn.Parameter(torch.randn(8, 5))
+                # Mock prototype_selector and router keys
+                class _Router:
+                    def __init__(self):
+                        self.keys = torch.nn.Parameter(torch.randn(8, 16))
+                self.prototype_selector = [_Router()]
 
         m = _M()
         iso = tca.ProtoIsolator(m)

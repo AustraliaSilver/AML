@@ -1,0 +1,83 @@
+{
+  "config": {
+    "tasks": "mnist,cifar10,fashion",
+    "epochs": "1,1,1",
+    "method": "ewckd",
+    "ewc_lambda": 5.0,
+    "kd_lambda": 1.0,
+    "ewc_sel": true,
+    "freeze_enc_bottom": 0,
+    "K": 48,
+    "max_layers": 18,
+    "max_dim": 64,
+    "latent_dim": 128,
+    "lr": 0.001,
+    "tau": 0.8,
+    "w_pi": 0.01,
+    "freeze_arch_epochs": 1,
+    "max_batches": 6,
+    "fisher_batches": 64,
+    "seed": 42,
+    "aug": "basic",
+    "workers": 3,
+    "tag": "full_timing",
+    "method_eval": true,
+    "route_tau": 0.6,
+    "no_snap_struct": false
+  },
+  "A_live": [
+    [
+      0.115,
+      null,
+      null
+    ],
+    [
+      0.0824,
+      0.1079,
+      null
+    ],
+    [
+      0.0425,
+      0.108,
+      0.245
+    ]
+  ],
+  "A_method": [
+    [
+      0.1686,
+      null,
+      null
+    ],
+    [
+      0.1814,
+      0.0985,
+      null
+    ],
+    [
+      0.1456,
+      0.1058,
+      0.1759
+    ]
+  ],
+  "bwt": -0.0362,
+  "forgetting": 0.0362,
+  "drift": [
+    [
+      1,
+      0.0
+    ],
+    [
+      2,
+      0.10779613256454468
+    ],
+    [
+      3,
+      0.10219335556030273
+    ]
+  ],
+  "fingerprint_pi_H": {
+    "mnist": 3.8699814571380617,
+    "cifar10": 3.86642681350708,
+    "fashion": 3.8564329135894777
+  }
+}

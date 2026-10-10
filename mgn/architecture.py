@@ -136,9 +136,15 @@ class GeneratedModel:
         self.structure.layer_gates = self.structure.layer_gates.to(device)
         self.structure.dim_weights = self.structure.dim_weights.to(device)
         self.structure.residual = self.structure.residual.to(device)
+        if self.structure.dim_masks is not None:
+            self.structure.dim_masks = self.structure.dim_masks.to(device)
+        if self.structure.block_mode is not None:
+            self.structure.block_mode = self.structure.block_mode.to(device)
         self.weights = {k: v.to(device) for k, v in self.weights.items()}
         if self.embedding is not None:
             self.embedding = self.embedding.to(device)
+        if self.pi_logits is not None:
+            self.pi_logits = self.pi_logits.to(device)
         if self.pi is not None:
             self.pi = self.pi.to(device)
         # prototypes is a reference to a module parameter; it moves with the

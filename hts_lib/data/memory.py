@@ -31,12 +31,16 @@ class EpisodicMemoryBuffer:
         if targets is not None:
             # torch RNG keeps this reproducible under set_seed()
             t = torch.as_tensor(list(targets))
-            quota = max(budget // int(t.max().item()) + 1, 1)
+            unique_classes = torch.unique(t)
+            num_classes = len(unique_classes)
+            # Ceiling division ensures we get enough total samples before truncating
+            quota = max((budget + num_classes - 1) // num_classes, 1)
             selected_idx = []
-            for c in torch.unique(t):
+            for c in unique_classes:
                 cls_idx = (t == c).nonzero(as_tuple=True)[0]
                 keep = cls_idx[torch.randperm(len(cls_idx))[:quota]]
                 selected_idx.extend(keep.tolist())
+            random.shuffle(selected_idx)
             selected_idx = selected_idx[:budget]
         else:
             indices = list(range(len(dataset)))

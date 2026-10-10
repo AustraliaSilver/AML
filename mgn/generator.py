@@ -4,6 +4,10 @@ import torch.nn.functional as F
 
 from .architecture import ModelStructure, GeneratedModel
 from .layout import get_prototype_layout, get_second_conv_layout
+try:
+    from hts_lib.models.basis import HtSLowRankAdapter
+except ImportError:
+    HtSLowRankAdapter = None
 
 
 class PrototypeLibrary(nn.Module):
@@ -80,6 +84,18 @@ class PrototypeLibrary(nn.Module):
         )
 
 
+class DistanceRouter(nn.Module):
+    def __init__(self, latent_dim, num_prototypes):
+        super().__init__()
+        import math
+        self.keys = nn.Parameter(torch.empty(num_prototypes, latent_dim))
+        nn.init.kaiming_uniform_(self.keys, a=math.sqrt(5))
+        self.scale = nn.Parameter(torch.tensor([1.0]))
+    def forward(self, z):
+        diff = z.unsqueeze(1) - self.keys.unsqueeze(0)
+        sq_dist = torch.sum(diff ** 2, dim=-1)
+        return -sq_dist * F.softplus(self.scale)
+
 class ModelGenerator(nn.Module):
     def __init__(
         self,
@@ -155,6 +171,16 @@ class ModelGenerator(nn.Module):
             max_dim=self.max_dim,
             output_dim=self.output_dim,
         )
+
+        # HtS Low-Rank Updates for CNN Layers
+        if self.use_conv and HtSLowRankAdapter is not None:
+            self.hts_adapters = nn.ModuleList()
+            for i, (w_start, w_end, b_start, b_end, in_c) in enumerate(self._proto_offsets):
+                self.hts_adapters.append(HtSLowRankAdapter(num_prototypes, self.max_dim, in_c))
+            self.hts_adapters2 = nn.ModuleList()
+            for i, (w_start, w_end, b_start, b_end) in enumerate(self._proto_offsets2):
+                self.hts_adapters2.append(HtSLowRankAdapter(num_prototypes, self.max_dim, self.max_dim))
+
 
         self.structure_delta = nn.Linear(latent_dim, max_layers + (max_layers * len(dim_choices)) + 1)
         # 2 executable block modes: Plain / ResNet
@@ -266,12 +292,20 @@ class ModelGenerator(nn.Module):
             # the executor and the static extractor).
             D = self.max_dim
             for i, (w_start, w_end, b_start, b_end, in_c) in enumerate(self._proto_offsets):
-                W[f"c{i+1}.weight"] = w_direct[:, w_start:w_end].view(-1, D, in_c, 3, 3)
+                w_aml = w_direct[:, w_start:w_end].view(-1, D, in_c, 3, 3)
+                if hasattr(self, 'hts_adapters'):
+                    w_hts = self.hts_adapters[i](pi)
+                    W[f"c{i+1}.weight"] = w_aml + w_hts
+                else:
+                    W[f"c{i+1}.weight"] = w_aml
                 W[f"c{i+1}.bias"] = w_direct[:, b_start:b_end]
             for i, (w2_start, w2_end, b2_start, b2_end) in enumerate(self._proto_offsets2):
-                # Residual-branch 3x3 (max_dim -> max_dim); consumed by
-                # TaskNetwork only when the layer routes through ResNet mode.
-                W[f"c{i+1}.weight2"] = w_direct[:, w2_start:w2_end].view(-1, D, D, 3, 3)
+                w2_aml = w_direct[:, w2_start:w2_end].view(-1, D, D, 3, 3)
+                if hasattr(self, 'hts_adapters2'):
+                    w2_hts = self.hts_adapters2[i](pi)
+                    W[f"c{i+1}.weight2"] = w2_aml + w2_hts
+                else:
+                    W[f"c{i+1}.weight2"] = w2_aml
                 W[f"c{i+1}.bias2"] = w_direct[:, b2_start:b2_end]
             wo_off, bo_off = self._proto_head
             sz_w = (16 * D) * self.output_dim
@@ -316,3 +350,4 @@ class ModelGenerator(nn.Module):
                               embedding=z, pi=pi,
                               prototypes=(self.prototype_lib.proto_weights
                                           if self.use_conv else None))
+

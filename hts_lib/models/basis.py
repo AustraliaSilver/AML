@@ -2,6 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class HtSLowRankAdapter(nn.Module):
+    def __init__(self, K, D_out, D_in, rank=8):
+        super().__init__()
+        self.K = K
+        self.rank = rank
+        self.B = nn.Parameter(torch.randn(K, rank, D_in, 3, 3) * 0.01)
+        self.A = nn.Parameter(torch.randn(K, D_out, rank, 1, 1) * 0.01)
+
+    def forward(self, alpha):
+        A_active = torch.einsum('bk, korxy -> borxy', alpha, self.A)
+        B_active = torch.einsum('bk, krihw -> brihw', alpha, self.B)
+        delta_W = torch.einsum('borxy, brihw -> boihw', A_active, B_active)
+        return delta_W
+
+    def compute_ortho_loss(self):
+        b_flat = self.A.view(self.K, -1)
+        b_norm = F.normalize(b_flat, p=2, dim=-1)
+        gram = torch.mm(b_norm, b_norm.t())
+        mask = ~torch.eye(self.K, dtype=torch.bool, device=self.A.device)
+        return (gram[mask] ** 2).mean()
+
+import torch.nn as nn
+
 class HtSDualResidualBasis(nn.Module):
     """
     Dual-Residual Basis System for Multi-Stage Dynamic Weight Synthesis.

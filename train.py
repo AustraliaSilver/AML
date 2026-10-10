@@ -16,48 +16,83 @@ from train_cv_cifar_18 import AcceleratedCVNetwork, get_prototype_layout
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mgn.architecture import ModelStructure, GeneratedModel
 from mgn.losses import MetaLoss
+from mgn.generator import DistanceRouter
+
+class TaskCentroidOOD(nn.Module):
+    def __init__(self, feature_dim=128, max_tasks=10, K=32):
+        super().__init__()
+        self.K = K
+        self.register_buffer('centroids', torch.zeros(max_tasks, feature_dim))
+        self.register_buffer('task_counts', torch.zeros(max_tasks))
+        self.current_task_id = 0
+        
+    def update_centroid(self, z):
+        z_mean = z.mean(dim=0).detach()
+        curr_count = self.task_counts[self.current_task_id]
+        new_count = curr_count + 1
+        self.centroids[self.current_task_id] = (self.centroids[self.current_task_id] * curr_count + z_mean) / new_count
+        self.task_counts[self.current_task_id] = new_count
+        
+    def get_pi(self, z, active_rows_per_task):
+        active_tasks = int((self.task_counts > 0).sum().item())
+        if active_tasks == 0:
+            pi = torch.ones(z.shape[0], self.K, device=z.device) / self.K
+            return pi
+            
+        c = self.centroids[:active_tasks]
+        z_norm = F.normalize(z, dim=-1)
+        c_norm = F.normalize(c, dim=-1)
+        sim = z_norm @ c_norm.T
+        task_probs = torch.softmax(sim * 1000.0, dim=-1)
+        
+        pi = torch.zeros(z.shape[0], self.K, device=z.device)
+        for t in range(active_tasks):
+            start = t * active_rows_per_task
+            end = start + active_rows_per_task
+            pi[:, start:end] = (task_probs[:, t:t+1] / active_rows_per_task)
+            
+        return pi
 
 class ConvAML_CIFAR_TrueDynamic(nn.Module):
-    def __init__(self, K=32, latent_dim=128, max_layers=18, max_dim=64, norm_mode="gn1"):
+    def __init__(self, K=32, latent_dim=1024, max_layers=18, max_dim=64, norm_mode="gn1"):
         super().__init__()
         self.K = K
         self.max_layers = max_layers
         self.max_dim = max_dim
 
         self.vision_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(3, 128, 3, padding=1), nn.GroupNorm(4, 128), nn.ReLU(),
             nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(128, 256, 3, padding=1), nn.GroupNorm(8, 256), nn.ReLU(),
             nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
-            nn.Linear(128, latent_dim), nn.ReLU()
+            nn.Conv2d(256, 512, 3, padding=1), nn.GroupNorm(16, 512), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)), nn.Flatten(),
+            nn.Linear(512 * 4, latent_dim), nn.ReLU()
         )
+        for p in self.vision_encoder.parameters():
+            p.requires_grad = False
+        
         self.prototype_selector = nn.Sequential(
-            nn.Linear(latent_dim, 256), nn.BatchNorm1d(256), nn.GELU(),
-            nn.Linear(256, 256), nn.BatchNorm1d(256), nn.GELU(),
-            nn.Linear(256, K)
+            nn.Linear(latent_dim, 256), nn.LayerNorm(256), nn.GELU(),
+            nn.Linear(256, 256), nn.LayerNorm(256), nn.GELU(),
+            DistanceRouter(256, K)
         )
 
-        self.structure_delta = nn.Linear(latent_dim, max_layers + (max_layers * max_dim))
-        # 2 executable block modes: Plain / ResNet (ViT head removed: it was
-        # never executed by any executor path and silently zeroed layers)
-        self.block_mode_head = nn.Linear(latent_dim, max_layers * 2)
-        nn.init.constant_(self.structure_delta.weight, 0.0)
-        nn.init.constant_(self.structure_delta.bias, 0.0)
-        nn.init.constant_(self.block_mode_head.weight, 0.0)
-        nn.init.constant_(self.block_mode_head.bias, 0.0)
+        self.ood_router = TaskCentroidOOD(feature_dim=latent_dim, max_tasks=10, K=K)
+        self.rows_per_task = 24
+        self.structure_prototypes = nn.Parameter(torch.zeros(K, max_layers + (max_layers * max_dim)))
+        self.block_mode_prototypes = nn.Parameter(torch.zeros(K, max_layers * 2))
+        
         with torch.no_grad():
             # ResNet-heavy init: keeps residual paths dominant during warmup.
             # Balanced (0.5) init was tested and destabilized training: Plain
             # rewrites (relu(GN(conv(h)))) destroyed signal -> post-unfreeze
             # the router overshot into one-hot prototypes (-12% acc).
-            self.block_mode_head.bias.data.view(max_layers, 2)[:, 1] = 2.0
+            self.block_mode_prototypes.data.view(K, max_layers, 2)[:, :, 1] = 2.0
 
         self._init_prototypes()
 
-        self.exec_ = AcceleratedCVNetwork(max_layers=max_layers, max_dim=max_dim, num_classes=10,
-                                          norm_mode=norm_mode)
+        self.exec_ = AcceleratedCVNetwork(max_layers=max_layers, max_dim=max_dim, num_classes=10, norm_mode=norm_mode, K=self.K)
 
     def _init_prototypes(self):
         import math
@@ -76,13 +111,17 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
     def forward(self, x, tau=1.0, struct_override=None, pi_mask=None):
         B = x.shape[0]; device = x.device
         z = self.vision_encoder(x)
-        sel_logits = self.prototype_selector(z)
-        if pi_mask is not None:
-            # Routing isolation: a domain may only mix prototype rows it owns
-            sel_logits = sel_logits.float().masked_fill(~pi_mask, float("-inf"))
-        pi = self.caf_attention(sel_logits)
+        
+        if self.training:
+            self.ood_router.current_task_id = getattr(self, 'train_task_id', 0)
+            with torch.no_grad():
+                self.ood_router.update_centroid(z)
+        
+        # OOD Routing (Train time or single task)
+        with torch.no_grad():
+            pi = self.ood_router.get_pi(z, self.rows_per_task)
 
-        delta = self.structure_delta(z)
+        delta = pi @ self.structure_prototypes
         layer_logits = delta[:, :self.max_layers] + 2.0
         layer_soft = torch.sigmoid(layer_logits)
         if self.training:
@@ -97,7 +136,7 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
         arange = torch.arange(self.max_dim, device=device).float().view(1, 1, self.max_dim)
         dim_masks = torch.sigmoid(10.0 * (d_lengths - arange))
 
-        bm_logits = self.block_mode_head(z).view(B, self.max_layers, 2)
+        bm_logits = (pi @ self.block_mode_prototypes).view(B, self.max_layers, 2)
 
         if struct_override is not None:
             # Continual mode: use the per-domain stored structure slot
@@ -109,13 +148,11 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
             if self.training:
                 block_mode = F.gumbel_softmax(bm_logits, tau=tau, hard=True, dim=-1)
             else:
-                # Deterministic argmax mode at eval: Gumbel sampling does not
-                # respect module.eval(), so leaving it on makes test accuracy
-                # depend on RNG draw order (two runs of the same seed disagree).
+                # Deterministic argmax mode at eval
                 block_mode = F.one_hot(bm_logits.argmax(dim=-1), 2).float()
 
         dim_weights = d_lengths / self.max_dim
-
+        
         struct = ModelStructure(
             layer_gates=layer_gates,
             dim_weights=dim_weights,
