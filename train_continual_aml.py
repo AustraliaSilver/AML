@@ -46,7 +46,7 @@ def _base_gray(mean, std):
     ]
 
 
-def get_task_data(name, data_root, workers=3, aug="basic"):
+def get_task_data(name, data_root, workers=0, aug="basic"):
     if name == "mnist":
         mean, std = (0.1307,) * 3, (0.3081,) * 3
         tf_train = transforms.Compose(
@@ -164,7 +164,8 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             top2 = pd.topk(min(2, pd.shape[1]), dim=-1).values
             margin = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else torch.zeros_like(top2[:, 0]))
             d_pred = dom_logits.argmax(-1)                         # [B]
-            route_hits += int((d_pred == dom_truth).sum())
+            if dom_truth is not None:
+                route_hits += int((d_pred == dom_truth).sum())
             route_n += d_pred.numel()
             route_hist += torch.bincount(d_pred.clamp(max=route_hist.numel() - 1),
                                          minlength=route_hist.numel())
@@ -516,6 +517,9 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 re_x, re_y, re_t = replay.sample(n_re, device)
                 inputs = torch.cat([inputs, re_x])
                 targets = torch.cat([targets, re_y])
+                re_x_a, re_y_a, _ = replay.sample(min(48, x_a.size(0), len(replay)), device)
+                x_a = torch.cat([x_a, re_x_a])
+                y_a = torch.cat([y_a, re_y_a])
                 
                 n_re_a = min(48, x_a.size(0), len(replay))
                 re_x_a, re_y_a, _ = replay.sample(n_re_a, device)
@@ -750,7 +754,7 @@ def main():
                                dom_head=(dom_head if use_route else None),
                                slots=(slots[:i + 1] if use_route else None),
                                snaps=(dom_snaps[:i + 1] if use_route else None),
-                               route_tau=args.route_tau)
+                               route_tau=args.route_tau, dom_truth=j)
             acc_live, _ = evaluate(model, el, device, amp_dtype)
             A[i][j] = acc
             A_live[i][j] = acc_live

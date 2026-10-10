@@ -533,7 +533,8 @@ def main(argv=None):
 
         scheduler.step()
         if epoch >= 5:
-            scheduler_arch.step()
+            if getattr(args, 'freeze_arch', False) == False:
+                scheduler_arch.step()
         train_loss = total_loss / max(x_w.size(0) * (step + 1), 1)
 
         val_acc, vm = eval_structure(model, valloader, len(valset), use_amp, amp_dtype,
