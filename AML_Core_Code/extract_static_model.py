@@ -142,7 +142,6 @@ def _build_child(prototypes, pi, layer_gates, dim_masks, block_probs,
 def extract_child_truedynamic(mother_model, x_dummy):
     """Extract a static child from ConvAML_CIFAR_TrueDynamic (train.py)."""
     mother_model.eval()
-    B = x_dummy.shape[0]
     L = mother_model.max_layers
     D = mother_model.max_dim
     device = x_dummy.device
