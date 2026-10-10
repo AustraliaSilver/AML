@@ -377,7 +377,7 @@ def main(argv=None):
     # branches early (untrained deep features look like noise), which
     # collapsed all depth gates within one epoch. The generalization
     # signal rewards capacity and keeps depth selection meaningful.
-    arch_names = ("structure_delta", "block_mode_head")
+    arch_names = ("structure_prototypes", "block_mode_prototypes")
     arch_params = [p for n, p in model.named_parameters() if any(k in n for k in arch_names)]
     other_params = [p for n, p in model.named_parameters() if not any(k in n for k in arch_names)]
     optimizer = optim.AdamW(other_params, lr=args.lr, weight_decay=1e-4)
