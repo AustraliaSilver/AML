@@ -150,20 +150,20 @@ def extract_child_truedynamic(mother_model, x_dummy):
     # Deterministic structure: no Gumbel noise, batch-mean conditioning.
     z = mother_model.vision_encoder(x_dummy)
 
-    pi = torch.softmax(mother_model.prototype_selector(z), dim=-1).mean(dim=0, keepdim=True)
+    pi = mother_model.ood_router.get_pi(z, mother_model.rows_per_task).mean(dim=0, keepdim=True)
 
-    delta = mother_model.structure_delta(z)
+    delta = pi @ mother_model.structure_prototypes
     layer_soft = torch.sigmoid(delta[:, :L] + 2.0)
-    layer_gates = (layer_soft > 0.5).float().mean(dim=0, keepdim=True)
+    layer_gates = (layer_soft > 0.5).float()
 
-    dim_logits = delta[:, L:].view(B, L, D)
+    dim_logits = delta[:, L:].view(1, L, D)
     d_logit = dim_logits.mean(dim=-1, keepdim=True) + 2.0
     d_lengths = torch.clamp(torch.sigmoid(d_logit) * D, min=24.0)
     arange = torch.arange(D, device=device).float().view(1, 1, D)
-    dim_masks = torch.sigmoid(10.0 * (d_lengths - arange)).mean(dim=0, keepdim=True)
+    dim_masks = torch.sigmoid(10.0 * (d_lengths - arange))
 
-    bm_logits = mother_model.block_mode_head(z).view(B, L, 2)
-    block_probs = torch.softmax(bm_logits, dim=-1).mean(dim=0, keepdim=True)
+    bm_logits = (pi @ mother_model.block_mode_prototypes).view(1, L, 2)
+    block_probs = torch.softmax(bm_logits, dim=-1)
 
     return _build_child(
         mother_model.proto_weights, pi, layer_gates, dim_masks, block_probs,
@@ -178,11 +178,11 @@ def extract_child(mother_model, x_dummy):
     `extract_child_truedynamic`, which handles ConvAML_CIFAR_TrueDynamic
     (repo-root train.py).
     """
-    if not (hasattr(mother_model, "proto_weights")
-            and hasattr(mother_model, "structure_delta")):
+    if not (hasattr(mother_model, "structure_prototypes")
+            and hasattr(mother_model, "proto_weights")):
         raise TypeError(
             f"Unsupported mother model {type(mother_model).__name__}: expected "
-            "ConvAML_CIFAR_TrueDynamic (attrs: proto_weights, structure_delta)."
+            "ConvAML_CIFAR_TrueDynamic (attrs: proto_weights, structure_prototypes)."
         )
     return extract_child_truedynamic(mother_model, x_dummy)
 
