@@ -13,10 +13,8 @@ Tests cover:
 
 import unittest
 import torch
-import torch.nn.functional as F
 
 from mgn.accel import _C
-from mgn.accel.fused_autograd import FusedPipelineFunction
 
 
 class TestCUDAEdgeCases(unittest.TestCase):
@@ -32,7 +30,7 @@ class TestCUDAEdgeCases(unittest.TestCase):
         H, W = 7, 11
         x = torch.randn(B, C_in, H, W, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         w = torch.randn(B, C_out, C_in, 3, 3, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        bias = torch.randn(B, C_out, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        _bias = torch.randn(B, C_out, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         g_out = torch.randn(B, C_out, H, W, device="cuda", dtype=torch.float32)
 
@@ -47,7 +45,7 @@ class TestCUDAEdgeCases(unittest.TestCase):
 
     def test_single_pixel_spatial_1x1(self):
         """Test Dynamic Conv2D and Normalizations with 1x1 spatial resolution."""
-        B, C_in, C_out = 2, 4, 8
+        B, C_in, _C_out = 2, 4, 8
         H, W = 1, 1
         x = torch.randn(B, C_in, H, W, device="cuda", dtype=torch.float32)
         mean = x.mean(dim=(1, 2, 3))
