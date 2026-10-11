@@ -14,14 +14,19 @@ Tests cover:
 import unittest
 import torch
 
-from mgn.accel import _C
+try:
+    from mgn.accel import _C
+    HAS_CUDA_EXT = True
+except ImportError:
+    _C = None
+    HAS_CUDA_EXT = False
 
 
 class TestCUDAEdgeCases(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
+        if not torch.cuda.is_available() or not HAS_CUDA_EXT:
+            raise unittest.SkipTest("CUDA or native _C extension not available")
         torch.manual_seed(42)
 
     def test_odd_spatial_conv2d_forward_and_backward(self):
