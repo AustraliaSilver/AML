@@ -367,6 +367,7 @@ class ProtoIsolator:
     """
 
     def __init__(self, model):
+        self.model = model
         self.p = model.proto_weights
         self.K = self.p.shape[0]
         self.frozen_hi = 0          # rows [0, frozen_hi) frozen (past)
@@ -386,11 +387,27 @@ class ProtoIsolator:
         self.snapshot = self.p.data.clone()
         if task_idx > 0 and reinit and e > s:
             import math as _math
-            import torch.nn as _nn
+            from mgn.layout import get_prototype_layout, get_second_conv_layout
+            max_layers = getattr(self.model, 'max_layers', 18)
+            max_dim = getattr(self.model, 'max_dim', 64)
+            _, offsets, _, wo_offset, bo_offset = get_prototype_layout(max_layers, max_dim, 10)
+            offsets2 = get_second_conv_layout(max_layers, max_dim, 10)
             with torch.no_grad():
-                w = torch.empty_like(self.p.data[s:e])
-                _nn.init.kaiming_uniform_(w, a=_math.sqrt(5))
-                self.p.data[s:e] = w
+                for i in range(max_layers):
+                    w_start, w_end, b_start, b_end, in_c = offsets[i]
+                    fan_in = in_c * 3 * 3
+                    bound = _math.sqrt(6.0 / fan_in)
+                    self.p.data[s:e, w_start:w_end].uniform_(-bound, bound)
+                    self.p.data[s:e, b_start:b_end].zero_()
+                for (w2_start, w2_end, b2_start, b2_end) in offsets2:
+                    fan_in2 = max_dim * 3 * 3
+                    bound2 = _math.sqrt(6.0 / fan_in2)
+                    self.p.data[s:e, w2_start:w2_end].uniform_(-bound2, bound2)
+                    self.p.data[s:e, b2_start:b2_end].zero_()
+                fan_in_head = 16 * max_dim
+                bound_head = _math.sqrt(6.0 / fan_in_head)
+                self.p.data[s:e, wo_offset:bo_offset].uniform_(-bound_head, bound_head)
+                self.p.data[s:e, bo_offset:].zero_()
         
         self.mask.fill_(1.0)
         if self.frozen_hi > 0: self.mask[:self.frozen_hi] = 0.0
@@ -517,9 +534,6 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 re_x, re_y, re_t = replay.sample(n_re, device)
                 inputs = torch.cat([inputs, re_x])
                 targets = torch.cat([targets, re_y])
-                re_x_a, re_y_a, _ = replay.sample(min(48, x_a.size(0), len(replay)), device)
-                x_a = torch.cat([x_a, re_x_a])
-                y_a = torch.cat([y_a, re_y_a])
                 
                 n_re_a = min(48, x_a.size(0), len(replay))
                 re_x_a, re_y_a, _ = replay.sample(n_re_a, device)

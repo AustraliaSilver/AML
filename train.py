@@ -109,6 +109,13 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
                 fan_in = in_c * 3 * 3
                 bound = math.sqrt(6.0 / fan_in)
                 self.proto_weights.data[:, w_start:w_end].uniform_(-bound, bound)
+            # Second conv in ResNet blocks (w2)
+            from mgn.layout import get_second_conv_layout
+            offsets2 = get_second_conv_layout(self.max_layers, self.max_dim, 10)
+            for (w2_start, w2_end, b2_start, b2_end) in offsets2:
+                fan_in2 = self.max_dim * 3 * 3
+                bound2 = math.sqrt(6.0 / fan_in2)
+                self.proto_weights.data[:, w2_start:w2_end].uniform_(-bound2, bound2)
             # Head (linear)
             fan_in_head = 16 * self.max_dim
             bound_head = math.sqrt(6.0 / fan_in_head)
