@@ -137,7 +137,7 @@ __global__ void custom_group_norm1_kernel(
     int b = blockIdx.x;
     if (b >= B) return;
 
-    int M = C * H * W_spatial;
+    size_t M = (size_t)C * H * W_spatial;
     const float* x_b = X + (size_t)b * M;
     float* y_b = Y + (size_t)b * M;
 
@@ -146,7 +146,7 @@ __global__ void custom_group_norm1_kernel(
     __shared__ float s_warp_sum[16];
 
     float thread_sum = 0.0f;
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         thread_sum += x_b[i];
     }
 
@@ -155,13 +155,14 @@ __global__ void custom_group_norm1_kernel(
     }
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    if (lane == 0) {
+    int num_warps = blockDim.x / 32;
+    if (lane == 0 && warp_id < 16) {
         s_warp_sum[warp_id] = thread_sum;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float val = (lane < (blockDim.x / 32)) ? s_warp_sum[lane] : 0.0f;
+        float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
         for (int offset = 8; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffff, val, offset);
         }
@@ -173,7 +174,7 @@ __global__ void custom_group_norm1_kernel(
     float mean = s_mean;
 
     float thread_var = 0.0f;
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         float diff = x_b[i] - mean;
         thread_var += diff * diff;
     }
@@ -181,13 +182,13 @@ __global__ void custom_group_norm1_kernel(
     for (int offset = 16; offset > 0; offset /= 2) {
         thread_var += __shfl_down_sync(0xffffffff, thread_var, offset);
     }
-    if (lane == 0) {
+    if (lane == 0 && warp_id < 16) {
         s_warp_sum[warp_id] = thread_var;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float val = (lane < (blockDim.x / 32)) ? s_warp_sum[lane] : 0.0f;
+        float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
         for (int offset = 8; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffff, val, offset);
         }
@@ -199,7 +200,7 @@ __global__ void custom_group_norm1_kernel(
     __syncthreads();
     float rstd = s_rstd;
 
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         y_b[i] = (x_b[i] - mean) * rstd;
     }
 }
@@ -222,7 +223,7 @@ void custom_group_norm1_launcher(
 __global__ void custom_instance_norm_kernel(
     const float* __restrict__ X,
     float* __restrict__ Y,
-    int total_instances, int M,
+    int total_instances, size_t M,
     float eps
 ) {
     int inst = blockIdx.x;
@@ -236,7 +237,7 @@ __global__ void custom_instance_norm_kernel(
     __shared__ float s_warp_sum[8];
 
     float thread_sum = 0.0f;
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         thread_sum += x_inst[i];
     }
 
@@ -245,13 +246,14 @@ __global__ void custom_instance_norm_kernel(
     }
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    if (lane == 0) {
+    int num_warps = blockDim.x / 32;
+    if (lane == 0 && warp_id < 8) {
         s_warp_sum[warp_id] = thread_sum;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float val = (lane < 8) ? s_warp_sum[lane] : 0.0f;
+        float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
         for (int offset = 4; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffffffff, val, offset);
         }
@@ -263,7 +265,7 @@ __global__ void custom_instance_norm_kernel(
     float mean = s_mean;
 
     float thread_var = 0.0f;
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         float diff = x_inst[i] - mean;
         thread_var += diff * diff;
     }
@@ -271,13 +273,13 @@ __global__ void custom_instance_norm_kernel(
     for (int offset = 16; offset > 0; offset /= 2) {
         thread_var += __shfl_down_sync(0xffffffff, thread_var, offset);
     }
-    if (lane == 0) {
+    if (lane == 0 && warp_id < 8) {
         s_warp_sum[warp_id] = thread_var;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float val = (lane < 8) ? s_warp_sum[lane] : 0.0f;
+        float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
         for (int offset = 4; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffffffff, val, offset);
         }
@@ -531,7 +533,7 @@ __global__ void custom_group_norm1_bwd_kernel(
     int b = blockIdx.x;
     if (b >= B) return;
 
-    int M = C * H * W_spatial;
+    size_t M = (size_t)C * H * W_spatial;
     const float* g_b = g_out + (size_t)b * M;
     const float* x_b = raw   + (size_t)b * M;
     float* din_b     = d_in  + (size_t)b * M;
@@ -547,7 +549,7 @@ __global__ void custom_group_norm1_bwd_kernel(
     float thread_sum_dy = 0.0f;
     float thread_sum_dy_xhat = 0.0f;
 
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         float dy = g_b[i];
         float xhat = (x_b[i] - mean) * rstd;
         thread_sum_dy += dy;
@@ -561,15 +563,16 @@ __global__ void custom_group_norm1_bwd_kernel(
 
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    if (lane == 0) {
+    int num_warps = blockDim.x / 32;
+    if (lane == 0 && warp_id < 16) {
         s_warp_dy[warp_id] = thread_sum_dy;
         s_warp_dy_xhat[warp_id] = thread_sum_dy_xhat;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float v_dy = (lane < 16) ? s_warp_dy[lane] : 0.0f;
-        float v_dy_xhat = (lane < 16) ? s_warp_dy_xhat[lane] : 0.0f;
+        float v_dy = (lane < num_warps) ? s_warp_dy[lane] : 0.0f;
+        float v_dy_xhat = (lane < num_warps) ? s_warp_dy_xhat[lane] : 0.0f;
         for (int offset = 8; offset > 0; offset /= 2) {
             v_dy      += __shfl_down_sync(0xffff, v_dy, offset);
             v_dy_xhat += __shfl_down_sync(0xffff, v_dy_xhat, offset);
@@ -585,7 +588,7 @@ __global__ void custom_group_norm1_bwd_kernel(
     float sum_dy_xhat = s_sum_dy_xhat;
     float scale = rstd / (float)M;
 
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         float dy = g_b[i];
         float xhat = (x_b[i] - mean) * rstd;
         din_b[i] = scale * ((float)M * dy - sum_dy - xhat * sum_dy_xhat);
@@ -617,7 +620,7 @@ __global__ void custom_instance_norm_bwd_kernel(
     const float* __restrict__ mean_in,
     const float* __restrict__ rstd_in,
     float* __restrict__ d_in,
-    int total_instances, int M
+    int total_instances, size_t M
 ) {
     int inst = blockIdx.x;
     if (inst >= total_instances) return;
@@ -637,7 +640,7 @@ __global__ void custom_instance_norm_bwd_kernel(
     float thread_sum_dy = 0.0f;
     float thread_sum_dy_xhat = 0.0f;
 
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         float dy = g_inst[i];
         float xhat = (x_inst[i] - mean) * rstd;
         thread_sum_dy += dy;
@@ -651,15 +654,16 @@ __global__ void custom_instance_norm_bwd_kernel(
 
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    if (lane == 0) {
+    int num_warps = blockDim.x / 32;
+    if (lane == 0 && warp_id < 8) {
         s_warp_dy[warp_id] = thread_sum_dy;
         s_warp_dy_xhat[warp_id] = thread_sum_dy_xhat;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float v_dy = (lane < 8) ? s_warp_dy[lane] : 0.0f;
-        float v_dy_xhat = (lane < 8) ? s_warp_dy_xhat[lane] : 0.0f;
+        float v_dy = (lane < num_warps) ? s_warp_dy[lane] : 0.0f;
+        float v_dy_xhat = (lane < num_warps) ? s_warp_dy_xhat[lane] : 0.0f;
         for (int offset = 4; offset > 0; offset /= 2) {
             v_dy      += __shfl_down_sync(0xffffffff, v_dy, offset);
             v_dy_xhat += __shfl_down_sync(0xffffffff, v_dy_xhat, offset);
@@ -675,7 +679,7 @@ __global__ void custom_instance_norm_bwd_kernel(
     float sum_dy_xhat = s_sum_dy_xhat;
     float scale = rstd / (float)M;
 
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         float dy = g_inst[i];
         float xhat = (x_inst[i] - mean) * rstd;
         din_inst[i] = scale * ((float)M * dy - sum_dy - xhat * sum_dy_xhat);

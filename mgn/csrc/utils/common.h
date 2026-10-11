@@ -4,13 +4,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <stdexcept>
+#include <string>
+
 #define AML_CUDA_CHECK(call)                                                   \
     do {                                                                       \
         cudaError_t err = (call);                                              \
         if (err != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,  \
-                    cudaGetErrorString(err));                                   \
-            exit(EXIT_FAILURE);                                                \
+            throw std::runtime_error(std::string("CUDA error at ") +           \
+                __FILE__ + ":" + std::to_string(__LINE__) + ": " +            \
+                cudaGetErrorString(err));                                      \
         }                                                                      \
     } while (0)
 

@@ -1,17 +1,10 @@
 /*
+ * DEPRECATED (v1 single-conv algebra):
+ * Retained strictly for legacy build compatibility. The active v2 pipeline
+ * uses fused_pipeline.cu (fused_mix_conv_kernel) and custom_dynamic_ops.cu.
+ * DO NOT USE in active training or inference paths.
+ *
  * fused_norm_relu_gate.cu
- *
- * Fuses GroupNorm(1 group) + ReLU + dim_mask + residual gating
- * into a single elementwise pass.
- *
- * Supports two modes (selected by block_mode per sample):
- *   mode 0 (Plain):      h_out = relu(norm(x)) * dim_mask
- *   mode 1 (ResNet):     h_out = relu(h_expand + norm(x)) * dim_mask
- *
- * Then applies layer gate:  h = gate * h_out + (1-gate) * h_expand
- *
- * Grid:  (B,)
- * Block: (N_THREADS) over spatial channels
  */
 
 #include "common.h"

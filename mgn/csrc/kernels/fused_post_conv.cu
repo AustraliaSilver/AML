@@ -1,21 +1,10 @@
 /*
+ * DEPRECATED (v1 single-conv algebra):
+ * Retained strictly for legacy build compatibility. The active v2 pipeline
+ * uses fused_pipeline.cu (fused_mix_conv_kernel) and custom_dynamic_ops.cu.
+ * DO NOT USE in active training or inference paths.
+ *
  * fused_post_conv.cu
- *
- * Fused post-convolution ops for one AML layer:
- *   h_norm = group_norm(h_conv, 1)   -- just channel-wise mean/var normalize
- *   h_plain = relu(h_norm) * dim_mask
- *   h_expand = (i==0) ? h_plain : h_prev * dim_mask
- *   h_resnet = relu(h_expand + h_norm) * dim_mask
- *   h_active = g_plain * h_plain + g_resnet * h_resnet
- *   h_out = (i==0) ? h_active : gate * h_active + (1-gate) * h_expand
- *
- * Input: h_conv [B, C, H, W] (bf16 or f32)
- *        h_prev [B, C, H, W] (bf16 or f32, ignored if first_layer)
- *        dim_mask [B, C, 1, 1] (f32)
- *        gate scalar [B, 1, 1, 1] (f32)
- *        g_plain scalar [B, 1, 1, 1] (f32)
- *        g_resnet scalar [B, 1, 1, 1] (f32)
- * Output: h_out [B, C, H, W] (same type as h_conv)
  */
 #include "common.h"
 #include <cuda_bf16.h>
