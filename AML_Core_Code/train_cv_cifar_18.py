@@ -59,7 +59,7 @@ except ImportError:
 
 
 class AcceleratedCVNetwork(nn.Module):
-    def __init__(self, max_layers=6, max_dim=64, num_classes=10, norm_mode="gn1", K=32):
+    def __init__(self, max_layers=6, max_dim=64, num_classes=10, norm_mode="gn1", K=32, use_hts_low_rank=False):
         super().__init__()
         self.max_layers = max_layers
         self.max_dim = max_dim
@@ -74,8 +74,8 @@ class AcceleratedCVNetwork(nn.Module):
         
         self._build_slices()
         
-        # HtS Low-Rank Integration
-        self.use_hts_low_rank = (HtSLowRankAdapter is not None)
+        # HtS Low-Rank Integration: default False to use the fast Fused CUDA pipeline
+        self.use_hts_low_rank = bool(use_hts_low_rank and (HtSLowRankAdapter is not None))
         if self.use_hts_low_rank:
             # K is passed via __init__
             self.hts_adapters = nn.ModuleList()
