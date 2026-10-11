@@ -33,9 +33,9 @@ CSRC = os.path.join(ROOT, "mgn", "csrc")
 ACCEL = os.path.join(ROOT, "mgn", "accel")
 
 EXTENSIONS = {
-    # (Restored these files and fixed compilation per user request)
     "_C": [
         os.path.join(CSRC, "bindings.cpp"),
+        os.path.join(CSRC, "kernels", "custom_dynamic_ops.cu"),
         os.path.join(CSRC, "kernels", "fused_pipeline.cu"),
         os.path.join(CSRC, "kernels", "fused_backward.cu"),
         os.path.join(CSRC, "kernels", "fused_chain_conv.cu"),
@@ -45,6 +45,7 @@ EXTENSIONS = {
     ],
     "_Cin": [
         os.path.join(CSRC, "in", "bindings_in.cpp"),
+        os.path.join(CSRC, "kernels", "custom_dynamic_ops.cu"),
         os.path.join(CSRC, "in", "fused_pipeline_in.cu"),
         os.path.join(CSRC, "in", "fused_backward_in.cu"),
     ],
@@ -73,7 +74,36 @@ def compiler_flags():
     return cflags, cuda_flags
 
 
+def _setup_windows_msvc():
+    import shutil
+    import subprocess
+    import glob
+    if shutil.which("cl") is not None:
+        return
+    candidates = (
+        glob.glob(r"C:\Program Files*\Microsoft Visual Studio\*\BuildTools\VC\Auxiliary\Build\vcvars64.bat") +
+        glob.glob(r"C:\Program Files*\Microsoft Visual Studio\*\Community\VC\Auxiliary\Build\vcvars64.bat") +
+        glob.glob(r"C:\Program Files*\Microsoft Visual Studio\*\Enterprise\VC\Auxiliary\Build\vcvars64.bat") +
+        glob.glob(r"C:\Program Files*\Microsoft Visual Studio\*\Professional\VC\Auxiliary\Build\vcvars64.bat")
+    )
+    if not candidates:
+        return
+    vcvars = candidates[0]
+    try:
+        cmd = f'cmd.exe /s /c "\"{vcvars}\" >nul && set"'
+        out = subprocess.check_output(cmd, shell=True, text=True)
+        for line in out.splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                os.environ[k] = v
+        print(f"[build_ext] loaded MSVC environment from {vcvars}")
+    except Exception as e:
+        print(f"[build_ext] warning: failed to load MSVC environment: {e}")
+
+
 def build(name, verbose=True):
+    if sys.platform == "win32":
+        _setup_windows_msvc()
     from torch.utils.cpp_extension import load
 
     sources = EXTENSIONS[name]

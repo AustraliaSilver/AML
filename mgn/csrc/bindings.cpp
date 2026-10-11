@@ -33,12 +33,13 @@ void fused_mix_bwd_v2_b_launcher(
     float* dn1, float* dh_skip, float* gdm_b,
     int B, int C, int D, int spatial, int is_layer0);
 
+#include "kernels/custom_dynamic_ops.h"
+
 /* ================================================================
- * v2 block algebra (real 2-convolution ResNet): the convolutions and
- * group-norms run as ATen ops (cuDNN grouped convs, bf16-rounded weight
- * mixing exactly as v1); only the final mode/gate mix is a custom
- * elementwise kernel. The Python autograd wrapper recomputes this same
- * ATen chain for its backward, so kernel and eager semantics cannot drift.
+ * v2 block algebra (real 2-convolution ResNet):
+ * Convolutions, Normalizations, and Mix operations are executed
+ * natively via custom CUDA kernels (custom_dynamic_conv2d,
+ * custom_group_norm1, custom_relu_dimmask, fused_mix_conv_launcher).
  * ================================================================ */
 static void block_forward_v2(
     const torch::Tensor& pi, const torch::Tensor& prototypes,
@@ -52,6 +53,8 @@ static void block_forward_v2(
     torch::Tensor& h_out, torch::Tensor& hc1, torch::Tensor& hc2,
     torch::Tensor& W1_mix, torch::Tensor& W2_mix
 ) {
+    auto opts_f32 = h_in.options().dtype(torch::kFloat32);
+
     W1_mix = torch::mm(
         pi.to(torch::kBFloat16),
         prototypes.slice(1, w_offsets[i], w_offsets[i] + C_out * C_in * 9).to(torch::kBFloat16)
@@ -61,15 +64,29 @@ static void block_forward_v2(
         prototypes.slice(1, b_offsets[i], b_offsets[i] + C_out).to(torch::kBFloat16)
     ).to(torch::kFloat32);
 
-    hc1 = torch::conv2d(
-        h_in.reshape({1, B * C_in, h_dim, w_dim}).to(torch::kBFloat16),
-        W1_mix.reshape({B * C_out, C_in, 3, 3}).to(torch::kBFloat16),
-        b1_mix.reshape({B * C_out}).to(torch::kBFloat16),
-        {1, 1}, {1, 1}, {1, 1}, B
-    ).to(torch::kFloat32).reshape({B, C_out, h_dim, w_dim});
+    hc1 = torch::empty({B, C_out, h_dim, w_dim}, opts_f32);
+    auto h_in_bf16 = h_in.to(torch::kBFloat16).contiguous();
+    auto W1_mix_bf16 = W1_mix.to(torch::kBFloat16).contiguous();
+    auto b1_mix_bf16 = b1_mix.to(torch::kBFloat16).contiguous();
+    custom_dynamic_conv2d_bf16_launcher(
+        h_in_bf16.data_ptr<at::BFloat16>(),
+        W1_mix_bf16.data_ptr<at::BFloat16>(),
+        b1_mix_bf16.data_ptr<at::BFloat16>(),
+        hc1.data_ptr<float>(),
+        B, C_in, C_out, h_dim, w_dim
+    );
 
-    torch::Tensor n1 = at::group_norm(hc1, 1, c10::nullopt, c10::nullopt, 1e-5, true);
-    torch::Tensor h_p = at::relu(n1) * dm_i.view({B, C_out, 1, 1});
+    torch::Tensor n1 = torch::empty_like(hc1);
+    custom_group_norm1_launcher(
+        hc1.data_ptr<float>(), n1.data_ptr<float>(),
+        B, C_out, h_dim, w_dim, 1e-5f
+    );
+
+    torch::Tensor h_p = torch::empty_like(n1);
+    custom_relu_dimmask_launcher(
+        n1.data_ptr<float>(), dm_i.data_ptr<float>(),
+        h_p.data_ptr<float>(), B, C_out, h_dim * w_dim, C_out
+    );
 
     W2_mix = torch::mm(
         pi.to(torch::kBFloat16),
@@ -80,13 +97,23 @@ static void block_forward_v2(
         prototypes.slice(1, b2_offsets[i], b2_offsets[i] + C_out).to(torch::kBFloat16)
     ).to(torch::kFloat32);
 
-    hc2 = torch::conv2d(
-        h_p.reshape({1, B * C_out, h_dim, w_dim}).to(torch::kBFloat16),
-        W2_mix.reshape({B * C_out, max_dim, 3, 3}).to(torch::kBFloat16),
-        b2_mix.reshape({B * C_out}).to(torch::kBFloat16),
-        {1, 1}, {1, 1}, {1, 1}, B
-    ).to(torch::kFloat32).reshape({B, C_out, h_dim, w_dim});
-    torch::Tensor n2 = at::group_norm(hc2, 1, c10::nullopt, c10::nullopt, 1e-5, true);
+    hc2 = torch::empty({B, C_out, h_dim, w_dim}, opts_f32);
+    auto h_p_bf16 = h_p.to(torch::kBFloat16).contiguous();
+    auto W2_mix_bf16 = W2_mix.to(torch::kBFloat16).contiguous();
+    auto b2_mix_bf16 = b2_mix.to(torch::kBFloat16).contiguous();
+    custom_dynamic_conv2d_bf16_launcher(
+        h_p_bf16.data_ptr<at::BFloat16>(),
+        W2_mix_bf16.data_ptr<at::BFloat16>(),
+        b2_mix_bf16.data_ptr<at::BFloat16>(),
+        hc2.data_ptr<float>(),
+        B, max_dim, C_out, h_dim, w_dim
+    );
+
+    torch::Tensor n2 = torch::empty_like(hc2);
+    custom_group_norm1_launcher(
+        hc2.data_ptr<float>(), n2.data_ptr<float>(),
+        B, C_out, h_dim, w_dim, 1e-5f
+    );
 
     h_out = h_p.clone();
     fused_mix_conv_launcher(

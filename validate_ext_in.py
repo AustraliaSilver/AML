@@ -155,74 +155,79 @@ def grad_parity(c, dtype=torch.bfloat16):
     return rel(out.detach(), out_r.detach()), errs
 
 
-failures = []
+def main():
+    failures = []
 
-# ---- 1. harness sanity: old GN1 path --------------------------------------
-c18 = build_case(L=18)
-with torch.no_grad():
-    res_old = _Cold.fused_forward_and_save(
-        c18["x"].float().contiguous(), c18["protos"].float().contiguous(),
-        c18["pi"].float().contiguous(), c18["lg"].float().contiguous(),
+    # ---- 1. harness sanity: old GN1 path --------------------------------------
+    c18 = build_case(L=18)
+    with torch.no_grad():
+        res_old = _Cold.fused_forward_and_save(
+            c18["x"].float().contiguous(), c18["protos"].float().contiguous(),
+            c18["pi"].float().contiguous(), c18["lg"].float().contiguous(),
         c18["dm"].float().contiguous(), c18["bm"].float().contiguous(),
         c18["w_offsets"], c18["b_offsets"], c18["w2_offsets"], c18["b2_offsets"],
         c18["C_ins"], c18["C_outs"], c18["Hs"], c18["Ws"], c18["D"])
-ref_gn1 = ref_forward(c18, c18["x"], c18["protos"], c18["pi"],
-                      c18["lg"], c18["dm"], c18["bm"], "gn1")
-e_old = rel(res_old[0], ref_gn1)
-ok = e_old < FWD_TOL
-failures += [] if ok else ["GN1 forward"]
-print(f"[1] GN1 fused vs eager ref (L=18) : rel_err {e_old:.5f}  {'OK' if ok else 'FAIL'}")
+        ref_gn1 = ref_forward(c18, c18["x"], c18["protos"], c18["pi"],
+                              c18["lg"], c18["dm"], c18["bm"], "gn1")
+        e_old = rel(res_old[0], ref_gn1)
+        ok = e_old < FWD_TOL
+        failures += [] if ok else ["GN1 forward"]
+        print(f"[1] GN1 fused vs eager ref (L=18) : rel_err {e_old:.5f}  {'OK' if ok else 'FAIL'}")
 
-# ---- 2. new IN path: forward parity ---------------------------------------
-with torch.no_grad():
-    res_in = _Cin.in_fused_forward_and_save(
-        c18["x"].float().contiguous(), c18["protos"].float().contiguous(),
-        c18["pi"].float().contiguous(), c18["lg"].float().contiguous(),
-        c18["dm"].float().contiguous(), c18["bm"].float().contiguous(),
-        c18["w_offsets"], c18["b_offsets"], c18["w2_offsets"], c18["b2_offsets"],
-        c18["C_ins"], c18["C_outs"], c18["Hs"], c18["Ws"], c18["D"])
-ref_in = ref_forward(c18, c18["x"], c18["protos"], c18["pi"],
-                     c18["lg"], c18["dm"], c18["bm"], "in")
-e_in = rel(res_in[0], ref_in)
-ok = e_in < FWD_TOL
-failures += [] if ok else ["IN forward"]
-print(f"[2] IN  fused vs eager ref (L=18) : rel_err {e_in:.5f}  {'OK' if ok else 'FAIL'}")
+    # ---- 2. new IN path: forward parity ---------------------------------------
+    with torch.no_grad():
+        res_in = _Cin.in_fused_forward_and_save(
+            c18["x"].float().contiguous(), c18["protos"].float().contiguous(),
+            c18["pi"].float().contiguous(), c18["lg"].float().contiguous(),
+            c18["dm"].float().contiguous(), c18["bm"].float().contiguous(),
+            c18["w_offsets"], c18["b_offsets"], c18["w2_offsets"], c18["b2_offsets"],
+            c18["C_ins"], c18["C_outs"], c18["Hs"], c18["Ws"], c18["D"])
+        ref_in = ref_forward(c18, c18["x"], c18["protos"], c18["pi"],
+                             c18["lg"], c18["dm"], c18["bm"], "in")
+        e_in = rel(res_in[0], ref_in)
+        ok = e_in < FWD_TOL
+        failures += [] if ok else ["IN forward"]
+        print(f"[2] IN  fused vs eager ref (L=18) : rel_err {e_in:.5f}  {'OK' if ok else 'FAIL'}")
 
-# ---- 3. gradient parity at well-conditioned depth (the real gate) ---------
-print(f"\n[3] Gradient parity, shallow depth (tol {GRAD_TOL:g}) -- PASS/FAIL gate")
-for L in (2, 3, 4):
-    c = build_case(L=L, pool=False)
-    fwd_err, errs = grad_parity(c)
-    worst = max(v for v in errs.values() if v == v)
-    ok = worst < GRAD_TOL
-    failures += [] if ok else [f"grad L={L}"]
-    detail = "  ".join(f"{k}={v:.5f}" for k, v in errs.items())
-    print(f"    L={L}: fwd={fwd_err:.5f}  {detail}   -> "
-          f"worst {worst:.5f} {'OK' if ok else 'FAIL'}")
+    # ---- 3. gradient parity at well-conditioned depth (the real gate) ---------
+    print(f"\n[3] Gradient parity, shallow depth (tol {GRAD_TOL:g}) -- PASS/FAIL gate")
+    for L in (2, 3, 4):
+        c = build_case(L=L, pool=False)
+        fwd_err, errs = grad_parity(c)
+        worst = max(v for v in errs.values() if v == v)
+        ok = worst < GRAD_TOL
+        failures += [] if ok else [f"grad L={L}"]
+        detail = "  ".join(f"{k}={v:.5f}" for k, v in errs.items())
+        print(f"    L={L}: fwd={fwd_err:.5f}  {detail}   -> "
+              f"worst {worst:.5f} {'OK' if ok else 'FAIL'}")
 
-# ---- 4. deep-stack drift: informational only ------------------------------
-print("\n[4] Gradient drift at L=18 -- INFORMATIONAL, not a gate")
-_, errs18 = grad_parity(c18)
-print("    " + "  ".join(f"{k}={v:.5f}" for k, v in errs18.items()))
+    # ---- 4. deep-stack drift: informational only ------------------------------
+    print("\n[4] Gradient drift at L=18 -- INFORMATIONAL, not a gate")
+    _, errs18 = grad_parity(c18)
+    print("    " + "  ".join(f"{k}={v:.5f}" for k, v in errs18.items()))
 
-# Quantify the reference's own instability so the numbers above are readable.
-names = ("protos", "pi", "lg", "dm", "bm")
-tensors = (c18["x"], c18["protos"], c18["pi"], c18["lg"], c18["dm"], c18["bm"])
-r_bf = [t.clone().requires_grad_(True) for t in tensors]
-o_bf = ref_forward(c18, *r_bf, "in", dtype=torch.bfloat16)
-w18 = torch.randn_like(o_bf)
-(o_bf * w18).sum().backward()
-r_fp = [t.clone().requires_grad_(True) for t in tensors]
-o_fp = ref_forward(c18, *r_fp, "in", dtype=torch.float32)
-(o_fp * w18).sum().backward()
-noise = {n: rel(a.grad, b.grad) for n, a, b in zip(names, r_bf[1:], r_fp[1:])}
-print("    reference noise floor (same eager formula, bf16 vs fp32):")
-print("    " + "  ".join(f"{k}={v:.5f}" for k, v in noise.items()))
-print("    -> the L=18 drift above is at or below the reference's own")
-print("       disagreement with itself, so it measures conditioning, not kernel error.")
+    # Quantify the reference's own instability so the numbers above are readable.
+    names = ("protos", "pi", "lg", "dm", "bm")
+    tensors = (c18["x"], c18["protos"], c18["pi"], c18["lg"], c18["dm"], c18["bm"])
+    r_bf = [t.clone().requires_grad_(True) for t in tensors]
+    o_bf = ref_forward(c18, *r_bf, "in", dtype=torch.bfloat16)
+    w18 = torch.randn_like(o_bf)
+    (o_bf * w18).sum().backward()
+    r_fp = [t.clone().requires_grad_(True) for t in tensors]
+    o_fp = ref_forward(c18, *r_fp, "in", dtype=torch.float32)
+    (o_fp * w18).sum().backward()
+    noise = {n: rel(a.grad, b.grad) for n, a, b in zip(names, r_bf[1:], r_fp[1:])}
+    print("    reference noise floor (same eager formula, bf16 vs fp32):")
+    print("    " + "  ".join(f"{k}={v:.5f}" for k, v in noise.items()))
+    print("    -> the L=18 drift above is at or below the reference's own")
+    print("       disagreement with itself, so it measures conditioning, not kernel error.")
 
-print()
-if failures:
-    print(f"FAILED: {', '.join(failures)}")
-    sys.exit(1)
-print("done -- all gated checks passed")
+    print()
+    if failures:
+        print(f"FAILED: {', '.join(failures)}")
+        sys.exit(1)
+    print("done -- all gated checks passed")
+
+
+if __name__ == "__main__":
+    main()
