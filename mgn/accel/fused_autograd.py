@@ -60,10 +60,12 @@ def _norm_stats(t, norm_mode):
 
 
 def _norm_bwd(g, raw, mean, rstd, norm_mode):
-    """Fused d(raw) for the weightless norms: one native_group_norm_backward
-    kernel replaces the manual ~7-op chain (which additionally needed a
-    raw.var() re-read of the activation)."""
+    """Fused d(raw) for the weightless norms: native CUDA backward kernel."""
     B, C, H, W = raw.shape
+    if norm_mode == "gn1" and hasattr(_C, "group_norm1_bwd"):
+        return _C.group_norm1_bwd(g, raw, mean, rstd, B, C, H, W)
+    elif norm_mode == "in" and hasattr(_C, "instance_norm_bwd"):
+        return _C.instance_norm_bwd(g, raw, mean, rstd, B, C, H, W)
     gg = torch.ops.aten.native_group_norm_backward(
         g.reshape(B, C * H * W), raw.reshape(B, C * H * W), mean, rstd,
         None, B, C, H * W, _norm_groups(C, norm_mode),
@@ -84,15 +86,11 @@ def _dot_channel(a, b, B, C):
 
 
 def _conv_bwd(g_out, x_in, w_mix, B, C_out, C_in, hd, wd):
-    """Grouped (groups=B) conv backward via cuDNN: returns (d_input[B,C_in,hd,wd]
-    f32, dW flat [B, -1] f32, db [B, C_out] f32).
+    """Direct per-sample dynamic conv backward via custom CUDA kernel."""
+    if hasattr(_C, "dynamic_conv2d_bwd"):
+        d_in, dW, db = _C.dynamic_conv2d_bwd(g_out, x_in, w_mix, B, C_in, C_out, hd, wd)
+        return d_in, dW, db
 
-    NOTE: a fp32 variant of this path was measured (AML_CONV_BWD_FP32
-    experiment, 2026-09-15): it left the fused-vs-eager gradient drift
-    UNCHANGED (worst 0.0458 both ways -- the drift is dominated by the
-    forward bf16 weight-mix and by summation order in the high-condition
-    structure-gradient reductions, not by conv backward precision) while
-    costing ~4.5% step time. The flag was therefore not shipped."""
     grads = torch.ops.aten.convolution_backward(
         g_out.reshape(1, B * C_out, hd, wd).to(torch.bfloat16),
         x_in.reshape(1, B * C_in, hd, wd).to(torch.bfloat16),

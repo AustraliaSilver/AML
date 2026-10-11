@@ -332,10 +332,70 @@ std::vector<torch::Tensor> mix_bwd_v2_b(
     return {dn1, dh_skip, gdm_b};
 }
 
+std::vector<torch::Tensor> dynamic_conv2d_bwd(
+    torch::Tensor g_out, torch::Tensor x_in, torch::Tensor w_mix,
+    int B, int C_in, int C_out, int H, int W_spatial
+) {
+    auto opts_f32 = g_out.options().dtype(torch::kFloat32);
+    auto d_in = torch::empty({B, C_in, H, W_spatial}, opts_f32);
+    auto d_w  = torch::empty({B, C_out * C_in * 9}, opts_f32);
+    auto d_b  = torch::empty({B, C_out}, opts_f32);
+
+    auto g_out_bf16 = g_out.to(torch::kBFloat16).contiguous();
+    auto x_in_bf16  = x_in.to(torch::kBFloat16).contiguous();
+    auto w_mix_bf16 = w_mix.to(torch::kBFloat16).contiguous();
+
+    custom_dynamic_conv2d_bwd_launcher(
+        g_out_bf16.data_ptr<at::BFloat16>(),
+        x_in_bf16.data_ptr<at::BFloat16>(),
+        w_mix_bf16.data_ptr<at::BFloat16>(),
+        d_in.data_ptr<float>(),
+        d_w.data_ptr<float>(),
+        d_b.data_ptr<float>(),
+        B, C_in, C_out, H, W_spatial
+    );
+    return {d_in, d_w, d_b};
+}
+
+torch::Tensor group_norm1_bwd(
+    torch::Tensor g_out, torch::Tensor raw, torch::Tensor mean, torch::Tensor rstd,
+    int B, int C, int H, int W_spatial
+) {
+    auto d_in = torch::empty_like(raw);
+    custom_group_norm1_bwd_launcher(
+        g_out.contiguous().data_ptr<float>(),
+        raw.contiguous().data_ptr<float>(),
+        mean.contiguous().data_ptr<float>(),
+        rstd.contiguous().data_ptr<float>(),
+        d_in.data_ptr<float>(),
+        B, C, H, W_spatial
+    );
+    return d_in;
+}
+
+torch::Tensor instance_norm_bwd(
+    torch::Tensor g_out, torch::Tensor raw, torch::Tensor mean, torch::Tensor rstd,
+    int B, int C, int H, int W_spatial
+) {
+    auto d_in = torch::empty_like(raw);
+    custom_instance_norm_bwd_launcher(
+        g_out.contiguous().data_ptr<float>(),
+        raw.contiguous().data_ptr<float>(),
+        mean.contiguous().data_ptr<float>(),
+        rstd.contiguous().data_ptr<float>(),
+        d_in.data_ptr<float>(),
+        B, C, H, W_spatial
+    );
+    return d_in;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mix_bwd_v2_a", &mix_bwd_v2_a, "v2 fused mix backward phase A");
     m.def("mix_bwd_v2_b", &mix_bwd_v2_b, "v2 fused mix backward phase B");
     m.def("fused_forward", &fused_forward, "Fused 6-layer AML forward");
     m.def("maxpool2x2_bwd", &maxpool2x2_bwd, "MaxPool 2x2 backward");
     m.def("fused_forward_and_save", &fused_forward_and_save, "Forward + save intermediates for backward");
+    m.def("dynamic_conv2d_bwd", &dynamic_conv2d_bwd, "Custom native dynamic conv2d backward");
+    m.def("group_norm1_bwd", &group_norm1_bwd, "Custom native GroupNorm(1) backward");
+    m.def("instance_norm_bwd", &instance_norm_bwd, "Custom native InstanceNorm backward");
 }
