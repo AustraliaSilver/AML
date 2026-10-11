@@ -132,7 +132,7 @@ void maxpool2x2_launcher(float* X, float* Y, int B, int C, int H, int W_) {
  *   autotune / bf16 noise the pipeline already carries.
  * ================================================================ */
 #define MB_THREADS 256
-#define MB_MAX_C   256
+#define MB_MAX_C   1024
 
 template<typename T>
 __device__ __forceinline__ T mb_tree_sum(T v, T* scratch) {
@@ -168,54 +168,58 @@ __global__ void fused_mix_bwd_v2_a_kernel(
     float* __restrict__ glg,
     int C, int D, int spatial, int is_layer0
 ) {
+    if (C > MB_MAX_C) return;
     const int b = blockIdx.x;
     const float* dm_row = dim_mask + (long)b * D;
     const float gp = block_mode[b * 2];
     const float gr = block_mode[b * 2 + 1];
     const float lgv = is_layer0 ? 1.0f : layer_gate[b];
 
-    __shared__ double s_gdm[MB_MAX_C];
     __shared__ double s_part[MB_THREADS / 32];
-    for (int t = threadIdx.x; t < C; t += MB_THREADS) s_gdm[t] = 0.0;
-    __syncthreads();
 
     const long base = (long)b * C * spatial;
-    const int CS = C * spatial;
     double ab0 = 0.0, ab1 = 0.0, alg = 0.0;
 
-    for (int j = threadIdx.x; j < CS; j += MB_THREADS) {
-        const int i = (int)(base + j);
-        const int c = j / spatial;
+    for (int c = 0; c < C; ++c) {
         const float dm = (c < D) ? dm_row[c] : 0.0f;
-        const float g = dout[i];
-        const float x1 = xhat1[i];
-        const float x2 = xhat2[i];
-        const float r1 = fmaxf(x1, 0.0f);
-        const float hp = r1 * dm;
-        const float he = is_layer0 ? hp : hpv[i] * dm;
-        const float u2 = he + x2;
-        const float r2 = fmaxf(u2, 0.0f);
-        const float hr = r2 * dm;
-        const float ha = gp * hp + gr * hr;
+        const long c_base = base + (long)c * spatial;
+        double ch_term = 0.0;
 
-        const float dha = is_layer0 ? g : lgv * g;
-        const float d_he0 = is_layer0 ? 0.0f : (1.0f - lgv) * g;
-        const float dhr = dha * gr;
-        const float t2 = (u2 > 0.0f) ? dhr * dm : 0.0f;
-        const float dhe = d_he0 + t2;
+        for (int s = threadIdx.x; s < spatial; s += MB_THREADS) {
+            const long i = c_base + s;
+            const float g = dout[i];
+            const float x1 = xhat1[i];
+            const float x2 = xhat2[i];
+            const float r1 = fmaxf(x1, 0.0f);
+            const float hp = r1 * dm;
+            const float he = is_layer0 ? hp : hpv[i] * dm;
+            const float u2 = he + x2;
+            const float r2 = fmaxf(u2, 0.0f);
+            const float hr = r2 * dm;
+            const float ha = gp * hp + gr * hr;
 
-        dn2[i] = t2;
-        d_he[i] = dhe;
-        d_hp_pre[i] = dha * gp + (is_layer0 ? dhe : 0.0f);
+            const float dha = is_layer0 ? g : lgv * g;
+            const float d_he0 = is_layer0 ? 0.0f : (1.0f - lgv) * g;
+            const float dhr = dha * gr;
+            const float t2 = (u2 > 0.0f) ? dhr * dm : 0.0f;
+            const float dhe = d_he0 + t2;
 
-        ab0 += (double)(dha * hp);
-        ab1 += (double)(dha * hr);
-        if (!is_layer0) alg += (double)(g * (ha - he));
-        atomicAdd(&s_gdm[c], (double)(dhr * r2));
+            dn2[i] = t2;
+            d_he[i] = dhe;
+            d_hp_pre[i] = dha * gp + (is_layer0 ? dhe : 0.0f);
+
+            ab0 += (double)(dha * hp);
+            ab1 += (double)(dha * hr);
+            if (!is_layer0) alg += (double)(g * (ha - he));
+            ch_term += (double)(dhr * r2);
+        }
+
+        double c_sum = mb_tree_sum(ch_term, s_part);
+        if (threadIdx.x == 0) {
+            gdm_a[(long)b * C + c] = (float)c_sum;
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    for (int t = threadIdx.x; t < C; t += MB_THREADS)
-        gdm_a[(long)b * C + t] = (float)s_gdm[t];
 
     float f0 = mb_tree_sum(ab0, s_part);
     __syncthreads();
@@ -240,35 +244,42 @@ __global__ void fused_mix_bwd_v2_b_kernel(
     float* __restrict__ gdm_b,          /* [B, C] (zero-init) */
     int C, int D, int spatial, int is_layer0
 ) {
+    if (C > MB_MAX_C) return;
     const int b = blockIdx.x;
     const float* dm_row = dim_mask + (long)b * D;
-
-    __shared__ double s_gdm[MB_MAX_C];
-    for (int t = threadIdx.x; t < C; t += MB_THREADS) s_gdm[t] = 0.0;
-    __syncthreads();
+    __shared__ double s_part[MB_THREADS / 32];
 
     const long base = (long)b * C * spatial;
-    const int CS = C * spatial;
-    for (int j = threadIdx.x; j < CS; j += MB_THREADS) {
-        const int i = (int)(base + j);
-        const int c = j / spatial;
+
+    for (int c = 0; c < C; ++c) {
         const float dm = (c < D) ? dm_row[c] : 0.0f;
-        const float dh = d_hp[i];
-        const float x1 = xhat1[i];
-        const float r1 = fmaxf(x1, 0.0f);
-        dn1[i] = (x1 > 0.0f) ? dh * dm : 0.0f;
-        float term = dh * r1;
-        if (!is_layer0) {
-            const float dhe = d_he[i];
-            dh_skip[i] = dhe * dm;
-            term += dhe * hpv[i];
+        const long c_base = base + (long)c * spatial;
+        double ch_term = 0.0;
+
+        for (int s = threadIdx.x; s < spatial; s += MB_THREADS) {
+            const long i = c_base + s;
+            const float dh = d_hp[i];
+            const float x1 = xhat1[i];
+            const float r1 = fmaxf(x1, 0.0f);
+            dn1[i] = (x1 > 0.0f) ? dh * dm : 0.0f;
+            float term = dh * r1;
+            if (!is_layer0) {
+                const float dhe = d_he[i];
+                dh_skip[i] = dhe * dm;
+                term += dhe * hpv[i];
+            }
+            ch_term += (double)term;
         }
-        atomicAdd(&s_gdm[c], (double)term);
+
+        double c_sum = mb_tree_sum(ch_term, s_part);
+        if (threadIdx.x == 0) {
+            gdm_b[(long)b * C + c] = (float)c_sum;
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    for (int t = threadIdx.x; t < C; t += MB_THREADS)
-        gdm_b[(long)b * C + t] = (float)s_gdm[t];
 }
+
+#include "../utils/common.h"
 
 void fused_mix_bwd_v2_a_launcher(
     const float* dout, const float* xhat1, const float* xhat2, const float* hpv,
@@ -277,14 +288,16 @@ void fused_mix_bwd_v2_a_launcher(
     float* gbm0, float* gbm1, float* glg,
     int B, int C, int D, int spatial, int is_layer0
 ) {
+    if (C > MB_MAX_C) {
+        throw std::runtime_error("fused_mix_bwd_v2_a: C (" + std::to_string(C) + 
+                                 ") exceeds MB_MAX_C (" + std::to_string(MB_MAX_C) + ")");
+    }
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     fused_mix_bwd_v2_a_kernel<<<B, MB_THREADS, 0, stream>>>(
         dout, xhat1, xhat2, hpv, dim_mask, block_mode, layer_gate,
         dn2, d_hp_pre, d_he, gdm_a, gbm0, gbm1, glg,
         C, D, spatial, is_layer0);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        fprintf(stderr, "AML kernel launch error (fused_mix_bwd_v2_a): %s\n", cudaGetErrorString(err));
+    AML_CUDA_CHECK(cudaGetLastError());
 }
 
 void fused_mix_bwd_v2_b_launcher(
@@ -293,11 +306,13 @@ void fused_mix_bwd_v2_b_launcher(
     float* dn1, float* dh_skip, float* gdm_b,
     int B, int C, int D, int spatial, int is_layer0
 ) {
+    if (C > MB_MAX_C) {
+        throw std::runtime_error("fused_mix_bwd_v2_b: C (" + std::to_string(C) + 
+                                 ") exceeds MB_MAX_C (" + std::to_string(MB_MAX_C) + ")");
+    }
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     fused_mix_bwd_v2_b_kernel<<<B, MB_THREADS, 0, stream>>>(
         d_hp, d_he, xhat1, hpv, dim_mask, dn1, dh_skip, gdm_b,
         C, D, spatial, is_layer0);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        fprintf(stderr, "AML kernel launch error (fused_mix_bwd_v2_b): %s\n", cudaGetErrorString(err));
+    AML_CUDA_CHECK(cudaGetLastError());
 }

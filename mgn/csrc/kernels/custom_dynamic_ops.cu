@@ -30,62 +30,65 @@ __global__ void dynamic_conv2d_3x3_kernel(
     float* __restrict__ Y,
     int B, int C_in, int C_out, int H, int W_spatial
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int spatial = H * W_spatial;
-    int total = B * C_out * spatial;
-    if (idx >= total) return;
+    size_t spatial = (size_t)H * W_spatial;
+    size_t total = (size_t)B * C_out * spatial;
 
-    int ow = idx % W_spatial;
-    int tmp = idx / W_spatial;
-    int oh = tmp % H;
-    int oc = (tmp / H) % C_out;
-    int b  = tmp / (H * C_out);
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (size_t)blockDim.x * gridDim.x) {
 
-    float val = bias ? to_float_val(bias[b * C_out + oc]) : 0.0f;
+        int ow = idx % W_spatial;
+        size_t tmp = idx / W_spatial;
+        int oh = tmp % H;
+        int oc = (tmp / H) % C_out;
+        int b  = tmp / (H * C_out);
 
-    const InT* w_ptr = W + (size_t)(b * C_out + oc) * (C_in * 9);
-    const InT* x_b   = X + (size_t)b * (C_in * spatial);
+        float val = bias ? to_float_val(bias[b * C_out + oc]) : 0.0f;
 
-    int ih0 = oh - 1;
-    int ih1 = oh;
-    int ih2 = oh + 1;
+        const InT* w_ptr = W + (size_t)(b * C_out + oc) * (C_in * 9);
+        const InT* x_b   = X + (size_t)b * (C_in * spatial);
 
-    int iw0 = ow - 1;
-    int iw1 = ow;
-    int iw2 = ow + 1;
+        int ih0 = oh - 1;
+        int ih1 = oh;
+        int ih2 = oh + 1;
 
-    bool h0_ok = (ih0 >= 0);
-    bool h2_ok = (ih2 < H);
+        int iw0 = ow - 1;
+        int iw1 = ow;
+        int iw2 = ow + 1;
 
-    bool w0_ok = (iw0 >= 0);
-    bool w2_ok = (iw2 < W_spatial);
+        bool h0_ok = (ih0 >= 0);
+        bool h2_ok = (ih2 < H);
 
-    #pragma unroll 4
-    for (int ic = 0; ic < C_in; ++ic) {
-        const InT* x_ic = x_b + (size_t)ic * spatial;
-        const InT* w_ic = w_ptr + ic * 9;
+        bool w0_ok = (iw0 >= 0);
+        bool w2_ok = (iw2 < W_spatial);
 
-        if (h0_ok) {
-            int r0 = ih0 * W_spatial;
-            if (w0_ok) val += to_float_val(w_ic[0]) * to_float_val(x_ic[r0 + iw0]);
-            val += to_float_val(w_ic[1]) * to_float_val(x_ic[r0 + iw1]);
-            if (w2_ok) val += to_float_val(w_ic[2]) * to_float_val(x_ic[r0 + iw2]);
+        #pragma unroll 4
+        for (int ic = 0; ic < C_in; ++ic) {
+            const InT* x_ic = x_b + (size_t)ic * spatial;
+            const InT* w_ic = w_ptr + ic * 9;
+
+            if (h0_ok) {
+                size_t r0 = (size_t)ih0 * W_spatial;
+                if (w0_ok) val += to_float_val(w_ic[0]) * to_float_val(x_ic[r0 + iw0]);
+                val += to_float_val(w_ic[1]) * to_float_val(x_ic[r0 + iw1]);
+                if (w2_ok) val += to_float_val(w_ic[2]) * to_float_val(x_ic[r0 + iw2]);
+            }
+            {
+                size_t r1 = (size_t)ih1 * W_spatial;
+                if (w0_ok) val += to_float_val(w_ic[3]) * to_float_val(x_ic[r1 + iw0]);
+                val += to_float_val(w_ic[4]) * to_float_val(x_ic[r1 + iw1]);
+                if (w2_ok) val += to_float_val(w_ic[5]) * to_float_val(x_ic[r1 + iw2]);
+            }
+            if (h2_ok) {
+                size_t r2 = (size_t)ih2 * W_spatial;
+                if (w0_ok) val += to_float_val(w_ic[6]) * to_float_val(x_ic[r2 + iw0]);
+                val += to_float_val(w_ic[7]) * to_float_val(x_ic[r2 + iw1]);
+                if (w2_ok) val += to_float_val(w_ic[8]) * to_float_val(x_ic[r2 + iw2]);
+            }
         }
-        {
-            int r1 = ih1 * W_spatial;
-            if (w0_ok) val += to_float_val(w_ic[3]) * to_float_val(x_ic[r1 + iw0]);
-            val += to_float_val(w_ic[4]) * to_float_val(x_ic[r1 + iw1]);
-            if (w2_ok) val += to_float_val(w_ic[5]) * to_float_val(x_ic[r1 + iw2]);
-        }
-        if (h2_ok) {
-            int r2 = ih2 * W_spatial;
-            if (w0_ok) val += to_float_val(w_ic[6]) * to_float_val(x_ic[r2 + iw0]);
-            val += to_float_val(w_ic[7]) * to_float_val(x_ic[r2 + iw1]);
-            if (w2_ok) val += to_float_val(w_ic[8]) * to_float_val(x_ic[r2 + iw2]);
-        }
+
+        Y[idx] = val;
     }
-
-    Y[idx] = val;
 }
 
 void custom_dynamic_conv2d_bf16_launcher(
@@ -95,9 +98,9 @@ void custom_dynamic_conv2d_bf16_launcher(
     float* Y,
     int B, int C_in, int C_out, int H, int W_spatial
 ) {
-    int total = B * C_out * H * W_spatial;
+    size_t total = (size_t)B * C_out * H * W_spatial;
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    int blocks = (int)((total + threads - 1) / threads);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     dynamic_conv2d_3x3_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
@@ -115,9 +118,9 @@ void custom_dynamic_conv2d_f32_launcher(
     float* Y,
     int B, int C_in, int C_out, int H, int W_spatial
 ) {
-    int total = B * C_out * H * W_spatial;
+    size_t total = (size_t)B * C_out * H * W_spatial;
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    int blocks = (int)((total + threads - 1) / threads);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     dynamic_conv2d_3x3_kernel<float><<<blocks, threads, 0, stream>>>(
@@ -143,7 +146,7 @@ __global__ void custom_group_norm1_kernel(
 
     __shared__ float s_mean;
     __shared__ float s_rstd;
-    __shared__ float s_warp_sum[16];
+    extern __shared__ float s_warp_sum[];
 
     float thread_sum = 0.0f;
     for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
@@ -156,15 +159,15 @@ __global__ void custom_group_norm1_kernel(
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
     int num_warps = blockDim.x / 32;
-    if (lane == 0 && warp_id < 16) {
+    if (lane == 0) {
         s_warp_sum[warp_id] = thread_sum;
     }
     __syncthreads();
 
     if (warp_id == 0) {
         float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
-        for (int offset = 8; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xffff, val, offset);
+        for (int offset = 16; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
         }
         if (lane == 0) {
             s_mean = val / (float)M;
@@ -182,15 +185,15 @@ __global__ void custom_group_norm1_kernel(
     for (int offset = 16; offset > 0; offset /= 2) {
         thread_var += __shfl_down_sync(0xffffffff, thread_var, offset);
     }
-    if (lane == 0 && warp_id < 16) {
+    if (lane == 0) {
         s_warp_sum[warp_id] = thread_var;
     }
     __syncthreads();
 
     if (warp_id == 0) {
         float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
-        for (int offset = 8; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xffff, val, offset);
+        for (int offset = 16; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
         }
         if (lane == 0) {
             float var = val / (float)M;
@@ -212,7 +215,10 @@ void custom_group_norm1_launcher(
     float eps
 ) {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    custom_group_norm1_kernel<<<B, 512, 0, stream>>>(
+    int threads = 512;
+    int num_warps = (threads + 31) / 32;
+    size_t smem_bytes = num_warps * sizeof(float);
+    custom_group_norm1_kernel<<<B, threads, smem_bytes, stream>>>(
         X, Y, B, C, H, W_spatial, eps
     );
 }
@@ -234,7 +240,7 @@ __global__ void custom_instance_norm_kernel(
 
     __shared__ float s_mean;
     __shared__ float s_rstd;
-    __shared__ float s_warp_sum[8];
+    extern __shared__ float s_warp_sum[];
 
     float thread_sum = 0.0f;
     for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
@@ -247,14 +253,14 @@ __global__ void custom_instance_norm_kernel(
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
     int num_warps = blockDim.x / 32;
-    if (lane == 0 && warp_id < 8) {
+    if (lane == 0) {
         s_warp_sum[warp_id] = thread_sum;
     }
     __syncthreads();
 
     if (warp_id == 0) {
         float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
-        for (int offset = 4; offset > 0; offset /= 2) {
+        for (int offset = 16; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffffffff, val, offset);
         }
         if (lane == 0) {
@@ -273,14 +279,14 @@ __global__ void custom_instance_norm_kernel(
     for (int offset = 16; offset > 0; offset /= 2) {
         thread_var += __shfl_down_sync(0xffffffff, thread_var, offset);
     }
-    if (lane == 0 && warp_id < 8) {
+    if (lane == 0) {
         s_warp_sum[warp_id] = thread_var;
     }
     __syncthreads();
 
     if (warp_id == 0) {
         float val = (lane < num_warps) ? s_warp_sum[lane] : 0.0f;
-        for (int offset = 4; offset > 0; offset /= 2) {
+        for (int offset = 16; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffffffff, val, offset);
         }
         if (lane == 0) {
@@ -291,7 +297,7 @@ __global__ void custom_instance_norm_kernel(
     __syncthreads();
     float rstd = s_rstd;
 
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < M; i += blockDim.x) {
         y_inst[i] = (x_inst[i] - mean) * rstd;
     }
 }
@@ -303,9 +309,12 @@ void custom_instance_norm_launcher(
     float eps
 ) {
     int total_instances = B * C;
-    int M = H * W_spatial;
+    size_t M = (size_t)H * W_spatial;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    custom_instance_norm_kernel<<<total_instances, 256, 0, stream>>>(
+    int threads = 256;
+    int num_warps = (threads + 31) / 32;
+    size_t smem_bytes = num_warps * sizeof(float);
+    custom_instance_norm_kernel<<<total_instances, threads, smem_bytes, stream>>>(
         X, Y, total_instances, M, eps
     );
 }
@@ -361,41 +370,44 @@ __global__ void dynamic_conv2d_bwd_d_input_kernel(
     float* __restrict__ d_in,
     int B, int C_in, int C_out, int H, int W_spatial
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int spatial = H * W_spatial;
-    int total = B * C_in * spatial;
-    if (idx >= total) return;
+    size_t spatial = (size_t)H * W_spatial;
+    size_t total = (size_t)B * C_in * spatial;
 
-    int iw = idx % W_spatial;
-    int tmp = idx / W_spatial;
-    int ih = tmp % H;
-    int ic = (tmp / H) % C_in;
-    int b  = tmp / (H * C_in);
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (size_t)blockDim.x * gridDim.x) {
 
-    float sum = 0.0f;
-    const InT* gout_b = g_out + (size_t)b * (C_out * spatial);
+        int iw = idx % W_spatial;
+        size_t tmp = idx / W_spatial;
+        int ih = tmp % H;
+        int ic = (tmp / H) % C_in;
+        int b  = tmp / (H * C_in);
 
-    for (int oc = 0; oc < C_out; ++oc) {
-        const InT* w_oc_ic = W + ((size_t)(b * C_out + oc) * C_in + ic) * 9;
-        const InT* gout_oc = gout_b + (size_t)oc * spatial;
+        float sum = 0.0f;
+        const InT* gout_b = g_out + (size_t)b * (C_out * spatial);
 
-        for (int kh = 0; kh < 3; ++kh) {
-            int oh = ih - (kh - 1);
-            if (oh < 0 || oh >= H) continue;
-            int oh_stride = oh * W_spatial;
+        for (int oc = 0; oc < C_out; ++oc) {
+            const InT* w_oc_ic = W + ((size_t)(b * C_out + oc) * C_in + ic) * 9;
+            const InT* gout_oc = gout_b + (size_t)oc * spatial;
 
-            for (int kw = 0; kw < 3; ++kw) {
-                int ow = iw - (kw - 1);
-                if (ow < 0 || ow >= W_spatial) continue;
+            for (int kh = 0; kh < 3; ++kh) {
+                int oh = ih - (kh - 1);
+                if (oh < 0 || oh >= H) continue;
+                size_t oh_stride = (size_t)oh * W_spatial;
 
-                float g_val = to_float_val(gout_oc[oh_stride + ow]);
-                float w_val = to_float_val(w_oc_ic[kh * 3 + kw]);
-                sum += g_val * w_val;
+                for (int kw = 0; kw < 3; ++kw) {
+                    int ow = iw - (kw - 1);
+                    if (ow < 0 || ow >= W_spatial) continue;
+
+                    float g_val = to_float_val(gout_oc[oh_stride + ow]);
+                    float w_val = to_float_val(w_oc_ic[kh * 3 + kw]);
+                    sum += g_val * w_val;
+                }
             }
         }
-    }
 
-    d_in[idx] = sum;
+        d_in[idx] = sum;
+    }
 }
 
 template <typename InT>
@@ -405,40 +417,43 @@ __global__ void dynamic_conv2d_bwd_d_weight_kernel(
     float* __restrict__ d_w,
     int B, int C_in, int C_out, int H, int W_spatial
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_weights = B * C_out * C_in * 9;
-    if (idx >= total_weights) return;
+    size_t total_weights = (size_t)B * C_out * C_in * 9;
+    size_t spatial = (size_t)H * W_spatial;
 
-    int k = idx % 9;
-    int kh = k / 3;
-    int kw = k % 3;
-    int tmp = idx / 9;
-    int ic = tmp % C_in;
-    int oc = (tmp / C_in) % C_out;
-    int b  = tmp / (C_in * C_out);
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_weights;
+         idx += (size_t)blockDim.x * gridDim.x) {
 
-    int spatial = H * W_spatial;
-    const InT* gout_oc = g_out + ((size_t)b * C_out + oc) * spatial;
-    const InT* xin_ic  = x_in  + ((size_t)b * C_in + ic) * spatial;
+        int k = idx % 9;
+        int kh = k / 3;
+        int kw = k % 3;
+        size_t tmp = idx / 9;
+        int ic = tmp % C_in;
+        int oc = (tmp / C_in) % C_out;
+        int b  = tmp / (C_in * C_out);
 
-    float sum = 0.0f;
-    for (int oh = 0; oh < H; ++oh) {
-        int ih = oh + kh - 1;
-        if (ih < 0 || ih >= H) continue;
-        int oh_stride = oh * W_spatial;
-        int ih_stride = ih * W_spatial;
+        const InT* gout_oc = g_out + ((size_t)b * C_out + oc) * spatial;
+        const InT* xin_ic  = x_in  + ((size_t)b * C_in + ic) * spatial;
 
-        for (int ow = 0; ow < W_spatial; ++ow) {
-            int iw = ow + kw - 1;
-            if (iw >= 0 && iw < W_spatial) {
-                float g = to_float_val(gout_oc[oh_stride + ow]);
-                float x = to_float_val(xin_ic[ih_stride + iw]);
-                sum += g * x;
+        float sum = 0.0f;
+        for (int oh = 0; oh < H; ++oh) {
+            int ih = oh + kh - 1;
+            if (ih < 0 || ih >= H) continue;
+            size_t oh_stride = (size_t)oh * W_spatial;
+            size_t ih_stride = (size_t)ih * W_spatial;
+
+            for (int ow = 0; ow < W_spatial; ++ow) {
+                int iw = ow + kw - 1;
+                if (iw >= 0 && iw < W_spatial) {
+                    float g = to_float_val(gout_oc[oh_stride + ow]);
+                    float x = to_float_val(xin_ic[ih_stride + iw]);
+                    sum += g * x;
+                }
             }
         }
-    }
 
-    d_w[idx] = sum;
+        d_w[idx] = sum;
+    }
 }
 
 template <typename InT>
@@ -451,11 +466,11 @@ __global__ void dynamic_conv2d_bwd_d_bias_kernel(
     int total = B * C_out;
     if (idx >= total) return;
 
-    int spatial = H * W_spatial;
+    size_t spatial = (size_t)H * W_spatial;
     const InT* gout_ptr = g_out + (size_t)idx * spatial;
 
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < spatial; i += blockDim.x) {
+    for (size_t i = threadIdx.x; i < spatial; i += blockDim.x) {
         sum += to_float_val(gout_ptr[i]);
     }
 
@@ -463,17 +478,18 @@ __global__ void dynamic_conv2d_bwd_d_bias_kernel(
         sum += __shfl_down_sync(0xffffffff, sum, offset);
     }
 
-    __shared__ float s_warp[8];
+    extern __shared__ float s_warp[];
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
+    int num_warps = blockDim.x / 32;
     if (lane == 0) {
         s_warp[warp_id] = sum;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float val = (lane < 8) ? s_warp[lane] : 0.0f;
-        for (int offset = 4; offset > 0; offset /= 2) {
+        float val = (lane < num_warps) ? s_warp[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset /= 2) {
             val += __shfl_down_sync(0xffffffff, val, offset);
         }
         if (lane == 0) {
@@ -494,8 +510,8 @@ void custom_dynamic_conv2d_bwd_launcher(
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     // 1. d_in
-    int total_in = B * C_in * H * W_spatial;
-    int blocks_in = (total_in + 255) / 256;
+    size_t total_in = (size_t)B * C_in * H * W_spatial;
+    int blocks_in = (int)((total_in + 255) / 256);
     dynamic_conv2d_bwd_d_input_kernel<__nv_bfloat16><<<blocks_in, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(g_out),
         reinterpret_cast<const __nv_bfloat16*>(w_mix),
@@ -503,8 +519,8 @@ void custom_dynamic_conv2d_bwd_launcher(
     );
 
     // 2. d_w
-    int total_w = B * C_out * C_in * 9;
-    int blocks_w = (total_w + 255) / 256;
+    size_t total_w = (size_t)B * C_out * C_in * 9;
+    int blocks_w = (int)((total_w + 255) / 256);
     dynamic_conv2d_bwd_d_weight_kernel<__nv_bfloat16><<<blocks_w, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(g_out),
         reinterpret_cast<const __nv_bfloat16*>(x_in),
@@ -512,7 +528,10 @@ void custom_dynamic_conv2d_bwd_launcher(
     );
 
     // 3. d_b
-    dynamic_conv2d_bwd_d_bias_kernel<__nv_bfloat16><<<B * C_out, 256, 0, stream>>>(
+    int bias_threads = 256;
+    int bias_warps = (bias_threads + 31) / 32;
+    size_t bias_smem = bias_warps * sizeof(float);
+    dynamic_conv2d_bwd_d_bias_kernel<__nv_bfloat16><<<B * C_out, bias_threads, bias_smem, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(g_out),
         d_b, B, C_out, H, W_spatial
     );
@@ -543,8 +562,10 @@ __global__ void custom_group_norm1_bwd_kernel(
 
     __shared__ float s_sum_dy;
     __shared__ float s_sum_dy_xhat;
-    __shared__ float s_warp_dy[16];
-    __shared__ float s_warp_dy_xhat[16];
+    extern __shared__ float s_smem[];
+    int num_warps = blockDim.x / 32;
+    float* s_warp_dy = s_smem;
+    float* s_warp_dy_xhat = s_smem + num_warps;
 
     float thread_sum_dy = 0.0f;
     float thread_sum_dy_xhat = 0.0f;
@@ -563,8 +584,7 @@ __global__ void custom_group_norm1_bwd_kernel(
 
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    int num_warps = blockDim.x / 32;
-    if (lane == 0 && warp_id < 16) {
+    if (lane == 0) {
         s_warp_dy[warp_id] = thread_sum_dy;
         s_warp_dy_xhat[warp_id] = thread_sum_dy_xhat;
     }
@@ -573,9 +593,9 @@ __global__ void custom_group_norm1_bwd_kernel(
     if (warp_id == 0) {
         float v_dy = (lane < num_warps) ? s_warp_dy[lane] : 0.0f;
         float v_dy_xhat = (lane < num_warps) ? s_warp_dy_xhat[lane] : 0.0f;
-        for (int offset = 8; offset > 0; offset /= 2) {
-            v_dy      += __shfl_down_sync(0xffff, v_dy, offset);
-            v_dy_xhat += __shfl_down_sync(0xffff, v_dy_xhat, offset);
+        for (int offset = 16; offset > 0; offset /= 2) {
+            v_dy      += __shfl_down_sync(0xffffffff, v_dy, offset);
+            v_dy_xhat += __shfl_down_sync(0xffffffff, v_dy_xhat, offset);
         }
         if (lane == 0) {
             s_sum_dy = v_dy;
@@ -604,7 +624,10 @@ void custom_group_norm1_bwd_launcher(
     int B, int C, int H, int W_spatial
 ) {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    custom_group_norm1_bwd_kernel<<<B, 512, 0, stream>>>(
+    int threads = 512;
+    int num_warps = (threads + 31) / 32;
+    size_t smem_bytes = 2 * num_warps * sizeof(float);
+    custom_group_norm1_bwd_kernel<<<B, threads, smem_bytes, stream>>>(
         g_out, raw, mean, rstd, d_in, B, C, H, W_spatial
     );
 }
@@ -634,8 +657,10 @@ __global__ void custom_instance_norm_bwd_kernel(
 
     __shared__ float s_sum_dy;
     __shared__ float s_sum_dy_xhat;
-    __shared__ float s_warp_dy[8];
-    __shared__ float s_warp_dy_xhat[8];
+    extern __shared__ float s_smem[];
+    int num_warps = blockDim.x / 32;
+    float* s_warp_dy = s_smem;
+    float* s_warp_dy_xhat = s_smem + num_warps;
 
     float thread_sum_dy = 0.0f;
     float thread_sum_dy_xhat = 0.0f;
@@ -654,8 +679,7 @@ __global__ void custom_instance_norm_bwd_kernel(
 
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    int num_warps = blockDim.x / 32;
-    if (lane == 0 && warp_id < 8) {
+    if (lane == 0) {
         s_warp_dy[warp_id] = thread_sum_dy;
         s_warp_dy_xhat[warp_id] = thread_sum_dy_xhat;
     }
@@ -664,7 +688,7 @@ __global__ void custom_instance_norm_bwd_kernel(
     if (warp_id == 0) {
         float v_dy = (lane < num_warps) ? s_warp_dy[lane] : 0.0f;
         float v_dy_xhat = (lane < num_warps) ? s_warp_dy_xhat[lane] : 0.0f;
-        for (int offset = 4; offset > 0; offset /= 2) {
+        for (int offset = 16; offset > 0; offset /= 2) {
             v_dy      += __shfl_down_sync(0xffffffff, v_dy, offset);
             v_dy_xhat += __shfl_down_sync(0xffffffff, v_dy_xhat, offset);
         }
@@ -695,9 +719,12 @@ void custom_instance_norm_bwd_launcher(
     int B, int C, int H, int W_spatial
 ) {
     int total_instances = B * C;
-    int M = H * W_spatial;
+    size_t M = (size_t)H * W_spatial;
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    custom_instance_norm_bwd_kernel<<<total_instances, 256, 0, stream>>>(
+    int threads = 256;
+    int num_warps = (threads + 31) / 32;
+    size_t smem_bytes = 2 * num_warps * sizeof(float);
+    custom_instance_norm_bwd_kernel<<<total_instances, threads, smem_bytes, stream>>>(
         g_out, raw, mean, rstd, d_in, total_instances, M
     );
 }
