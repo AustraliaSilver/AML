@@ -389,6 +389,68 @@ torch::Tensor instance_norm_bwd(
     return d_in;
 }
 
+void batched_hyper_linear_launcher(
+    const float* A, const float* B, const float* bias, float* C,
+    int batch, int M, int K, int N);
+
+void batched_hyper_linear_wmma_bf16_launcher(
+    const __nv_bfloat16* A, const __nv_bfloat16* B, const float* bias, float* C,
+    int batch, int M, int K, int N);
+
+torch::Tensor batched_hyper_linear(torch::Tensor A, torch::Tensor B, c10::optional<torch::Tensor> bias_opt) {
+    int batch = A.size(0);
+    int M = A.size(1);
+    int K = A.size(2);
+    int N = B.size(2);
+    auto opts = A.options().dtype(torch::kFloat32);
+    auto C = torch::empty({batch, M, N}, opts);
+
+    auto A_f32 = A.to(torch::kFloat32).contiguous();
+    auto B_f32 = B.to(torch::kFloat32).contiguous();
+    const float* bias_ptr = nullptr;
+    torch::Tensor bias_contig;
+    if (bias_opt.has_value() && bias_opt.value().defined()) {
+        bias_contig = bias_opt.value().to(torch::kFloat32).contiguous();
+        bias_ptr = bias_contig.data_ptr<float>();
+    }
+
+    batched_hyper_linear_launcher(
+        A_f32.data_ptr<float>(),
+        B_f32.data_ptr<float>(),
+        bias_ptr,
+        C.data_ptr<float>(),
+        batch, M, K, N
+    );
+    return C;
+}
+
+torch::Tensor batched_hyper_linear_tc(torch::Tensor A, torch::Tensor B, c10::optional<torch::Tensor> bias_opt) {
+    int batch = A.size(0);
+    int M = A.size(1);
+    int K = A.size(2);
+    int N = B.size(2);
+    auto opts = A.options().dtype(torch::kFloat32);
+    auto C = torch::empty({batch, M, N}, opts);
+
+    auto A_bf16 = A.to(torch::kBFloat16).contiguous();
+    auto B_bf16 = B.to(torch::kBFloat16).contiguous();
+    const float* bias_ptr = nullptr;
+    torch::Tensor bias_contig;
+    if (bias_opt.has_value() && bias_opt.value().defined()) {
+        bias_contig = bias_opt.value().to(torch::kFloat32).contiguous();
+        bias_ptr = bias_contig.data_ptr<float>();
+    }
+
+    batched_hyper_linear_wmma_bf16_launcher(
+        reinterpret_cast<const __nv_bfloat16*>(A_bf16.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(B_bf16.data_ptr<at::BFloat16>()),
+        bias_ptr,
+        C.data_ptr<float>(),
+        batch, M, K, N
+    );
+    return C;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mix_bwd_v2_a", &mix_bwd_v2_a, "v2 fused mix backward phase A");
     m.def("mix_bwd_v2_b", &mix_bwd_v2_b, "v2 fused mix backward phase B");
@@ -398,4 +460,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dynamic_conv2d_bwd", &dynamic_conv2d_bwd, "Custom native dynamic conv2d backward");
     m.def("group_norm1_bwd", &group_norm1_bwd, "Custom native GroupNorm(1) backward");
     m.def("instance_norm_bwd", &instance_norm_bwd, "Custom native InstanceNorm backward");
+    m.def("batched_hyper_linear", &batched_hyper_linear, "Tiled shared memory batched GEMM",
+          py::arg("A"), py::arg("B"), py::arg("bias") = py::none());
+    m.def("batched_hyper_linear_tc", &batched_hyper_linear_tc, "Tensor Core WMMA BF16 batched GEMM",
+          py::arg("A"), py::arg("B"), py::arg("bias") = py::none());
 }
