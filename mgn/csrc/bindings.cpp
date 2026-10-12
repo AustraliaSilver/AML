@@ -64,17 +64,11 @@ static void block_forward_v2(
         prototypes.slice(1, b_offsets[i], b_offsets[i] + C_out).to(torch::kBFloat16)
     ).to(torch::kFloat32);
 
-    hc1 = torch::empty({B, C_out, h_dim, w_dim}, opts_f32);
-    auto h_in_bf16 = h_in.to(torch::kBFloat16).contiguous();
-    auto W1_mix_bf16 = W1_mix.to(torch::kBFloat16).contiguous();
-    auto b1_mix_bf16 = b1_mix.to(torch::kBFloat16).contiguous();
-    custom_dynamic_conv2d_bf16_launcher(
-        h_in_bf16.data_ptr<at::BFloat16>(),
-        W1_mix_bf16.data_ptr<at::BFloat16>(),
-        b1_mix_bf16.data_ptr<at::BFloat16>(),
-        hc1.data_ptr<float>(),
-        B, C_in, C_out, h_dim, w_dim
-    );
+    auto h_in_flat = h_in.view({1, B * C_in, h_dim, w_dim});
+    auto W1_flat = W1_mix.view({B * C_out, C_in, 3, 3});
+    auto b1_flat = b1_mix.view({B * C_out});
+    hc1 = at::conv2d(h_in_flat, W1_flat, b1_flat, {1, 1}, {1, 1}, {1, 1}, B)
+              .view({B, C_out, h_dim, w_dim});
 
     torch::Tensor n1 = torch::empty_like(hc1);
     custom_group_norm1_launcher(
@@ -97,17 +91,11 @@ static void block_forward_v2(
         prototypes.slice(1, b2_offsets[i], b2_offsets[i] + C_out).to(torch::kBFloat16)
     ).to(torch::kFloat32);
 
-    hc2 = torch::empty({B, C_out, h_dim, w_dim}, opts_f32);
-    auto h_p_bf16 = h_p.to(torch::kBFloat16).contiguous();
-    auto W2_mix_bf16 = W2_mix.to(torch::kBFloat16).contiguous();
-    auto b2_mix_bf16 = b2_mix.to(torch::kBFloat16).contiguous();
-    custom_dynamic_conv2d_bf16_launcher(
-        h_p_bf16.data_ptr<at::BFloat16>(),
-        W2_mix_bf16.data_ptr<at::BFloat16>(),
-        b2_mix_bf16.data_ptr<at::BFloat16>(),
-        hc2.data_ptr<float>(),
-        B, max_dim, C_out, h_dim, w_dim
-    );
+    auto h_p_flat = h_p.view({1, B * max_dim, h_dim, w_dim});
+    auto W2_flat = W2_mix.view({B * C_out, max_dim, 3, 3});
+    auto b2_flat = b2_mix.view({B * C_out});
+    hc2 = at::conv2d(h_p_flat, W2_flat, b2_flat, {1, 1}, {1, 1}, {1, 1}, B)
+              .view({B, C_out, h_dim, w_dim});
 
     torch::Tensor n2 = torch::empty_like(hc2);
     custom_group_norm1_launcher(

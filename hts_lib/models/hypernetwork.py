@@ -136,6 +136,13 @@ class HtSContinualModel(nn.Module):
         if task not in self.stems:
             raise KeyError(f"Task '{task}' not registered. Available: {list(self.stems.keys())}")
 
+        stem_conv = self.stems[task][0]
+        if hasattr(stem_conv, "in_channels") and x.shape[1] != stem_conv.in_channels:
+            if x.shape[1] == 3 and stem_conv.in_channels == 1:
+                x = x[:, :1, :, :]
+            elif x.shape[1] == 1 and stem_conv.in_channels == 3:
+                x = x.repeat(1, 3, 1, 1)
+
         h = self.stems[task](x)
         logits_alpha = self.task_ctrl(h).view(B, self.n_blocks, self.K)
 

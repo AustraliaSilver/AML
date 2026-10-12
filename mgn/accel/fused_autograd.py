@@ -86,11 +86,7 @@ def _dot_channel(a, b, B, C):
 
 
 def _conv_bwd(g_out, x_in, w_mix, B, C_out, C_in, hd, wd):
-    """Direct per-sample dynamic conv backward via custom CUDA kernel."""
-    if hasattr(_C, "dynamic_conv2d_bwd"):
-        d_in, dW, db = _C.dynamic_conv2d_bwd(g_out, x_in, w_mix, B, C_in, C_out, hd, wd)
-        return d_in, dW, db
-
+    """High-performance per-sample dynamic conv backward via cuDNN / ATen."""
     grads = torch.ops.aten.convolution_backward(
         g_out.reshape(1, B * C_out, hd, wd).to(torch.bfloat16),
         x_in.reshape(1, B * C_in, hd, wd).to(torch.bfloat16),
