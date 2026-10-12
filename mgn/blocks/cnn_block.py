@@ -6,14 +6,18 @@ from .base import BaseDynamicBlock
 
 
 class PlainConvBlock(BaseDynamicBlock):
-    """Plain CNN block: Conv3x3 -> GroupNorm -> ReLU with dynamic channel masking.
+    """Plain CNN block: Conv3x3 -> Norm -> ReLU with dynamic channel masking.
     
     Standard feedforward convolutional block without residual skip connections.
+    Supports norm_type='bn' (cuDNN fused BatchNorm) or 'gn' (GroupNorm).
     """
-    def __init__(self, in_channels: int, out_channels: int, norm_groups: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "bn", norm_groups: int = 1):
         super().__init__(in_channels, out_channels)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=True)
-        self.norm = nn.GroupNorm(norm_groups, out_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=norm_type != "bn")
+        if norm_type == "bn":
+            self.norm = nn.BatchNorm2d(out_channels)
+        else:
+            self.norm = nn.GroupNorm(norm_groups, out_channels)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor, dim_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -26,7 +30,6 @@ class PlainConvBlock(BaseDynamicBlock):
 
     def compute_params(self, active_dim: Optional[float] = None) -> float:
         d = active_dim if active_dim is not None else float(self.out_channels)
-        # in_c * d * 3 * 3 + d (bias) + 2*d (norm weight & bias)
         return float(self.in_channels * d * 9 + d + 2 * d)
 
     def compute_flops(self, spatial_size: Tuple[int, int], active_dim: Optional[float] = None) -> float:
@@ -38,23 +41,33 @@ class PlainConvBlock(BaseDynamicBlock):
 
 
 class ResNetBlock(BaseDynamicBlock):
-    """Residual CNN block: 2x (Conv3x3 -> GroupNorm -> ReLU) with identity skip connection.
+    """Residual CNN block: 2x (Conv3x3 -> Norm -> ReLU) with identity skip connection.
     
-    If in_channels != out_channels, a 1x1 projection is applied to the skip path.
+    Supports norm_type='bn' (cuDNN fused BatchNorm) or 'gn' (GroupNorm).
     """
-    def __init__(self, in_channels: int, out_channels: int, norm_groups: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "bn", norm_groups: int = 1):
         super().__init__(in_channels, out_channels)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=True)
-        self.norm1 = nn.GroupNorm(norm_groups, out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True)
-        self.norm2 = nn.GroupNorm(norm_groups, out_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=norm_type != "bn")
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=norm_type != "bn")
+        if norm_type == "bn":
+            self.norm1 = nn.BatchNorm2d(out_channels)
+            self.norm2 = nn.BatchNorm2d(out_channels)
+        else:
+            self.norm1 = nn.GroupNorm(norm_groups, out_channels)
+            self.norm2 = nn.GroupNorm(norm_groups, out_channels)
         self.act = nn.ReLU(inplace=True)
         
         if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.GroupNorm(norm_groups, out_channels)
-            )
+            if norm_type == "bn":
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(out_channels)
+                )
+            else:
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                    nn.GroupNorm(norm_groups, out_channels)
+                )
         else:
             self.shortcut = nn.Identity()
 

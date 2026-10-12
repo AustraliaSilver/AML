@@ -21,11 +21,12 @@ class HybridBlock(BaseDynamicBlock):
         in_channels: int,
         out_channels: int,
         num_heads: int = 4,
+        norm_type: str = "bn",
         norm_groups: int = 1
     ):
         super().__init__(in_channels, out_channels)
-        self.plain = PlainConvBlock(in_channels, out_channels, norm_groups=norm_groups)
-        self.resnet = ResNetBlock(in_channels, out_channels, norm_groups=norm_groups)
+        self.plain = PlainConvBlock(in_channels, out_channels, norm_type=norm_type, norm_groups=norm_groups)
+        self.resnet = ResNetBlock(in_channels, out_channels, norm_type=norm_type, norm_groups=norm_groups)
         self.vit = VisionTransformerBlock(in_channels, out_channels, num_heads=num_heads)
 
     def forward(
