@@ -104,7 +104,7 @@ def get_task_data(name, data_root, workers=0, aug="basic"):
 # ----------------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
-             snaps=None, route_tau=None, dom_truth=None):
+             snaps=None, route_tau=None, dom_truth=None, pi_mask=None):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -201,7 +201,8 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 if idx_c.any():
                     with torch.amp.autocast('cuda', **ac):
                         o, st, p, dg = model(x[idx_c], tau=0.1,
-                                             struct_override=(override[0][idx_c], override[1][idx_c]))
+                                             struct_override=(override[0][idx_c], override[1][idx_c]),
+                                             pi_mask=pi_mask)
                     outs_conf.append((idx_c, o))
                     pi_conf.append((idx_c, p.float()))
                     ls_full[idx_c] = dg["layer_soft"].float()
@@ -210,7 +211,8 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 if has_amb:
                     with torch.amp.autocast('cuda', **ac):
                         o2, _, p2, dg2 = model(x[amb_t], tau=0.1,
-                                               struct_override=(override[0][amb_t], override[1][amb_t]))
+                                               struct_override=(override[0][amb_t], override[1][amb_t]),
+                                               pi_mask=pi_mask)
                     conf2 = o2.float().softmax(-1).max(-1).values
                     upd = conf2 > best_conf
                     if best_out is None:
@@ -250,7 +252,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             n += x.shape[0]
         else:
             with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
-                out, struct, pi, diag = model(x, tau=0.1, struct_override=override)
+                out, struct, pi, diag = model(x, tau=0.1, struct_override=override, pi_mask=pi_mask)
             correct += (out.argmax(-1) == y).sum().item()
             total += y.numel()
             ls = diag["layer_soft"].float()

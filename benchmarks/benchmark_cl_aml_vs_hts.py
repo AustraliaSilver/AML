@@ -113,7 +113,15 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
     for i, t_name in enumerate(tasks):
         print(f"\n---> [AML] Task {i+1}/{T}: {t_name.upper()} ({epochs_aml[i]} epochs)")
         s, e = aml_isolator.begin_task(i, T, reinit=False)
-        opt = torch.optim.AdamW(aml_model.parameters(), lr=1e-3, weight_decay=1e-4)
+        pi_mask = torch.zeros(aml_model.K, dtype=torch.bool, device=device)
+        pi_mask[s:e] = True
+
+        params = [
+            {"params": aml_model.vision_encoder.parameters(), "lr": 3e-4, "weight_decay": 1e-4},
+            {"params": aml_model.prototype_selector.parameters(), "lr": 1e-3, "weight_decay": 1e-4},
+            {"params": [aml_model.proto_weights, aml_model.structure_prototypes, aml_model.block_mode_prototypes], "lr": 1.5e-3, "weight_decay": 1e-5},
+        ]
+        opt = torch.optim.AdamW(params)
 
         t_task_start = time.time()
         for ep in range(1, epochs_aml[i] + 1):
@@ -124,8 +132,15 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
                 opt.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast("cuda", enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
-                    out, _, pi, diag = aml_model(x, tau=0.8)
+                    out, _, pi, diag = aml_model(x, tau=0.8, pi_mask=pi_mask)
                     loss = F.cross_entropy(out, y)
+
+                    if e > s:
+                        p_act = aml_model.proto_weights[s:e]
+                        p_n = F.normalize(p_act, dim=-1)
+                        sim = p_n @ p_n.t()
+                        eye = torch.eye(sim.shape[0], device=device)
+                        loss = loss + 0.05 * ((sim - eye) ** 2).mean()
 
                 loss.backward()
                 aml_isolator.mask_grad()
@@ -150,11 +165,16 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
         # Evaluate after stage i
         print(f"      Evaluating AML after stage {i+1}...")
         for j in range(i + 1):
-            acc_live, _ = evaluate_aml(aml_model, test_loaders[tasks[j]], device, amp_dtype=amp_dtype)
+            s_j = round(j * aml_model.K / T)
+            e_j = round((j + 1) * aml_model.K / T)
+            pi_mask_j = torch.zeros(aml_model.K, dtype=torch.bool, device=device)
+            pi_mask_j[s_j:e_j] = True
+
+            acc_live, _ = evaluate_aml(aml_model, test_loaders[tasks[j]], device, amp_dtype=amp_dtype, pi_mask=pi_mask_j)
             acc_meth, _ = evaluate_aml(
                 aml_model, test_loaders[tasks[j]], device, amp_dtype=amp_dtype,
                 dom_head=dom_head, slots=slots[:i+1], snaps=dom_snaps[:i+1],
-                route_tau=0.6, dom_truth=j
+                route_tau=0.6, dom_truth=j, pi_mask=pi_mask_j
             )
             A_aml_live[i][j] = acc_live * 100.0
             A_aml_method[i][j] = acc_meth * 100.0

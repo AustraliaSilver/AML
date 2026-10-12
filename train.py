@@ -54,7 +54,7 @@ class TaskCentroidOOD(nn.Module):
         return pi
 
 class ConvAML_CIFAR_TrueDynamic(nn.Module):
-    def __init__(self, K=32, latent_dim=1024, max_layers=18, max_dim=64, norm_mode="gn1"):
+    def __init__(self, K=32, latent_dim=1024, max_layers=18, max_dim=64, norm_mode="gn1", train_encoder=True):
         super().__init__()
         self.K = K
         self.max_layers = max_layers
@@ -69,8 +69,9 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
             nn.AdaptiveAvgPool2d((2, 2)), nn.Flatten(),
             nn.Linear(512 * 4, latent_dim), nn.ReLU()
         )
-        for p in self.vision_encoder.parameters():
-            p.requires_grad = False
+        if not train_encoder:
+            for p in self.vision_encoder.parameters():
+                p.requires_grad = False
         
         self.prototype_selector = nn.Sequential(
             nn.Linear(latent_dim, 256), nn.LayerNorm(256), nn.GELU(),
@@ -133,9 +134,17 @@ class ConvAML_CIFAR_TrueDynamic(nn.Module):
             with torch.no_grad():
                 self.ood_router.update_centroid(z)
         
-        # OOD Routing (Train time or single task)
-        with torch.no_grad():
-            pi = self.ood_router.get_pi(z, self.rows_per_task)
+        pi_logits = self.prototype_selector(z)
+        if pi_mask is not None:
+            if pi_mask.dtype == torch.bool:
+                pi_logits = pi_logits.masked_fill(~pi_mask.unsqueeze(0), -1e4)
+            else:
+                pi_logits = pi_logits.masked_fill((pi_mask == 0).unsqueeze(0), -1e4)
+
+        if self.training:
+            pi = F.gumbel_softmax(pi_logits, tau=tau, hard=False, dim=-1)
+        else:
+            pi = F.softmax(pi_logits / tau, dim=-1)
 
         delta = pi @ self.structure_prototypes
         layer_logits = delta[:, :self.max_layers] + 2.0
