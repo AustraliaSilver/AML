@@ -44,7 +44,7 @@ from hts_lib.training.trainer import ContinualTrainer
 from hts_lib.evaluation.evaluator import ContinualEvaluator
 
 
-def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, steps_per_epoch=None, eval_cap=None, device="cuda"):
+def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, steps_per_epoch=None, eval_cap=None, aml_k=12, aml_dim=48, device="cuda"):
     set_seed(42)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     data_root = os.path.join(ROOT, "data")
@@ -56,6 +56,7 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
     print(f" UNIFIED CONTINUAL LEARNING BENCHMARK: AML vs HtS ({device})")
     print(f" Protocol: 3-Task Sequence (MNIST -> CIFAR-10 -> Fashion-MNIST)")
     print(f" Schedule: AML epochs={epochs_aml} | HtS epochs={epochs_hts}")
+    print(f" AML Config: K={aml_k} prototypes | max_dim={aml_dim}")
     if steps_per_epoch:
         print(f" Train Cap: {steps_per_epoch} batches per epoch")
     if eval_cap:
@@ -98,7 +99,7 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
     print(" [1/2] RUNNING AML SUPERNET (ProtoIsolator + Native Fused CUDA V2)")
     print("#" * 90)
 
-    aml_model = ConvAML_CIFAR_TrueDynamic(K=48, max_dim=64, max_layers=18, norm_mode="gn1").to(device)
+    aml_model = ConvAML_CIFAR_TrueDynamic(K=aml_k, max_dim=aml_dim, max_layers=18, norm_mode="gn1").to(device)
     aml_isolator = ProtoIsolator(aml_model)
     aml_replay = ReplayBuffer()
     dom_head = nn.Linear(1024, T).to(device)
@@ -307,8 +308,11 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=str, default="2,2,2", help="Epochs per task, e.g. 2,2,2")
     parser.add_argument("--steps", type=int, default=None, help="Cap batches per epoch for quick benchmarking")
     parser.add_argument("--eval-cap", type=int, default=None, help="Cap batches per evaluation")
+    parser.add_argument("--aml-k", type=int, default=12, help="Number of prototypes K in AML (default: 12)")
+    parser.add_argument("--aml-dim", type=int, default=48, help="Max dimension in AML (default: 48)")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     args = parser.parse_args()
 
     ep_list = tuple(int(x) for x in args.epochs.split(","))
-    run_benchmark(epochs_aml=ep_list, epochs_hts=ep_list, steps_per_epoch=args.steps, eval_cap=args.eval_cap, device=args.device)
+    run_benchmark(epochs_aml=ep_list, epochs_hts=ep_list, steps_per_epoch=args.steps, eval_cap=args.eval_cap,
+                  aml_k=args.aml_k, aml_dim=args.aml_dim, device=args.device)
