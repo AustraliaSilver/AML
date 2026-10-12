@@ -644,8 +644,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tasks', type=str, default='mnist,cifar10,fashion')
     ap.add_argument('--epochs', type=str, default='5,28,16', help='per-task epochs')
-    ap.add_argument('--K', type=int, default=48,
-                    help='prototype count; split across tasks (16 rows/task at K=48,T=3)')
+    ap.add_argument('--K', type=int, default=12,
+                    help='prototype count; split across tasks (4 rows/task at K=12, T=3)')
+    ap.add_argument('--max-dim', type=int, default=48,
+                    help='maximum channel dimension for prototype layout (default: 48)')
     ap.add_argument('--norm', type=str, default='gn1', choices=['gn1', 'in'],
                     help='post-conv normalization: gn1 (volume stats, legacy) or in (per-channel InstanceNorm)')
     ap.add_argument('--freeze', type=int, default=2)
@@ -679,7 +681,7 @@ def main():
     ep_list = [int(e) for e in args.epochs.split(',')]
     assert len(ep_list) == len(tasks)
 
-    model = ConvAML_CIFAR_TrueDynamic(K=args.K, max_dim=64, max_layers=18,
+    model = ConvAML_CIFAR_TrueDynamic(K=args.K, max_dim=args.max_dim, max_layers=18,
                                       norm_mode=args.norm).to(device)
 
     T = len(tasks)

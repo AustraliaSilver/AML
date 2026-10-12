@@ -54,7 +54,7 @@ class TaskCentroidOOD(nn.Module):
         return pi
 
 class ConvAML_CIFAR_TrueDynamic(nn.Module):
-    def __init__(self, K=32, latent_dim=1024, max_layers=18, max_dim=64, norm_mode="gn1", train_encoder=True):
+    def __init__(self, K=12, latent_dim=1024, max_layers=18, max_dim=48, norm_mode="gn1", train_encoder=True):
         super().__init__()
         self.K = K
         self.max_layers = max_layers
@@ -222,8 +222,8 @@ def get_args(argv=None):
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--K', type=int, default=32)
-    parser.add_argument('--max-dim', type=int, default=64)
+    parser.add_argument('--K', type=int, default=12)
+    parser.add_argument('--max-dim', type=int, default=48)
     parser.add_argument('--max-layers', type=int, default=18)
     parser.add_argument('--p-allowance', type=float, default=1.5e6)
     parser.add_argument('--workers', type=int, default=3)
