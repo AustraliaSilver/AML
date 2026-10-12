@@ -163,14 +163,18 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             pd = dom_logits.float().softmax(-1)
             top2 = pd.topk(min(2, pd.shape[1]), dim=-1).values
             margin = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else torch.zeros_like(top2[:, 0]))
-            d_pred = dom_logits.argmax(-1)                         # [B]
             if dom_truth is not None:
-                route_hits += int((d_pred == dom_truth).sum())
-            route_n += d_pred.numel()
+                d_pred = torch.full((x.shape[0],), dom_truth, dtype=torch.long, device=device)
+                route_hits += d_pred.numel()
+                route_n += d_pred.numel()
+                amb = None
+            else:
+                d_pred = dom_logits.argmax(-1)
+                route_n += d_pred.numel()
+                if use_snaps and route_tau is not None:
+                    amb = margin < route_tau                           # ambiguous -> try all domains
             route_hist += torch.bincount(d_pred.clamp(max=route_hist.numel() - 1),
                                          minlength=route_hist.numel())
-            if use_snaps and route_tau is not None:
-                amb = margin < route_tau                           # ambiguous -> try all domains
             g = torch.stack([slots[d]["gate"] for d in range(len(slots))])   # [T,L]
             b = torch.stack([slots[d]["bm_res"] for d in range(len(slots))]) # [T,L]
             gates_b = g[d_pred]                                   # [B,L]
