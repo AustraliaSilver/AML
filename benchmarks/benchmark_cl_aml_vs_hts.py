@@ -32,16 +32,12 @@ sys.path.insert(0, os.path.join(ROOT, "AML_Core_Code"))
 from train import ConvAML_CIFAR_TrueDynamic, set_seed
 from train_continual_aml import (
     get_task_data,
-    build_replay_buffer,
-    ReplayBuffer,
     ProtoIsolator,
-    consolidate,
     collect_structure_slot,
     evaluate as evaluate_aml
 )
 from hts_lib.models.hypernetwork import HtSContinualModel
 from hts_lib.training.trainer import ContinualTrainer
-from hts_lib.evaluation.evaluator import ContinualEvaluator
 
 
 def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, steps_per_epoch=None, eval_cap=None, aml_k=12, aml_dim=48, device="cuda"):
@@ -54,7 +50,7 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
 
     print("\n" + "=" * 90)
     print(f" UNIFIED CONTINUAL LEARNING BENCHMARK: AML vs HtS ({device})")
-    print(f" Protocol: 3-Task Sequence (MNIST -> CIFAR-10 -> Fashion-MNIST)")
+    print(" Protocol: 3-Task Sequence (MNIST -> CIFAR-10 -> Fashion-MNIST)")
     print(f" Schedule: AML epochs={epochs_aml} | HtS epochs={epochs_hts}")
     print(f" AML Config: K={aml_k} prototypes | max_dim={aml_dim}")
     if steps_per_epoch:
@@ -101,7 +97,6 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
 
     aml_model = ConvAML_CIFAR_TrueDynamic(K=aml_k, max_dim=aml_dim, max_layers=18, norm_mode="gn1").to(device)
     aml_isolator = ProtoIsolator(aml_model)
-    aml_replay = ReplayBuffer()
     dom_head = nn.Linear(1024, T).to(device)
     slots = [None] * T
     dom_snaps = [None] * T
@@ -180,8 +175,8 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
             A_aml_live[i][j] = acc_live * 100.0
             A_aml_method[i][j] = acc_meth * 100.0
 
-        print(f"      [Live Accs]   : " + ", ".join(f"{tasks[j]}: {A_aml_live[i][j]:.2f}%" for j in range(i+1)))
-        print(f"      [Method Accs] : " + ", ".join(f"{tasks[j]}: {A_aml_method[i][j]:.2f}%" for j in range(i+1)))
+        print("      [Live Accs]   : " + ", ".join(f"{tasks[j]}: {A_aml_live[i][j]:.2f}%" for j in range(i+1)))
+        print("      [Method Accs] : " + ", ".join(f"{tasks[j]}: {A_aml_method[i][j]:.2f}%" for j in range(i+1)))
 
     aml_total_time = time.time() - aml_start_time
 
@@ -249,7 +244,7 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
             acc = correct / total * 100.0
             A_hts[i][j] = acc
 
-        print(f"      [HtS Accs]    : " + ", ".join(f"{tasks[j]}: {A_hts[i][j]:.2f}%" for j in range(i+1)))
+        print("      [HtS Accs]    : " + ", ".join(f"{tasks[j]}: {A_hts[i][j]:.2f}%" for j in range(i+1)))
 
     hts_total_time = time.time() - hts_start_time
 
@@ -279,17 +274,17 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
     print("                     FINAL CONTINUAL BENCHMARK RESULTS")
     print("=" * 90)
 
-    print(f"\n[1] ACCURACY MATRIX: AML LIVE (Standard CL - Current Weights Only)")
+    print("\n[1] ACCURACY MATRIX: AML LIVE (Standard CL - Current Weights Only)")
     for i in range(T):
         row = " | ".join(f"{A_aml_live[i][j]:6.2f}%" if j <= i else "   ---  " for j in range(T))
         print(f"    After Stage {i+1} ({tasks[i]:<10}) : {row}")
 
-    print(f"\n[2] ACCURACY MATRIX: AML METHOD (Test-time Snapshot Retrieval)")
+    print("\n[2] ACCURACY MATRIX: AML METHOD (Test-time Snapshot Retrieval)")
     for i in range(T):
         row = " | ".join(f"{A_aml_method[i][j]:6.2f}%" if j <= i else "   ---  " for j in range(T))
         print(f"    After Stage {i+1} ({tasks[i]:<10}) : {row}")
 
-    print(f"\n[3] ACCURACY MATRIX: HtS (Dual-Residual Basis + Tensor Cores + HtSBasisIsolator)")
+    print("\n[3] ACCURACY MATRIX: HtS (Dual-Residual Basis + Tensor Cores + HtSBasisIsolator)")
     for i in range(T):
         row = " | ".join(f"{A_hts[i][j]:6.2f}%" if j <= i else "   ---  " for j in range(T))
         print(f"    After Stage {i+1} ({tasks[i]:<10}) : {row}")
