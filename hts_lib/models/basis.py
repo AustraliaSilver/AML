@@ -53,31 +53,41 @@ class HtSDualResidualBasis(nn.Module):
         self.b2_3_priv = nn.Parameter(torch.randn(K, d3, d2, 3, 3) * 0.01)
         self.b3_priv = nn.Parameter(torch.randn(K, d3, d3, 3, 3) * 0.01)
 
-    def get_kernel(self, name, alpha):
+    def get_kernel(self, name, alpha, use_tc=False):
         """
         Synthesizes dynamic kernels on-the-fly for the current batch.
         Args:
             name: Stage identifier ('b1', 'b1_2', 'b2', 'b2_3', 'b3')
             alpha: Softmax/Gumbel routing weights [B, K]
+            use_tc: If True and on CUDA, accelerate kernel synthesis via Tensor Core WMMA
         Returns:
             Kernel tensor [B, C_out, C_in, 3, 3]
         """
         B = alpha.shape[0]
+
+        def _synthesize(b_priv, d_out, d_in):
+            b_flat = b_priv.view(self.K, -1)
+            if use_tc and alpha.is_cuda:
+                try:
+                    from mgn.accel import _C
+                    if hasattr(_C, "batched_hyper_linear_tc"):
+                        # [1, B, K] x [1, K, N] -> [1, B, N]
+                        res = _C.batched_hyper_linear_tc(alpha.unsqueeze(0), b_flat.unsqueeze(0))
+                        return res.squeeze(0).view(B, d_out, d_in, 3, 3)
+                except Exception:
+                    pass
+            return torch.mm(alpha, b_flat).view(B, d_out, d_in, 3, 3)
+
         if name == 'b1':
-            priv = torch.mm(alpha, self.b1_priv.view(self.K, -1)).view(B, self.d1, self.d1, 3, 3)
-            return self.base1.unsqueeze(0) + priv
+            return self.base1.unsqueeze(0) + _synthesize(self.b1_priv, self.d1, self.d1)
         elif name == 'b1_2':
-            priv = torch.mm(alpha, self.b1_2_priv.view(self.K, -1)).view(B, self.d2, self.d1, 3, 3)
-            return self.base1_2.unsqueeze(0) + priv
+            return self.base1_2.unsqueeze(0) + _synthesize(self.b1_2_priv, self.d2, self.d1)
         elif name == 'b2':
-            priv = torch.mm(alpha, self.b2_priv.view(self.K, -1)).view(B, self.d2, self.d2, 3, 3)
-            return self.base2.unsqueeze(0) + priv
+            return self.base2.unsqueeze(0) + _synthesize(self.b2_priv, self.d2, self.d2)
         elif name == 'b2_3':
-            priv = torch.mm(alpha, self.b2_3_priv.view(self.K, -1)).view(B, self.d3, self.d2, 3, 3)
-            return self.base2_3.unsqueeze(0) + priv
+            return self.base2_3.unsqueeze(0) + _synthesize(self.b2_3_priv, self.d3, self.d2)
         elif name == 'b3':
-            priv = torch.mm(alpha, self.b3_priv.view(self.K, -1)).view(B, self.d3, self.d3, 3, 3)
-            return self.base3.unsqueeze(0) + priv
+            return self.base3.unsqueeze(0) + _synthesize(self.b3_priv, self.d3, self.d3)
         else:
             raise ValueError(f"Unknown kernel stage name: {name}")
 

@@ -128,7 +128,7 @@ class HtSContinualModel(nn.Module):
             self.heads[task_name] = head
             self.supported_tasks.append(task_name)
 
-    def forward(self, x, task="cifar", tau=0.8):
+    def forward(self, x, task="cifar", tau=0.8, use_tc=False):
         """
         Forward execution with on-the-fly weight synthesis.
         """
@@ -145,7 +145,7 @@ class HtSContinualModel(nn.Module):
             alphas = F.softmax(logits_alpha / tau, dim=-1)
 
         for idx, blk in enumerate(self.blocks):
-            h = blk(h, self.basis_sys.get_kernel(self.block_kernels[idx], alphas[:, idx]))
+            h = blk(h, self.basis_sys.get_kernel(self.block_kernels[idx], alphas[:, idx], use_tc=use_tc))
 
         logits = self.heads[task](h)
         return logits, alphas

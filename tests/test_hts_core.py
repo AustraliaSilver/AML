@@ -121,5 +121,42 @@ class TestHtSCore(unittest.TestCase):
         self.assertEqual(x_batch.shape[1:], (3, 32, 32))
         self.assertEqual(len(y_batch), 16)
 
+    def test_tensor_core_forward(self):
+        """Test forward pass using Tensor Core WMMA kernel acceleration."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        x = torch.randn(4, 3, 32, 32, device=self.device)
+        out, alphas = self.model(x, task="cifar", use_tc=True)
+        self.assertEqual(out.shape, (4, 10))
+        self.assertEqual(alphas.shape, (4, 8, 8))
+        self.assertFalse(torch.isnan(out).any())
+
+    def test_hts_basis_isolator(self):
+        """Test HtSBasisIsolator gradient masking and parameter snapshot restoration."""
+        from hts_lib.training.trainer import HtSBasisIsolator
+        isolator = HtSBasisIsolator(self.model)
+        
+        # Task 0 of 3: s=0, e=3 (for K=8)
+        s, e = isolator.begin_task(0, num_tasks=3)
+        self.assertEqual(s, 0)
+        self.assertEqual(e, 3)
+
+        self.model.train()
+        x = torch.randn(2, 3, 32, 32, device=self.device)
+        y = torch.tensor([0, 1], device=self.device)
+        out, _ = self.model(x, task="cifar")
+        loss = torch.nn.functional.cross_entropy(out, y)
+        loss.backward()
+
+        # Gradients for experts [3:] must be masked to zero
+        for name in ("b1_priv", "b2_priv", "b3_priv"):
+            param = getattr(self.model.basis_sys, name)
+            self.assertIsNotNone(param.grad)
+            self.assertTrue(torch.all(param.grad[e:] == 0.0))
+
+        # Test snapshot restoration
+        isolator.restore()
+
+
 if __name__ == '__main__':
     unittest.main()
