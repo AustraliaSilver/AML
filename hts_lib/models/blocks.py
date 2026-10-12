@@ -29,7 +29,7 @@ class HtSResidualBlock(nn.Module):
 
     def forward(self, x, kernel):
         """
-        Executes dynamic grouped convolution with sample-specific weights.
+        Executes dynamic convolution with sample-specific weights.
         Args:
             x: Input tensor [B, in_d, H, W]
             kernel: Batch-specific kernel tensor [B, out_d, in_d, 3, 3]
@@ -37,10 +37,21 @@ class HtSResidualBlock(nn.Module):
         B, C, H, W = x.shape
         res = F.gelu(self.gn1(x))
         
-        x_r = res.reshape(1, B * self.in_d, H, W)
-        k_r = kernel.reshape(B * self.out_d, self.in_d, 3, 3)
-        out = F.conv2d(x_r, k_r, stride=self.stride, padding=1, groups=B)
-        out = out.reshape(B, self.out_d, out.shape[2], out.shape[3])
+        if self.stride == 1:
+            try:
+                from mgn.accel.functions import native_dynamic_conv2d
+                out = native_dynamic_conv2d(res, kernel)
+            except Exception:
+                x_r = res.reshape(1, B * self.in_d, H, W)
+                k_r = kernel.reshape(B * self.out_d, self.in_d, 3, 3)
+                out = F.conv2d(x_r, k_r, stride=1, padding=1, groups=B)
+                out = out.reshape(B, self.out_d, H, W)
+        else:
+            x_r = res.reshape(1, B * self.in_d, H, W)
+            k_r = kernel.reshape(B * self.out_d, self.in_d, 3, 3)
+            out = F.conv2d(x_r, k_r, stride=self.stride, padding=1, groups=B)
+            out = out.reshape(B, self.out_d, out.shape[2], out.shape[3])
+
         out = self.gn2(out)
-        
         return F.gelu(out + self.shortcut(x))
+

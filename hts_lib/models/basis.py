@@ -62,20 +62,21 @@ class HtSDualResidualBasis(nn.Module):
         Returns:
             Kernel tensor [B, C_out, C_in, 3, 3]
         """
+        B = alpha.shape[0]
         if name == 'b1':
-            priv = torch.einsum('bk,koihw->boihw', alpha, self.b1_priv)
+            priv = torch.mm(alpha, self.b1_priv.view(self.K, -1)).view(B, self.d1, self.d1, 3, 3)
             return self.base1.unsqueeze(0) + priv
         elif name == 'b1_2':
-            priv = torch.einsum('bk,koihw->boihw', alpha, self.b1_2_priv)
+            priv = torch.mm(alpha, self.b1_2_priv.view(self.K, -1)).view(B, self.d2, self.d1, 3, 3)
             return self.base1_2.unsqueeze(0) + priv
         elif name == 'b2':
-            priv = torch.einsum('bk,koihw->boihw', alpha, self.b2_priv)
+            priv = torch.mm(alpha, self.b2_priv.view(self.K, -1)).view(B, self.d2, self.d2, 3, 3)
             return self.base2.unsqueeze(0) + priv
         elif name == 'b2_3':
-            priv = torch.einsum('bk,koihw->boihw', alpha, self.b2_3_priv)
+            priv = torch.mm(alpha, self.b2_3_priv.view(self.K, -1)).view(B, self.d3, self.d2, 3, 3)
             return self.base2_3.unsqueeze(0) + priv
         elif name == 'b3':
-            priv = torch.einsum('bk,koihw->boihw', alpha, self.b3_priv)
+            priv = torch.mm(alpha, self.b3_priv.view(self.K, -1)).view(B, self.d3, self.d3, 3, 3)
             return self.base3.unsqueeze(0) + priv
         else:
             raise ValueError(f"Unknown kernel stage name: {name}")

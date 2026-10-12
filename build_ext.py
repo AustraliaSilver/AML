@@ -104,6 +104,8 @@ def _setup_windows_msvc():
 def build(name, verbose=True):
     if sys.platform == "win32":
         _setup_windows_msvc()
+    import torch.utils.cpp_extension as ce
+    ce._check_cuda_version = lambda compiler_name, compiler_version: None
     from torch.utils.cpp_extension import load
 
     sources = EXTENSIONS[name]

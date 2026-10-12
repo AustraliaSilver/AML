@@ -332,6 +332,38 @@ std::vector<torch::Tensor> mix_bwd_v2_b(
     return {dn1, dh_skip, gdm_b};
 }
 
+torch::Tensor dynamic_conv2d_fwd(
+    torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> bias_opt
+) {
+    int B = x.size(0);
+    int C_in = x.size(1);
+    int H = x.size(2);
+    int W_spatial = x.size(3);
+    int C_out = (w.dim() == 5) ? w.size(1) : (w.size(1) / (C_in * 9));
+
+    auto opts_f32 = x.options().dtype(torch::kFloat32);
+    auto y = torch::empty({B, C_out, H, W_spatial}, opts_f32);
+
+    auto x_bf16 = x.to(torch::kBFloat16).contiguous();
+    auto w_bf16 = w.to(torch::kBFloat16).contiguous();
+
+    const at::BFloat16* bias_ptr = nullptr;
+    torch::Tensor bias_contig;
+    if (bias_opt.has_value() && bias_opt.value().defined()) {
+        bias_contig = bias_opt.value().to(torch::kBFloat16).contiguous();
+        bias_ptr = bias_contig.data_ptr<at::BFloat16>();
+    }
+
+    custom_dynamic_conv2d_bf16_launcher(
+        x_bf16.data_ptr<at::BFloat16>(),
+        w_bf16.data_ptr<at::BFloat16>(),
+        bias_ptr,
+        y.data_ptr<float>(),
+        B, C_in, C_out, H, W_spatial
+    );
+    return y;
+}
+
 std::vector<torch::Tensor> dynamic_conv2d_bwd(
     torch::Tensor g_out, torch::Tensor x_in, torch::Tensor w_mix,
     int B, int C_in, int C_out, int H, int W_spatial
@@ -457,6 +489,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_forward", &fused_forward, "Fused 6-layer AML forward");
     m.def("maxpool2x2_bwd", &maxpool2x2_bwd, "MaxPool 2x2 backward");
     m.def("fused_forward_and_save", &fused_forward_and_save, "Forward + save intermediates for backward");
+    m.def("dynamic_conv2d_fwd", &dynamic_conv2d_fwd, "Custom native dynamic conv2d forward",
+          py::arg("x"), py::arg("w"), py::arg("bias") = py::none());
     m.def("dynamic_conv2d_bwd", &dynamic_conv2d_bwd, "Custom native dynamic conv2d backward");
     m.def("group_norm1_bwd", &group_norm1_bwd, "Custom native GroupNorm(1) backward");
     m.def("instance_norm_bwd", &instance_norm_bwd, "Custom native InstanceNorm backward");
