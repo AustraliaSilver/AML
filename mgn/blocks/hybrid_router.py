@@ -44,16 +44,17 @@ class HybridBlock(BaseDynamicBlock):
             return self.resnet(x, dim_mask=dim_mask)
 
         # Optimization: If one-hot / hard routed, execute ONLY the chosen block
-        if mode_weights.ndim == 2 and (mode_weights == 1.0).any():
-            # Check if entire batch shares the same hard choice
-            mode_sum = mode_weights.sum(dim=0)
-            B = x.shape[0]
-            if mode_sum[0] == B:
-                return self.plain(x, dim_mask=dim_mask)
-            elif mode_sum[1] == B:
-                return self.resnet(x, dim_mask=dim_mask)
-            elif mode_sum[2] == B:
-                return self.vit(x, dim_mask=dim_mask)
+        if mode_weights.ndim == 2:
+            mode_max, mode_idx = mode_weights.max(dim=-1)
+            # Check if all samples in batch selected the same mode (very common with domain routing)
+            if (mode_max > 0.99).all() and (mode_idx == mode_idx[0]).all():
+                chosen = mode_idx[0].item()
+                if chosen == 0:
+                    return self.plain(x, dim_mask=dim_mask)
+                elif chosen == 1:
+                    return self.resnet(x, dim_mask=dim_mask)
+                elif chosen == 2:
+                    return self.vit(x, dim_mask=dim_mask)
 
         # Soft continuous mixture for differentiable architecture search (DARTS)
         w_plain = mode_weights[:, 0].view(-1, 1, 1, 1)

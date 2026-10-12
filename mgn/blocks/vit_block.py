@@ -51,10 +51,22 @@ class VisionTransformerBlock(BaseDynamicBlock):
         # x: [B, C_in, H, W]
         x = self.in_proj(x)
         B, C, H, W = x.shape
-        N = H * W
+        orig_H, orig_W = H, W
 
-        # Convert Spatial [B, C, H, W] -> Sequence [B, N, C]
-        x_seq = x.flatten(2).transpose(1, 2)  # [B, N, C]
+        # MobileViT optimization: If spatial dimension >= 16, downscale tokens to max 8x8 (64 tokens)
+        # to accelerate self-attention from O(1024^2) down to O(64^2) - 256x faster attention
+        needs_downsample = H > 8 or W > 8
+        if needs_downsample:
+            x_down = F.adaptive_avg_pool2d(x, (8, 8))
+            H_tok, W_tok = 8, 8
+        else:
+            x_down = x
+            H_tok, W_tok = H, W
+
+        N = H_tok * W_tok
+
+        # Convert Spatial -> Sequence [B, N, C]
+        x_seq = x_down.flatten(2).transpose(1, 2)
 
         # Multi-Head Self-Attention with Residual
         norm_x = self.norm1(x_seq)
@@ -62,7 +74,7 @@ class VisionTransformerBlock(BaseDynamicBlock):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, N, head_dim]
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # Use PyTorch 2.0+ optimized scaled_dot_product_attention (FlashAttention when available)
+        # Use PyTorch 2.0+ optimized scaled_dot_product_attention (FlashAttention on GPU)
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.attn_drop.p if self.training else 0.0
@@ -74,8 +86,13 @@ class VisionTransformerBlock(BaseDynamicBlock):
         # MLP with Residual
         x_seq = x_seq + self.mlp(self.norm2(x_seq))
 
-        # Convert Sequence [B, N, C] -> Spatial [B, C, H, W]
-        out = x_seq.transpose(1, 2).reshape(B, C, H, W)
+        # Convert Sequence -> Spatial [B, C, H_tok, W_tok]
+        out_down = x_seq.transpose(1, 2).reshape(B, C, H_tok, W_tok)
+
+        if needs_downsample:
+            out = F.interpolate(out_down, size=(orig_H, orig_W), mode='bilinear', align_corners=False) + x
+        else:
+            out = out_down
 
         if dim_mask is not None:
             out = out * dim_mask

@@ -87,27 +87,52 @@ class HybridAMLNetwork(nn.Module):
         return out, mode_weights
 
 
-def train_hybrid_aml(epochs=3, batch_size=64, lr=1e-3, steps_per_epoch=20):
+def train_hybrid_aml(dataset='mnist', epochs=5, batch_size=64, lr=1e-3, steps_per_epoch=0):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[*] Training Hybrid AML (CNN + ViT) on {device}...")
+    print(f"[*] Training Hybrid AML (CNN + ViT) on dataset '{dataset}' ({device})...")
 
     # Data
-    tf_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-    tf_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
+    if dataset == 'mnist':
+        tf_train = transforms.Compose([
+            transforms.Grayscale(num_output_channels=3),
+            transforms.Resize((32, 32)),
+            transforms.RandomCrop(32, padding=2),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)),
+        ])
+        tf_test = transforms.Compose([
+            transforms.Grayscale(num_output_channels=3),
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)),
+        ])
+        trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=tf_train)
+        testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=tf_test)
+    else:
+        tf_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        tf_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=tf_train)
+        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=tf_test)
 
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=tf_train)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=tf_test)
+    use_amp = torch.cuda.is_available()
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+    trainloader = torch.utils.data.DataLoader(
+        trainset, batch_size=batch_size, shuffle=True,
+        num_workers=2, pin_memory=True, persistent_workers=True
+    )
+    testloader = torch.utils.data.DataLoader(
+        testset, batch_size=batch_size * 2, shuffle=False,
+        num_workers=2, pin_memory=True, persistent_workers=True
+    )
 
     model = HybridAMLNetwork(num_classes=10, max_layers=6, hidden_dim=48, K=8, num_heads=4).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -121,13 +146,17 @@ def train_hybrid_aml(epochs=3, batch_size=64, lr=1e-3, steps_per_epoch=20):
         for step, (inputs, targets) in enumerate(trainloader):
             if steps_per_epoch and step >= steps_per_epoch:
                 break
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs, mode_weights = model(inputs, tau=1.0)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                outputs, mode_weights = model(inputs, tau=1.0)
+                loss = criterion(outputs, targets)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
@@ -146,8 +175,10 @@ def train_hybrid_aml(epochs=3, batch_size=64, lr=1e-3, steps_per_epoch=20):
             for step, (inputs, targets) in enumerate(testloader):
                 if steps_per_epoch and step >= steps_per_epoch:
                     break
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs, mode_weights = model(inputs, tau=1.0)
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    outputs, mode_weights = model(inputs, tau=1.0)
                 _, predicted = outputs.max(1)
                 test_total += targets.size(0)
                 test_correct += predicted.eq(targets).sum().item()
@@ -164,14 +195,17 @@ def train_hybrid_aml(epochs=3, batch_size=64, lr=1e-3, steps_per_epoch=20):
 
     # Save checkpoint
     os.makedirs('checkpoints', exist_ok=True)
-    out_path = 'checkpoints/aml_hybrid_cifar10_demo.pth'
+    out_path = f'checkpoints/aml_hybrid_{dataset}_best.pth'
     torch.save(model.state_dict(), out_path)
     print(f"[*] Saved hybrid model to {out_path}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=3)
-    parser.add_argument('--steps', type=int, default=25)
+    parser.add_argument('--dataset', type=str, default='mnist', choices=['mnist', 'cifar10'])
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--steps', type=int, default=0, help='0 for full epoch')
     args = parser.parse_args()
-    train_hybrid_aml(epochs=args.epochs, steps_per_epoch=args.steps)
+    train_hybrid_aml(dataset=args.dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, steps_per_epoch=args.steps)
