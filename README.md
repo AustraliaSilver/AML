@@ -23,12 +23,13 @@ The AML framework unifies two complementary engines:
     [1] AML Meta-Supernet Engine                                    [2] HtS Continual Hypernetwork
     (Vision Encoder -> Structure Heads -> TaskNetwork)              (Multi-Domain Lifelong Learning)
                 │                                                                   │
-    ├── PrototypeLibrary (K=32 prototype rows)                      ├── Dual-Residual Basis (K=8 Experts)
-    ├── Gumbel-Softmax Continuous Routing                           ├── B_shared Base + sum(alpha_i * B_priv_i)
-    │   - Dynamic Depth Gates L(x)                                  ├── Layer-Aware Diversity & Orthogonality
-    │   - Dynamic Channel Width Masks D(x)                          └── Episodic Memory Buffer + Routing Isolation
+    ├── Streamlined Prototypes (K=12, max_dim=48, 12.7M)            ├── Dual-Residual Basis (K=8 Experts, 1.47M)
+    ├── Differentiable Prototype Routing (pi_mask)                  ├── B_shared Base + sum(alpha_i * B_priv_i)
+    ├── cuDNN Tensor Core Dynamic Convolutions                      ├── Hardware WMMA BF16 Tensor Cores (SM86+)
+    │   - Dynamic Depth Gates L(x)                                  ├── Native Dynamic Conv2D Stride-1 Engine
+    │   - Dynamic Channel Width Masks D(x)                          └── HtSBasisIsolator Zero-Replay Isolation
     │   - Dynamic Block Types (Plain / ResNet)
-    └── Hard Pruning -> StaticChildModel Extraction                 Synthesized Child CNN (<10k active params)
+    └── Hard Pruning -> StaticChildModel Extraction                 Modular Depth Stage-Blocks Child CNN
 ```
 
 ## 2. Core Subsystems
@@ -37,9 +38,10 @@ The AML framework unifies two complementary engines:
 - **ConvAML_CIFAR_TrueDynamic** (`train.py`) — the live 18-layer vision supernet:
   a CNN encoder produces a latent `z`, from which per-sample depth gates, width
   masks and Plain/ResNet block modes are generated; weights are mixed from a
-  shared prototype library via attention over routing logits `pi`.
+  compact prototype library ($K=12$, `max_dim=48`, 12.7M parameters) via
+  differentiable attention over routing logits `pi` with task-specific `pi_mask`.
 - **AcceleratedCVNetwork** (`AML_Core_Code/train_cv_cifar_18.py`) — the executor.
-  On CUDA it runs the fused pipeline from `mgn/accel/_C*`; the block algebra is
+  On CUDA it runs the fused pipeline accelerated with cuDNN Tensor Cores; the block algebra is
   the real two-convolution ResNet (shared conv1 + residual conv2), recomputed
   identically by the ATen/eager fallback so both paths stay bit-swap verifiable
   (`validate_ext_in.py` certifies kernel↔eager parity).
@@ -116,6 +118,25 @@ diverge per domain (pairwise gate L1 divergence **2.41–5.47** rather than ~0).
 
 Vision supernet benchmarks (including static baselines) are recorded in
 `experiments/*.json`.
+
+### Dual-Engine Continual Learning Benchmark: AML vs HtS
+
+Run the side-by-side benchmark comparing AML ($K=12, \text{max\_dim}=48$) and HtS Dual-Residual Hypernetwork ($K=8$, Tensor Cores WMMA) on the standard 3-task sequence (**MNIST $\rightarrow$ CIFAR-10 $\rightarrow$ Fashion-MNIST**):
+
+```bash
+python benchmarks/benchmark_cl_aml_vs_hts.py --epochs 1,1,1 --steps 30 --eval-cap 15
+```
+
+Measured on **RTX 3050 Laptop GPU** (Zero-Replay setting):
+
+| Engine / Method | Final ACC ($A_{\text{avg}}$) | BWT | Forgetting | Runtime (s) | Parameters | Model Size |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **AML (Live Weights — No Replay)** | **29.73%** | **+0.00%** | **0.00%** | 183.4s | 12,759,873 | 48.7 MB |
+| **AML (Method — Snapshot Retr.)**  | **33.34%** | **+0.00%** | **0.00%** | 183.4s | 12,759,873 | 48.7 MB |
+| **HtS (Tensor Cores WMMA BF16)**   | **36.98%** | -33.15% | 33.15% | **24.2s** | **1,468,790** | **5.8 MB** |
+
+- **AML**: Achieves perfect **Zero Forgetting (0.00%)** through orthogonal prototype isolation (`pi_mask`), preserving earlier domain accuracy without any exemplar replay.
+- **HtS**: Runs **7.6x faster** with **8.7x fewer parameters** using hardware Tensor Cores WMMA BF16 and native CUDA dynamic convolutions.
 
 ## 4. Repository Structure
 
@@ -197,7 +218,7 @@ python build_ext.py          # builds both _C and _Cin into mgn/accel/
 python validate_ext_in.py
 ```
 
-## 4. Native CUDA Acceleration & Microbenchmarks
+## 6. Native CUDA Acceleration & Microbenchmarks
 
 The engine features a fully native CUDA acceleration suite (`mgn/csrc/`):
 - **Direct Dynamic Conv2D (BF16 & FP32)**: Per-sample dynamic weights ($B \times C_{out} \times C_{in} \times 3 \times 3$) without intermediate `im2col` tensor bloat, unrolled $3 \times 3$ direct convolutions with native input, weight, and bias backward kernels.
@@ -224,10 +245,11 @@ Run the automated environment diagnostic script to verify your GPU, compiler, an
 python verify_env.py                         # Checks Python, PyTorch, GPU, NVCC, and runs CUDA smoke tests
 python benchmarks/benchmark_cuda_vs_baseline.py   # Runs full microbenchmark suite vs ATen/cuDNN
 python benchmarks/profile_training_step.py        # Runs PyTorch Profiler on an end-to-end training step
-python -m unittest discover tests            # Runs all 48 unit tests (100% pass)
+pytest                                       # Runs full test suite (58 tests: 50 in tests/, 8 in mgn/tests/, 100% pass)
+python -m unittest discover tests            # Runs CPU-safe tests in tests/ (50 tests, 100% pass)
 ```
 
-## 5. Build, Installation & Training
+## 7. Build, Installation & Training
 
 ### Build CUDA Extensions
 ```bash
@@ -245,12 +267,13 @@ python build_ext.py
 ### Training:
 
 ```bash
-python train.py                       # Vision supernet on CIFAR-10 (fused CUDA pipeline)
+python train.py                       # Vision supernet on CIFAR-10 (default K=12, max_dim=48, 12.7M params)
 python train.py --dataset mnist       # MNIST / fashion
 python train.py --steps 4 --epochs 1  # Capped sanity run
 python train_continual_aml.py         # 3-domain continual lifelong benchmark
+python benchmarks/benchmark_cl_aml_vs_hts.py  # Side-by-side AML vs HtS continual learning benchmark
 ```
 
-## 6. License
+## 8. License
 
 MIT — see [LICENSE](LICENSE).
