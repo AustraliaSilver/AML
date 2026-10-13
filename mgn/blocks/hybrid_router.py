@@ -51,11 +51,15 @@ class HybridBlock(BaseDynamicBlock):
             if (mode_max > 0.99).all() and (mode_idx == mode_idx[0]).all():
                 chosen = mode_idx[0].item()
                 if chosen == 0:
-                    return self.plain(x, dim_mask=dim_mask)
+                    cand = self.plain(x, dim_mask=dim_mask)
                 elif chosen == 1:
-                    return self.resnet(x, dim_mask=dim_mask)
+                    cand = self.resnet(x, dim_mask=dim_mask)
                 elif chosen == 2:
-                    return self.vit(x, dim_mask=dim_mask)
+                    cand = self.vit(x, dim_mask=dim_mask)
+                else:
+                    raise ValueError(f"Invalid mode {chosen}")
+                return cand * mode_weights[:, chosen].view(-1, 1, 1, 1)
+
 
         # Soft continuous mixture for differentiable architecture search (DARTS)
         w_plain = mode_weights[:, 0].view(-1, 1, 1, 1)

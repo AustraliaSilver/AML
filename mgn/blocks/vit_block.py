@@ -90,9 +90,10 @@ class VisionTransformerBlock(BaseDynamicBlock):
         out_down = x_seq.transpose(1, 2).reshape(B, C, H_tok, W_tok)
 
         if needs_downsample:
-            out = F.interpolate(out_down, size=(orig_H, orig_W), mode='bilinear', align_corners=False) + x
+            out = F.interpolate(out_down, size=(orig_H, orig_W), mode='nearest') + x
         else:
             out = out_down
+
 
         if dim_mask is not None:
             out = out * dim_mask
