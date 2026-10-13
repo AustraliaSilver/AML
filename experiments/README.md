@@ -75,13 +75,24 @@ Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual L
 ### 3.3. Đối Chiếu Thực Nghiệm Continual Learning (Zero-Replay): AML vs CNN vs ResNet vs ViT
 Được đo đạc tự động từ kịch bản [`benchmarks/benchmark_cl_comparison.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/benchmarks/benchmark_cl_comparison.py) qua chuỗi 3 tác vụ (**MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST**):
 
-| Kiến Trúc / Mô Hình | Giao Thức | Độ Chính Xác Cuối ($A_{\text{avg}}$) | BWT | Quên Lãng (Forgetting) | Tổng Tham Số | Bộ Nhớ Model |
+| Architecture / Model | Giao Thức | Độ Chính Xác Cuối ($A_{\text{avg}}$) | BWT | Quên Lãng (Forgetting) | Tổng Tham Số | Bộ Nhớ Model |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Plain CNN (18-Layer)** | Không Replay | 31.56% | -54.66% | **54.66%** | 385,594 | 1.47 MB |
 | **Standard ResNet-18** | Không Replay | 34.54% | -55.07% | **55.07%** | 348,730 | 1.33 MB |
 | **Vision Transformer (ViT)** | Không Replay | 25.36% | -14.61% | **14.61%** | 232,234 | 0.89 MB |
 | **AML Live Weights** | Không Snapshot | 29.73% | -46.50% | **46.50%** | 12,759,873 | 48.7 MB |
 | **AML 18-Layer Hybrid (Ours)** | **Snapshot Cô Lập** | **75.46%** | **+0.00%** | **0.00%** | 12,759,873 | **+1.3 MB / task** (INT8) |
+
+#### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn ($A[i, j]$):
+
+| Kiến Trúc / Mô Hình | Sau Stage 1 (MNIST) | Sau Stage 2 (CIFAR-10) | Sau Stage 3 (Fashion-MNIST) | $A_{\text{avg}}$ Cuối | Quên Lãng |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| | **Eval: MNIST** | **Eval: MNIST \| CIFAR-10** | **Eval: MNIST \| CIFAR-10 \| Fashion** | | |
+| **Plain CNN (18-Layer)** | 94.65% | 7.69% \| 31.51% | 8.51% \| 8.32% \| 77.85% | 31.56% | 54.66% |
+| **Standard ResNet-18** | 97.96% | 6.42% \| 38.94% | 10.81% \| 15.95% \| 76.86% | 34.54% | 55.07% |
+| **Vision Transformer (ViT)** | 39.17% | 12.21% \| 19.31% | 17.79% \| 11.48% \| 46.82% | 25.36% | 14.61% |
+| **AML Live Weights** | 72.54% | 41.41% \| 42.44% | 8.89% \| 13.10% \| 75.93% | 32.64% | 46.50% |
+| **AML 18-Layer Hybrid (Ours)** | **92.83%** | **92.83% \| 45.96%** | **92.83% \| 45.96% \| 87.58%** | **75.46%** | **0.00%** |
 
 - **Kết luận**: Các mạng tĩnh truyền thống bị xóa sạch trí nhớ (Forgetting lên tới $\sim 55\%$). AML 18-Layer Hybrid ngăn chặn hoàn toàn hiện tượng suy thoái này nhờ cơ chế Snapshot Retrieval và Proto-Isolation.
 

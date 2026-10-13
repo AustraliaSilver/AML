@@ -136,6 +136,19 @@ python benchmarks/benchmark_cl_comparison.py
 | **AML Live Weights** | Mutable Supernet (No Snap) | 29.73% | -46.50% | **46.50%** | 12,759,873 | 48.7 MB |
 | **AML 18-Layer Hybrid (Ours)** | **Snapshot Isolation (Zero-Replay)** | **75.46%** | **+0.00%** | **0.00%** | 12,759,873 | **+1.3 MB / task** (INT8) |
 
+#### Stage-by-Stage Accuracy Evolution Across Task Progression
+
+Shows exact domain accuracy ($A[i, j]$) evaluated after each sequential learning stage:
+
+| Architecture / Model | After Stage 1 (MNIST) | After Stage 2 (CIFAR-10) | After Stage 3 (Fashion-MNIST) | Final ($A_{\text{avg}}$) | Forgetting |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| | **Eval: MNIST** | **Eval: MNIST \| CIFAR-10** | **Eval: MNIST \| CIFAR-10 \| Fashion** | | |
+| **Plain CNN (18-Layer)** | 94.65% | 7.69% \| 31.51% | 8.51% \| 8.32% \| 77.85% | 31.56% | 54.66% |
+| **Standard ResNet-18** | 97.96% | 6.42% \| 38.94% | 10.81% \| 15.95% \| 76.86% | 34.54% | 55.07% |
+| **Vision Transformer (ViT)** | 39.17% | 12.21% \| 19.31% | 17.79% \| 11.48% \| 46.82% | 25.36% | 14.61% |
+| **AML Live Weights** | 72.54% | 41.41% \| 42.44% | 8.89% \| 13.10% \| 75.93% | 32.64% | 46.50% |
+| **AML 18-Layer Hybrid (Ours)** | **92.83%** | **92.83% \| 45.96%** | **92.83% \| 45.96% \| 87.58%** | **75.46%** | **0.00%** |
+
 - **Plain CNN & ResNet-18**: Erase earlier domain representations almost entirely (MNIST collapses from $94.6\%$ / $97.9\%$ down to $\sim 8.5\%$ / $10.8\%$).
 - **AML 18-Layer Hybrid**: Completely circumvents representation erasure via orthogonal prototype isolation and INT8 snapshot retrieval, maintaining pristine domain performance across all sequential tasks.
 

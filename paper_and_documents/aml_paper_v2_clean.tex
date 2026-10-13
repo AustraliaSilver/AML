@@ -1395,7 +1395,27 @@ We evaluated the 18-layer Hybrid Supernet against standard static deep architect
 \end{tabular}
 \end{table}
 
-As demonstrated in Table~\ref{tab:cl_results}, standard static architectures suffer catastrophic representation erasure: Plain CNN and ResNet-18 forget more than $54\%$ of previously acquired task knowledge, causing MNIST accuracy to collapse from over $94\%$ to approximately $8.5\%$--$10.8\%$. While Vision Transformer (ViT) experiences less proportional degradation due to distributed self-attention representations, its overall task accuracy remains constrained under zero-replay training.
+\begin{table}[t]
+\centering
+\caption{\textbf{Stage-by-Stage Accuracy Evolution Across Task Progression.} Detailed domain accuracy $A[i, j]$ evaluated after each sequential learning stage under Zero-Replay ($\text{replay}=0$).}
+\label{tab:cl_progression}
+\small
+\begin{tabular}{l c cc ccc c c}
+\toprule
+\textbf{Architecture / Model} & \textbf{Stage 1 (MNIST)} & \multicolumn{2}{c}{\textbf{Stage 2 (CIFAR-10)}} & \multicolumn{3}{c}{\textbf{Stage 3 (Fashion-MNIST)}} & \textbf{Final Acc} & \textbf{Forgetting} \\
+\cmidrule(lr){2-2} \cmidrule(lr){3-4} \cmidrule(lr){5-7}
+& \textbf{MNIST} & \textbf{MNIST} & \textbf{CIFAR} & \textbf{MNIST} & \textbf{CIFAR} & \textbf{Fashion} & ($A_{\text{avg}}$) & \\
+\midrule
+\textbf{Plain CNN (18-Layer)} & $94.65\%$ & $7.69\%$ & $31.51\%$ & $8.51\%$ & $8.32\%$ & $77.85\%$ & $31.56\%$ & $54.66\%$ \\
+\textbf{Standard ResNet-18} & $97.96\%$ & $6.42\%$ & $38.94\%$ & $10.81\%$ & $15.95\%$ & $76.86\%$ & $34.54\%$ & $55.07\%$ \\
+\textbf{Vision Transformer (ViT)} & $39.17\%$ & $12.21\%$ & $19.31\%$ & $17.79\%$ & $11.48\%$ & $46.82\%$ & $25.36\%$ & $14.61\%$ \\
+\textbf{AML Live Weights} & $72.54\%$ & $41.41\%$ & $42.44\%$ & $8.89\%$ & $13.10\%$ & $75.93\%$ & $32.64\%$ & $46.50\%$ \\
+\textbf{AML 18-Layer Hybrid} (\textbf{Ours}) & $\mathbf{92.83\%}$ & $\mathbf{92.83\%}$ & $\mathbf{45.96\%}$ & $\mathbf{92.83\%}$ & $\mathbf{45.96\%}$ & $\mathbf{87.58\%}$ & $\mathbf{75.46\%}$ & $\mathbf{0.00\%}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As demonstrated in Tables~\ref{tab:cl_results} and \ref{tab:cl_progression}, standard static architectures suffer catastrophic representation erasure: Plain CNN and ResNet-18 forget more than $54\%$ of previously acquired task knowledge, causing MNIST accuracy to collapse from over $94\%$ to approximately $8.5\%$--$10.8\%$. While Vision Transformer (ViT) experiences less proportional degradation due to distributed self-attention representations, its overall task accuracy remains constrained under zero-replay training.
 
 In contrast, the AML Full-State Functional Snapshot mechanism completely circumvents parameter overwrite, achieving mathematically exact \textbf{Zero-Forgetting ($BWT = +0.00\%$, Forgetting $= 0.00\%$)}. By compressing historical functional states to 8-bit quantized weights, AML preserves pristine historical accuracy across all seen domains with an ultra-compact incremental storage cost of only $\sim 1.3$ MB per task, eliminating episodic replay entirely.
 
