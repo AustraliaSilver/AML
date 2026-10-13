@@ -97,6 +97,58 @@ Dynamic block-mode probabilities indicate true per-stage specialization:
 - **Stage 2 (Layers 6–11)**: ResNet 80.5%, Plain CNN 14.5%, ViT suppressed.
 - **Stage 3 (Layers 12–17)**: Vision Transformer (ViT) 72.1%, ResNet 18.0%.
 
+> **Read these carefully.** A 2026-10-14 audit showed these fingerprints are
+> **the initialisation, not a learned outcome**. Softmax of the hard-coded prior
+> is 18.1 / **81.3** / 0.5 % for stage 1 and 2.4 / 17.8 / **79.8** % for stage 3;
+> re-measuring on the three shipped checkpoints gave 18.4 / **81.1** / 0.6 % and
+> 2.4 / 17.7 / **79.9** %. Training moved the mode distribution by **less than
+> half a percentage point**. The "72.1 %" quoted above is the nearest value in the
+> literature-facing tables — it is not evidence of discovered structure.
+>
+> The depth gates were worse: `layer_soft` sat in `[0.876, 0.882]` on every row
+> of every checkpoint, i.e. **0 of 216** gates ever closed, so the dynamic-depth
+> machinery had nothing to skip. Root cause was the optimiser step budget —
+> AdamW moves a parameter by ≈`lr` per step, and the architecture LR of `2e-4`
+> allowed ≈0.12 of travel per task against the ≈2.0 needed to flip a gate.
+> See [`experiments/dynamic_depth_routing_2026-10-14.md`](experiments/dynamic_depth_routing_2026-10-14.md).
+
+#### 4. Dynamic Depth, Per-Sample Routing and EWC (2026-10-14)
+
+Three mechanisms were added so the numbers above become *earned* rather than
+assumed:
+
+| Mechanism | What it does | Guard against regressing |
+| :--- | :--- | :--- |
+| **P2 depth short-circuit** | A closed gate branches around the block at inference instead of computing it and multiplying by 0 | exact-equality test vs a full-compute reference, including per-sample skips |
+| **P3 per-sample MoE dispatch** | Runs each candidate block only on the sub-batch that selected it, instead of on the whole batch and masking afterwards | numerical equivalence for one-hot routing + a test that the architecture gradient stays non-zero |
+| **P4 Fisher EWC** | One diagonal-Fisher vector over the shared trunk, so forgetting can be bounded without a 7.2 MB snapshot per task | test that the Fisher *accumulates* across tasks |
+
+```bash
+python train_continual_aml.py --model-type hybrid18 \
+  --tasks mnist,cifar10,fashion --epochs 3,10,6 \
+  --replay-per-class 0 --router-type centroid \
+  --arch-lr 3e-3 --depth-cost 0.02 --ewc-lambda 100
+```
+
+```python
+python -m unittest tests.test_dynamic_depth_routing   # 22 tests, CI-enforced
+```
+
+Three corrections to the original proposals are recorded in full, with
+measurements, in the investigation log:
+
+1. The proposed per-sample dispatch **zeroes the architecture gradient**
+   (`2.50e0 → 0.00e0`) because `out[mask] = branch(x[mask])` removes
+   `mode_weights` from the autograd graph. It is now eval-only.
+2. `VisionTransformerBlock.compute_flops` overstated ViT cost by **76×** because
+   it used `h*w` tokens while `forward` pools to 64. ViT is the cheapest mode at
+   32×32 and 16×16 — the opposite of the "Conv is cheaper when shallow" premise.
+3. A zero-valued `block_mode_prototypes` does not give a 33/33/33 split. Inference
+   takes `argmax`, ties resolve to index 0, and all 18 layers collapse to PlainConv.
+   Measured cost of the noise-based neutral prior: **89.9 % → 11.4 %** on MNIST at
+   a 4×60-step budget, because near-zero logits make `gumbel_softmax` noise
+   dominated and every layer switches branch almost every step.
+
 ---
 
 ### Dual-Engine Continual Learning Benchmark: AML vs HtS

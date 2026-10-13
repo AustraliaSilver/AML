@@ -4,6 +4,33 @@ Tài liệu này cung cấp bản đồ tổng thể, giải thích dữ liệu 
 
 ---
 
+## 0. Điều tra Cơ Chế Động (2026-10-14)
+
+[`dynamic_depth_routing_2026-10-14.md`](dynamic_depth_routing_2026-10-14.md) — nhật ký điều
+tra và hiện thực hoá ba cơ chế **P2** (dynamic depth short-circuit), **P3** (per-sample MoE
+routing) và **P4** (Fisher EWC). Toàn bộ số đo trong tài liệu đó được đo trực tiếp trên
+checkpoint và GPU của repo, không lấy từ tài liệu cũ.
+
+Tóm tắt những gì đo được:
+
+| Hiện tượng | Số đo |
+| :--- | :--- |
+| Cổng depth chưa từng đóng lần nào | `layer_soft ∈ [0.876, 0.882]`, **0/216** gate trên cả 3 checkpoint |
+| Ngân sách bước của optimizer quá nhỏ | AdamW đi `≈lr` mỗi step; `lr=2e-4` cho `≈0.12`/task so với `≈2.0` cần để đảo cổng |
+| Phân bố mode sau train = lúc init | Stage 1 ResNet 81.3% → 81.1%; Stage 3 ViT 79.8% → 79.9% |
+| MoE dispatch nguy hiểm | `d(loss)/d(bm_logits)`: `2.496e0 → 0.000e0` (phá huỷ architecture search) |
+| Mô hình FLOPs của ViT sai | 239.08M (phân tích) so với 3.15M (runtime thật), sai số **76×** |
+| Zero-init không cho 33/33/33 | `argmax` hòa → index 0 → toàn bộ 18 layer về PlainConv |
+| Neutral prior tốn accuracy | MNIST 4×60 step: staged **89.9%**, neutral **11.4%** |
+| Snapshot thực tế | **7.2 MB/task** (không phải "hàng chục MB"); T=3 → 21.6 MB |
+| Chống quên trước đây | `--anchor-lam` mặc định **0.0**, EWC/Fisher **không tồn tại** trong repo |
+
+Tám lỗi ẩn được phát hiện trong lúc hiện thực hoá (ghi tại mục 8 của tài liệu đó), trong đó
+hai lỗi là do chính phần sửa mới tạo ra và bị bộ test bắt được: `consolidate()` **ghi đè**
+Fisher thay vì cộng dồn khiến EWC im lặng không làm gì từ task thứ hai trở đi.
+
+---
+
 ## 1. Bản Đồ Tiến Hóa Thực Nghiệm (Experimental Evolution Roadmap)
 
 Các thí nghiệm trong thư mục này được tổ chức theo 4 giai đoạn phát triển có tính kế thừa khoa học:

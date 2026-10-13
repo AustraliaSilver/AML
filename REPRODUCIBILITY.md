@@ -79,6 +79,56 @@ python train_continual_aml.py \
 
 ---
 
+### Option D: Dynamic Depth + Per-Sample Routing + EWC (2026-10-14)
+
+Adds three mechanisms that were previously inert. Full measurements and the bugs
+found while validating them are in
+[`experiments/dynamic_depth_routing_2026-10-14.md`](experiments/dynamic_depth_routing_2026-10-14.md).
+
+```bash
+python train_continual_aml.py \
+  --model-type hybrid18 \
+  --tasks mnist,cifar10,fashion \
+  --epochs 3,10,6 \
+  --replay-per-class 0 \
+  --router-type centroid \
+  --arch-lr 3e-3 \
+  --depth-cost 0.02 \
+  --flops-cost 0.01 \
+  --ewc-lambda 100.0
+```
+
+| Flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `--arch-lr` | `3e-3` | LR for `structure_prototypes` / `block_mode_prototypes`. Was `2e-4`, which capped the per-task travel of the depth logit at ≈0.12 against the ≈2.0 needed to close a gate. |
+| `--depth-cost` | `0.02` | Sparsity penalty on the depth gates. **Required** for the short-circuit to have anything to skip — without it all 18 gates stay open. |
+| `--depth-target` | `0.0` | `>0` turns the penalty into a hinge `relu(mean − target)`, bounding pruning to `1−target` so the trunk can never collapse. |
+| `--flops-cost` | `0.0` | Complexity term, in GFLOP/sample. ViT is the cheapest mode at 32×32 and 16×16 (tokens are pooled to 8×8), so this pushes those stages toward ViT — the opposite of "Conv at shallow layers". At 8×8 Plain is cheapest again. |
+| `--arch-prior` | `staged` | `staged` = CoAtNet-style 3-stage prior. `neutral` = small symmetric noise. Measured at a 4×60-step budget: staged 89.9 %, neutral 11.4 %. |
+| `--ewc-lambda` | `0.0` | Elastic Weight Consolidation on the shared trunk. `>0` is what lets forgetting be bounded without storing an 18-layer snapshot per task. |
+
+Depth telemetry is printed every epoch:
+
+```text
+[mnist] ep 3/3 | 264.7s | loss 1.31 | mnist acc 87.31% | [Plain: 12%, ResNet: 59%, ViT: 29%] | [active L: 15.20/18, 331.5 MFLOP/s]
+```
+
+`active L` is the mean number of open gates per sample; `MFLOP/s` is the
+differentiably expected cost of the selected structure.
+
+#### Regression tests
+
+```bash
+python -m pytest tests/test_dynamic_depth_routing.py -q     # 18 tests
+python scratch/test_p2_p3.py                                 # equivalence + gradient guards
+```
+
+These encode the specific failures observed: uninitialised memory leaking into
+per-sample-skipped rows, dtype mismatch under autocast, the MoE dispatch zeroing
+the architecture gradient, and EWC's Fisher being reset instead of accumulated.
+
+---
+
 ### Option C: Baseline Comparison (Plain CNN vs ResNet-18 vs ViT vs AML) (~3 minutes)
 
 Directly replicates the side-by-side continual learning benchmark under identical zero-replay conditions:

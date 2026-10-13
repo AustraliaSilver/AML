@@ -1356,6 +1356,107 @@ In an 18-layer network, applying global self-attention across large feature maps
 \end{itemize}
 The network terminates in an expanded $4 \times 4$ adaptive spatial pooling head ($768$ dimensions), normalized by LayerNorm and a dropout regularizer before mapping to task-isolated linear classification weights.
 
+\paragraph{Audit note (2026-10-14): the stage profile above is an initialisation, not a discovered structure.}
+A direct audit of the three released checkpoints found that the reported mode
+distribution is indistinguishable from the prior that produces it. Softmax of the
+hard-coded stage prior is $18.1 / 81.3 / 0.5\,\%$ for Stage~1 and
+$2.4 / 17.8 / 79.8\,\%$ for Stage~3; re-measuring on
+\texttt{aml\_continual\_after\_\{mnist,cifar10,fashion\}.pth} yields
+$18.4 / 81.1 / 0.6\,\%$ and $2.4 / 17.7 / 79.9\,\%$ respectively --- a shift of
+less than half a percentage point after full training. The $72.1\,\%$ quoted for
+Stage~3 in the tables above is likewise not evidence of search. Two mechanisms
+were responsible, and both are now corrected in the implementation:
+\begin{enumerate}
+    \item \textbf{Insufficient optimiser step budget.} AdamW moves a parameter by
+    approximately $\eta$ per step independently of gradient magnitude. With the
+    architecture learning rate at $2{\times}10^{-4}$ and a per-task budget of
+    $\approx 585$ steps, $\boldsymbol{\alpha}_{\text{struct}}$ could travel at most
+    $\approx 0.12$, whereas flipping the gate
+    $g^{(l)} = \sigma(\delta^{(l)} + 2)$ past $0.5$ requires $|\delta^{(l)}| \approx 2$.
+    The measured $|{\max} \boldsymbol{\alpha}_{\text{struct}}|$ after full training
+    was $0.016$--$0.040$.
+    \item \textbf{No sparsity or cost pressure.} The loss carried no term penalising
+    depth, so nothing ever pushed a gate closed. Measured across all
+    $216$ row$\times$layer gates of every checkpoint,
+    $g^{(l)} \in [0.876, 0.882]$ and \textbf{zero} gates ever closed --- the dynamic-depth
+    machinery had nothing to short-circuit.
+\end{enumerate}
+Both are addressed by a sparsity penalty on the depth gates and an architecture
+learning rate of $3{\times}10^{-3}$ (Section~\ref{sec:depth_audit}). We retain the staged
+prior as the default because an unbiased initialisation was measured to be
+harmful at this training budget: with near-zero mode logits,
+$\text{GumbelSoftmax}(\tau{=}0.8)$ becomes noise-dominated, every layer switches
+branch almost every step, and accuracy falls from $89.9\%$ to $11.4\%$ on MNIST
+at a $4{\times}60$-step budget.
+
+\subsection{Dynamic Depth, Per-Sample Routing, and Stability Without Snapshots}
+\label{sec:depth_audit}
+
+\paragraph{Depth is a control-flow decision, not a post-hoc multiply.}
+A closed gate $g^{(l)} = 0$ makes
+$h \leftarrow g\,h_{\text{cand}} + (1-g)\,h$ an exact identity, yet the candidate
+block has already been executed. We therefore branch around it at inference:
+when the gate is closed for an entire batch the layer is not called at all, and
+when only part of the batch is closed the block runs on the open sub-batch and the
+blend is scattered back. The decision for all $L$ layers is derived from a single
+device-to-host transfer, so the short-circuit costs one sync per forward rather
+than one per layer.
+
+The skip threshold is an $\epsilon$ rather than the $0.5$ hard-gate threshold,
+and the distinction is load-bearing. The gates reaching this code come from two
+sources: the hard path yields exactly $\{0,1\}$, but domain routing supplies
+\emph{soft} per-domain slot means in $(0,1)$. A slot mean of $0.2$ must blend as
+$0.2\,h_{\text{cand}} + 0.8\,h$, so short-circuiting at $0.5$ would silently
+replace it with an identity and change the routed model's output. Only
+$g^{(l)} \le \epsilon$ is an exact identity, and equivalence to the
+unshort-circuited computation is asserted bit-exactly on CPU in the test suite.
+
+\paragraph{Per-sample mode dispatch, and the gradient it destroys.}
+Routing weights are one-hot at inference, so
+$\sum_m w_m\, b_m(x) = w_{\arg\max}\, b_{\arg\max}(x)$ and each candidate block
+need only be evaluated on the sub-batch that selected it. Implemented naively
+this is a severe regression: $x[\texttt{mask}]$ scatter
+$b_m(x[\texttt{mask}])$ removes the mode weights from the autograd graph, and the
+straight-through estimator
+$\hat{y} = \mathrm{hard}(y) - y.\mathrm{detach} + y$ then delivers
+$\partial\mathcal{L}/\partial \boldsymbol{\alpha}_{\text{modes}} = 0$ exactly
+(measured: $2.496{\times}10^{0} \rightarrow 0$). The dispatch is therefore
+restricted to inference, and training retains the differentiable mixture. Even
+then the gain is conditional: measured on the released checkpoints all $18/18$
+layers are already single-mode per batch, so the existing fast path absorbs it;
+under a forced three-way mixed batch dispatch is $1.91\times$ faster at
+$32{\times}32$, $1.14\times$ at $16{\times}16$, and $0.90\times$ --- i.e.
+slower --- at $8{\times}8$, where gather/scatter overhead dominates.
+
+\paragraph{The analytic FLOP model must match the kernel that runs.}
+The ViT block pools tokens to at most $8{\times}8$ before attention, so the
+attention term is governed by $n = 64$ rather than $n = H W$. An analytic model
+using $n = HW$ overstates the block by $76\times$ at $32{\times}32$
+($239.08\,\mathrm{M}$ versus $3.15\,\mathrm{M}$ measured). Consequently, the
+intuition that convolution is cheaper at shallow layers is wrong for this
+architecture: ViT is the cheapest mode at $32{\times}32$ and $16{\times}16$
+($13.5\times$ and $3.4\times$ cheaper than Plain/ResNet respectively), while at
+$8{\times}8$, where no pooling is needed, Plain becomes cheapest again. A FLOPs
+regulariser therefore biases the two wide stages toward ViT. We report the
+complexity term in GFLOP/sample; using raw MFLOPs with an $O(0.01)$ coefficient
+adds $\approx 6$ nats to a $10$-way cross-entropy and suppresses classification
+entirely.
+
+\paragraph{Snapshot size and a stability mechanism that was disabled.}
+The full per-task snapshot is $1{,}781{,}793$ values $\approx 7.2\,\mathrm{MB}$
+(of which the $18$ layers are $5.86\,\mathrm{MB}$), or $\approx 21.6\,\mathrm{MB}$
+over three tasks; it is a $7\,\mathrm{MB}$ problem rather than the tens of
+megabytes sometimes quoted. Separately, the only stability term shipped in the
+continual trainer was an $L_2$-SP anchor on the encoder and prototype selector,
+defaulting to $\lambda = 0.0$, i.e.\ \emph{disabled}; measured $A_{\text{live}}$
+decays $98.05\% \rightarrow 3.52\% \rightarrow 28.99\%$ across the three tasks.
+We therefore add diagonal-Fisher Elastic Weight Consolidation over the shared
+trunk, which requires one Fisher vector and one $\boldsymbol{\theta}^{\star}$ for
+\emph{all} tasks rather than a full weight copy per task. Two subtleties are
+asserted by tests: the Fisher must be \emph{accumulated} across tasks (overwriting
+it silently disables EWC from the second task onward), and parameters receiving
+no gradient in a step must be skipped rather than recorded with zero Fisher.
+
 \subsection{Zero-Replay Catastrophic Forgetting Mitigation}
 In standard continual learning, neural networks suffer from catastrophic forgetting when sequentially trained on disparate domains $\mathcal{T}_1 \to \mathcal{T}_2 \to \mathcal{T}_3$ without an episodic replay buffer. AML resolves this by decoupling functional representation preservation from sample storage:
 
@@ -1465,9 +1566,9 @@ We envision several promising extensions of Architecture Mode Learning:
     
     \item \textbf{Transformer and LLM routing:} Applying AML to Large Language Models, where the ModelGenerator dynamically selects attention head counts, MLP expansion factors, and layer configurations based on input token complexity, could dramatically reduce inference costs.
     
-    \item \textbf{Per-sample routing:} Extending from per-task to per-sample routing would enable different images within a single batch to traverse entirely different computational graphs, maximizing the efficiency gains for heterogeneous-difficulty datasets.
+    \item \textbf{Per-sample routing:} Extending from per-task to per-sample routing would enable different images within a single batch to traverse entirely different computational graphs, maximizing the efficiency gains for heterogeneous-difficulty datasets. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Candidate-block dispatch on the routing sub-batch is implemented and verified numerically equivalent for one-hot routing, but it is currently worth nothing in practice: on the released checkpoints the per-batch mode assignment is already uniform, so the pre-existing single-branch fast path already absorbs the win. The remaining open question is how to make mode routing non-uniform in the first place without destabilising weight training.
     
-    \item \textbf{Online and continual learning:} Coupling AML with elastic weight consolidation would allow the architecture to dynamically expand for new tasks while protecting previously learned knowledge through the Ghost Layer mechanism.
+    \item \textbf{Online and continual learning:} Coupling AML with elastic weight consolidation would allow the architecture to dynamically expand for new tasks while protecting previously learned knowledge through the Ghost Layer mechanism. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Diagonal-Fisher EWC over the shared trunk is now implemented and tested. What remains open is the stronger variant: dropping the per-task snapshot entirely in favour of a single shared backbone plus task-conditioned sparse adapters, which would reduce per-task state from the current $7.2\,\mathrm{MB}$ to a bitmask plus quantised prototypes. We did not attempt this here, because removing the $18$-layer snapshot without first validating that EWC holds $A_{\text{live}}$ steady is precisely the configuration that currently collapses accuracy.
     
     \item \textbf{Reinforcement learning integration:} Combining AML with policy gradient methods (PPO, SAC) would enable embodied agents to optimize their own cognitive architecture as part of their core policy, rather than relying on human-designed networks.
     
