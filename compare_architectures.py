@@ -30,8 +30,8 @@ def get_cifar10(batch_size=128):
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-    trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_train)
-    testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=False, transform=transform_test)
+    trainset = torchvision.datasets.CIFAR10(root=data_root, train=True, download=True, transform=transform_train)
+    testset = torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
     testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=1, pin_memory=True)
     return trainloader, testloader

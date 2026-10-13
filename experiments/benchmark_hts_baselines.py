@@ -1,6 +1,7 @@
 """
-Standard Scientific Baselines & Ablation Matrix Benchmark
-==========================================================
+[ABLATION & COMPARATIVE BASELINE]
+Standard Scientific Baselines & Ablation Matrix Benchmark (HtS vs Static Multi-Head)
+=====================================================================================
 Compares 4 architectural baselines under identical budget and data protocols:
 1. Baseline 1: Plain Multi-Head CNN (Standard static ResNet without Hypernetwork)
 2. Baseline 2: Static Basis Mixer (Collapsed Hypernetwork, uniform alpha=[1/K...1/K])
@@ -8,6 +9,7 @@ Compares 4 architectural baselines under identical budget and data protocols:
 4. Baseline 4: Full HtS Dual-Residual Model (Shared Base + K=8 Dynamic Residual Basis)
 
 Outputs formal comparison table and Accuracy Matrices.
+=====================================================================================
 """
 
 import argparse

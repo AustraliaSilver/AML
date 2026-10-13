@@ -1,8 +1,13 @@
 """
-Phase 2 Benchmark: MGN vs Baselines on Real Datasets
+[PHASE 1 HISTORICAL BENCHMARK]
+MGN vs Baselines on Tabular / PCA-Reduced Real Datasets
+=====================================================================================
+Evaluates the baseline Model Generation Network (MGN) on tabular and PCA feature
+vectors against standard static baselines (FixedMoE, SmallCNN, Random Forest).
 
 Usage:
     python experiments/benchmark.py [--datasets mnist,fashion_mnist,cifar10] [--seeds 5] [--quick]
+=====================================================================================
 """
 
 import sys, os, json, time, argparse, warnings

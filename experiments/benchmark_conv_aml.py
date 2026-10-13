@@ -1,6 +1,14 @@
 """
-Phase 3 Benchmark: ConvAML (Convolutional Architecture Mode Learning) vs Baselines on Raw Image Datasets
-Directly evaluates ConvAML on spatial image datasets (MNIST, Fashion-MNIST, CIFAR-10) without PCA feature reduction.
+[PHASE 2 BENCHMARK]
+ConvAML (Convolutional Architecture Mode Learning) vs Baselines on Raw Image Datasets
+=====================================================================================
+Directly evaluates ConvAML on spatial image datasets (MNIST, Fashion-MNIST, CIFAR-10)
+without PCA feature reduction, comparing against static SmallCNN and ResNetBlock baselines.
+Results are summarized in `experiments/conv_aml_all.json`.
+
+For current 18-Layer 3-Stage Hybrid Continual Learning architecture, refer to:
+    `train_continual_aml.py` and `mgn/blocks/hybrid_18.py`.
+=====================================================================================
 """
 
 import sys, os, json, time, argparse, warnings

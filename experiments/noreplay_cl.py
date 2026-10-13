@@ -1,25 +1,23 @@
 """
-No-replay continual learning for the AML supernet - encoder-stability research
+[PHASE 3 PILOT / ARCHIVAL EXPERIMENT]
+No-Replay Continual Learning for AML Supernet: Encoder-Stability Research
 ===============================================================================
+Historical Context & Purpose:
+This script contains the Phase 3 pilot exploration that tested weight-space
+regularization (EWC, Feature Distillation / KD, and bottom-layer parameter freezing)
+on the shared vision encoder without episodic replay buffers.
 
-Direction: turn the episodic replay buffer OFF and ask whether the shared
-vision encoder ("bo mat") can be held stable with weight-space constraints
-only, so old domains stay alive:
+Key Scientific Finding from this Pilot:
+Shared weight constraints alone cannot prevent representation drift under new domains
+(A_live forgetting remained at ~43.7% in results_noreplay_full_pilot4.json). This key
+insight motivated the architectural upgrade in Phase 4: Full Supernet Snapshotting
+combined with TaskCentroidRouter and Prototype Isolation.
 
-  naive  - no replay, no stabilizer (lower bound)
-  ewc    - online EWC, Fisher computed per task on the encoder
-  kd     - feature distillation toward a frozen teacher from task i-1 (LwF-style)
-  ewckd  - both
-  + --freeze-enc-bottom N: after task 0 freeze the encoder's first N children
-    (parameter isolation, not replay)
-
-The model class is pinned to train.py @ HEAD (c83c599) semantics -- learned
-prototype routing + z-space structure heads + two-conv executor -- because
-the working tree's train.py is mid-refactor (random frozen encoder + centroid
-ood_router) and cannot express this experiment.
-
-Primary metric is the LIVE (current weights) protocol, the standard CL
-protocol comparable to ER/EWC/DER literature. Snapshot retrieval is not used.
+Active Production Entry Point:
+For current 18-Layer 3-Stage Hybrid Continual Learning (Zero-Forgetting 99.42% with
+zero replay exemplars), use the top-level production script:
+    `train_continual_aml.py` (with `mgn/blocks/hybrid_18.py`).
+===============================================================================
 """
 
 import argparse

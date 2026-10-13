@@ -92,3 +92,9 @@ python train_continual_aml.py \
   - **Stage 3 (Layers 12–17 @ 8x8)**: Vision Transformer (72%) + ResNet (18%).
 - **Classifier Head**: Spatial $4 \times 4$ adaptive pooling (768-d) $\rightarrow$ `LayerNorm(768)` $\rightarrow$ `Dropout(0.1)` $\rightarrow$ Prototype Linear Classifier.
 - **Continual Learning Memory**: Full-state functional supernet snapshot ($\mathbf{W}_{\text{stem}}, \mathbf{W}_{\text{layers}}^{1..18}, \mathbf{W}_{\text{protos}}$) + `TaskCentroidRouter` unit hypersphere vector centroids $\mu_t \in \mathbb{R}^{512}$.
+
+---
+
+## 5. Historical Benchmarks & Pilot Logs
+
+For earlier experimental phases (Phase 1 MLP/PCA benchmarks, Phase 2 ConvAML spatial benchmarks, and Phase 3 No-Replay pilot runs with raw JSON outputs), refer to the dedicated documentation in [`experiments/README.md`](experiments/README.md).

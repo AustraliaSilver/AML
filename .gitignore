@@ -38,3 +38,8 @@ logs/
 
 # Run logs
 *.log
+
+# Scratch and contest directories
+scratch/
+contest/
+

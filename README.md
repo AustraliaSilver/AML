@@ -101,10 +101,10 @@ Dynamic block-mode probabilities indicate true per-stage specialization:
 
 ### Dual-Engine Continual Learning Benchmark: AML vs HtS
 
-Run the side-by-side benchmark comparing AML ($K=12, \text{max\_dim}=48$) and HtS Dual-Residual Hypernetwork ($K=8$, Tensor Cores WMMA) on the standard 3-task sequence (**MNIST $\rightarrow$ CIFAR-10 $\rightarrow$ Fashion-MNIST**):
+Run the side-by-side benchmark comparing AML ($K=12$, max_dim = 48) and HtS Dual-Residual Hypernetwork ($K=8$, Tensor Cores WMMA) on the standard 3-task sequence (**MNIST $\rightarrow$ CIFAR-10 $\rightarrow$ Fashion-MNIST**):
 
 ```bash
-python benchmarks/benchmark_cl_aml_vs_hts.py --epochs 1,1,1 --steps 30 --eval-cap 15
+python benchmarks/benchmark_cl_aml_vs_hts.py --epochs "1,1,1" --steps 30 --eval-cap 15
 ```
 
 Measured on **RTX 3050 Laptop GPU** (Zero-Replay setting):
@@ -253,6 +253,8 @@ python train.py --steps 4 --epochs 1  # Capped sanity run
 python train_continual_aml.py         # 3-domain continual lifelong benchmark
 python benchmarks/benchmark_cl_aml_vs_hts.py  # Side-by-side AML vs HtS continual learning benchmark
 ```
+
+For previous benchmarks (Phase 1 MLP/PCA, Phase 2 ConvAML, Phase 3 Pilot runs), see the comprehensive documentation in [`experiments/README.md`](experiments/README.md).
 
 ## 8. License
 
