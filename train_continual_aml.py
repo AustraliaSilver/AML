@@ -4,15 +4,20 @@ Continual / multi-domain benchmark for the AML supernet.
 Sequence: MNIST -> CIFAR-10 -> Fashion-MNIST (all mapped to 10 classes,
 3x32x32 inputs so the shared supernet consumes them directly).
 
-Purpose: test whether the dynamic machinery (depth gates, block modes,
-prototype routing) actually SPECIALIZES per domain when the input
-distribution shifts - the setting where per-sample/per-domain adaptive
-architecture has a reason to exist.
+Architecture:
+  - 18-Layer Hybrid Supernet (mgn/blocks/hybrid_18.py) supporting Plain CNN,
+    ResNet, and Vision Transformer (ViT) in a 3-Stage CoAtNet/MobileViT hierarchy.
+  - Full-State Supernet Snapshots preserving stem, 18 layers, layer norm, and prototypes.
+  - Zero-Replay TaskCentroidRouter tracking pristine domain feature centroids.
 
 Reports:
-  - Accuracy matrix A[i,j], BWT, Forgetting (academic CL metrics)
-  - Per-domain structure fingerprints (mean layer gates, ResNet prob,
-    pi entropy) + pairwise L1 divergence between domain fingerprints.
+  - Three distinct Continual Learning evaluation matrices:
+      * A_oracle[i, j]: Task-IL (Full 18-layer snapshot retrieval with task identity) -> Zero Forgetting (BWT = +0.00%)
+      * A_auto[i, j]  : Domain-IL / Class-IL (Autonomous routing via centroid cosine distance)
+      * A_live[i, j]  : Standard mutable network weights (comparable to ER/EWC/DER literature)
+  - Backward Transfer (BWT) and Average Forgetting metrics across all three modes.
+  - Per-domain structure fingerprints (mean layer gates, mode probabilities, pi entropy)
+    and pairwise L1 divergence between domain fingerprints.
 """
 
 import os
