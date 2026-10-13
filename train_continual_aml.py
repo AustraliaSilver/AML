@@ -206,9 +206,30 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
 # ----------------------------------------------------------------------
 # Eval: returns acc plus structure fingerprint
 # ----------------------------------------------------------------------
+def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
+                             n_domains: int, amb_topk: int) -> torch.Tensor:
+    """Which seen domains are worth re-trying for the ambiguous samples.
+
+    amb_topk = 0 keeps the original behaviour: try every seen domain, which
+    costs a full load_state_dict of enc + sel + stem + 18 layers + ln per domain
+    per batch (~1.5M parameters copied T times) for a subset that usually has a
+    clear runner-up. amb_topk = k restricts the retry to the k most likely
+    domains of each ambiguous sample.
+
+    Returns a bool tensor of shape [n_domains].
+    """
+    if amb_topk <= 0 or not bool(amb_mask.any()):
+        return torch.ones(n_domains, dtype=torch.bool, device=pd.device)
+    k = min(amb_topk, pd.shape[1])
+    topk_d = pd.topk(k, dim=-1).indices                      # [B, k]
+    allow = torch.zeros(pd.shape[0], n_domains, dtype=torch.bool, device=pd.device)
+    allow.scatter_(1, topk_d, True)
+    return allow[amb_mask].any(dim=0)
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
-             snaps=None, route_tau=None, dom_truth=None, pi_mask=None):
+             snaps=None, route_tau=None, dom_truth=None, pi_mask=None, amb_topk=0):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -217,7 +238,11 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     80.01% -> +protos 99.42%). Samples whose router margin < route_tau are
     evaluated under ALL seen snapshots and the highest-confidence prediction
     wins (open-set / ambiguous-input fallback). dom_truth (optional): true
-    domain id of the loader, for router diagnostics (fp["route_acc"])."""
+    domain id of the loader, for router diagnostics (fp["route_acc"]).
+    amb_topk: restrict the ambiguous-sample retry to the k most likely domains.
+    0 (default) keeps the original behaviour of retrying under every seen
+    snapshot, which costs a full load_state_dict of enc + sel + stem + 18
+    layers + ln per domain per batch."""
     model.eval()
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
@@ -278,9 +303,22 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             else:
                 d_pred = pred_argmax
                 if use_snaps and route_tau is not None:
-                    amb = margin < route_tau                           # ambiguous -> try all domains
+                    amb = margin < route_tau                           # ambiguous -> try several domains
             route_hist += torch.bincount(pred_argmax.clamp(max=route_hist.numel() - 1),
                                          minlength=route_hist.numel())
+            # Which snapshots are worth loading at all.
+            #
+            # Confident samples need only their predicted domain. For ambiguous
+            # ones the original code retried EVERY seen domain, which means a
+            # full load_state_dict of enc + sel + stem + 18 layers + ln per
+            # snapshot per batch -- ~1.5M parameters copied T times for a subset
+            # that usually has a clear runner-up. amb_topk > 0 restricts that
+            # retry to the k most likely domains; 0 preserves the original
+            # try-everything behaviour.
+            need_dom = ambiguous_candidate_mask(
+                pd,
+                amb if amb is not None else torch.zeros_like(d_pred, dtype=torch.bool),
+                len(snaps), amb_topk)
             g = torch.stack([slots[d]["gate"].to(device) for d in range(len(slots))])   # [T,L]
             gates_b = g[d_pred]                                                           # [B,L]
             if "bm_mode" in slots[0]:
@@ -305,7 +343,11 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             ac = dict(enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16)
             for d in range(len(snaps)):
                 idx_c = (~amb_t) & (d_pred == d)
-                if not idx_c.any() and not has_amb:
+                # Load a snapshot only if this domain actually has work: either
+                # confident samples routed to it, or (with amb_topk) it is one of
+                # the retry candidates for an ambiguous sample.
+                want_amb = has_amb and bool(need_dom[d])
+                if not idx_c.any() and not want_amb:
                     continue
                 model.vision_encoder.load_state_dict(snaps[d]["enc"])
                 model.prototype_selector.load_state_dict(snaps[d]["sel"])
@@ -334,7 +376,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                     st_bm = st.block_mode.float()
                     bm_wsum += (st_bm[:, :, 1] if st_bm.shape[-1] >= 2 else st_bm[:, :, 0]).mean(0) * idx_c.sum().item()
                     wtot += idx_c.sum().item()
-                if has_amb:
+                if want_amb:
                     with torch.amp.autocast('cuda', **ac):
                         o2, _, p2, dg2 = model(x[amb_t], tau=0.1,
                                                struct_override=(override[0][amb_t], override[1][amb_t]),
@@ -801,6 +843,11 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
 
     ce = lambda lg, tg: F.cross_entropy(lg.float(), tg, label_smoothing=0.1)
 
+    # The differentiable cost term costs 54 extra CUDA launches per forward, so
+    # it is switched on only when something actually consumes it.
+    if flops_cost > 0 and hasattr(model, 'compute_cost'):
+        model.compute_cost = True
+
     task_pi_mask = None
     if isolator is not None and hasattr(model, 'K'):
         task_pi_mask = torch.zeros(model.K, device=device, dtype=torch.bool)
@@ -1031,6 +1078,11 @@ def main():
     ap.add_argument('--ewc-lambda', type=float, default=0.0,
                     help='Elastic Weight Consolidation on the shared trunk. >0 '
                          'anchors earlier tasks without a snapshot per task.')
+    ap.add_argument('--amb-topk', type=int, default=0,
+                    help='restrict the ambiguous-sample retry (router margin < '
+                         '--route-tau) to the k most likely domains. 0 = retry '
+                         'under every seen snapshot, which loads ~1.5M params per '
+                         'domain per batch. k=2 is the usual choice.')
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
 
@@ -1217,7 +1269,7 @@ def main():
                                       slots=(slots[:i + 1] if use_route else None),
                                       snaps=(dom_snaps[:i + 1] if use_route else None),
                                       route_tau=args.route_tau, dom_truth=j,
-                                      pi_mask=pi_mask_j)
+                                      pi_mask=pi_mask_j, amb_topk=args.amb_topk)
 
             # Domain-IL (Autonomous routing via Centroid / dom_head without truth)
             acc_auto = acc_oracle
@@ -1227,7 +1279,7 @@ def main():
                                        slots=slots[:i + 1],
                                        snaps=dom_snaps[:i + 1],
                                        route_tau=args.route_tau, dom_truth=None,
-                                       pi_mask=pi_mask_j)
+                                       pi_mask=pi_mask_j, amb_topk=args.amb_topk)
 
             # Live mutable supernet
             acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j)

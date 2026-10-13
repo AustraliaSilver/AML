@@ -106,6 +106,7 @@ python train_continual_aml.py \
 | `--flops-cost` | `0.0` | Complexity term, in GFLOP/sample. ViT is the cheapest mode at 32×32 and 16×16 (tokens are pooled to 8×8), so this pushes those stages toward ViT — the opposite of "Conv at shallow layers". At 8×8 Plain is cheapest again. |
 | `--arch-prior` | `staged` | `staged` = CoAtNet-style 3-stage prior. `neutral` = small symmetric noise. Measured at a 4×60-step budget: staged 89.9 %, neutral 11.4 %. |
 | `--ewc-lambda` | `0.0` | Elastic Weight Consolidation on the shared trunk. `>0` is what lets forgetting be bounded without storing an 18-layer snapshot per task. |
+| `--amb-topk` | `0` | Restrict the ambiguous-sample retry (router margin `< --route-tau`) to the k most likely domains. `0` retries under every seen snapshot, which re-loads enc + sel + stem + 18 layers + ln (~1.5 M parameters) per domain per batch. `2` is the usual choice. |
 
 Depth telemetry is printed every epoch:
 

@@ -348,5 +348,51 @@ class TestFisherEWC(unittest.TestCase):
         self.assertLessEqual(e.state_bytes(), before + 2 * 1_500_000)
 
 
+class TestAmbiguousRetryBudget(unittest.TestCase):
+    """The ambiguous-sample retry is the real inference cost: it re-loads
+    enc + sel + stem + 18 layers + ln per domain per batch."""
+
+    def test_zero_keeps_try_every_domain(self):
+        from train_continual_aml import ambiguous_candidate_mask
+        pd = torch.tensor([[0.7, 0.2, 0.1], [0.1, 0.8, 0.1]])
+        amb = torch.tensor([True, True])
+        m = ambiguous_candidate_mask(pd, amb, 3, 0)
+        self.assertEqual(m.tolist(), [True, True, True])
+
+    def test_topk_restricts_the_retry(self):
+        from train_continual_aml import ambiguous_candidate_mask
+        pd = torch.tensor([[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.2, 0.1, 0.7]])
+        amb = torch.tensor([True, True, True])
+        m = ambiguous_candidate_mask(pd, amb, 3, 1)
+        # every sample's argmax is retained
+        self.assertEqual(m.tolist(), [True, True, True])
+        m2 = ambiguous_candidate_mask(pd, amb, 3, 2)
+        # union of top-2 across the three samples = all three domains here
+        self.assertEqual(m2.tolist(), [True, True, True])
+
+    def test_topk_actually_drops_a_domain(self):
+        from train_continual_aml import ambiguous_candidate_mask
+        pd = torch.tensor([[0.8, 0.15, 0.05], [0.85, 0.10, 0.05]])
+        amb = torch.tensor([True, True])
+        self.assertEqual(ambiguous_candidate_mask(pd, amb, 3, 1).tolist(),
+                         [True, False, False])
+        self.assertEqual(ambiguous_candidate_mask(pd, amb, 3, 2).tolist(),
+                         [True, True, False])
+
+    def test_no_ambiguous_samples_keeps_every_domain(self):
+        from train_continual_aml import ambiguous_candidate_mask
+        pd = torch.tensor([[0.8, 0.15, 0.05], [0.85, 0.10, 0.05]])
+        amb = torch.tensor([False, False])
+        self.assertEqual(ambiguous_candidate_mask(pd, amb, 3, 1).tolist(),
+                         [True, True, True])
+
+    def test_topk_larger_than_domain_count_is_clamped(self):
+        from train_continual_aml import ambiguous_candidate_mask
+        pd = torch.tensor([[0.8, 0.15, 0.05]])
+        amb = torch.tensor([True])
+        self.assertEqual(ambiguous_candidate_mask(pd, amb, 3, 99).tolist(),
+                         [True, True, True])
+
+
 if __name__ == "__main__":
     unittest.main()
