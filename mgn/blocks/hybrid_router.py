@@ -43,11 +43,17 @@ class HybridBlock(BaseDynamicBlock):
             # Default to resnet if unrouted
             return self.resnet(x, dim_mask=dim_mask)
 
-        # Optimization: If one-hot / hard routed, execute ONLY the chosen block
         if mode_weights.ndim == 2:
             mode_max, mode_idx = mode_weights.max(dim=-1)
-            # Check if all samples in batch selected the same mode (very common with domain routing)
-            if (mode_max > 0.99).all() and (mode_idx == mode_idx[0]).all():
+            # One device->host transfer serves BOTH predicates below. The previous
+            # code evaluated two separate Python `and`s, i.e. two syncs per layer.
+            _flags = torch.stack(((mode_max > 0.99).all(),
+                                  (mode_idx == mode_idx[0]).all()))
+            all_hard, same_mode = _flags.tolist()
+            del _flags
+
+            if all_hard and same_mode:
+                # Whole batch agrees: execute the single selected block once.
                 chosen = mode_idx[0].item()
                 if chosen == 0:
                     cand = self.plain(x, dim_mask=dim_mask)
@@ -58,6 +64,44 @@ class HybridBlock(BaseDynamicBlock):
                 else:
                     raise ValueError(f"Invalid mode {chosen}")
                 return cand * mode_weights[:, chosen].view(-1, 1, 1, 1)
+
+            if all_hard and not self.training:
+                # P3 - True per-sample MoE dispatch.
+                #
+                # The fall-through below would compute every active branch on the
+                # FULL batch and then mask it out, so a batch split 50/50 between
+                # Plain and ResNet pays 2 full-batch block evaluations instead of
+                # 2 half-batch ones. Dispatching on the sub-batch that actually
+                # uses each branch removes that waste.
+                #
+                # Equivalence: with one-hot mode_weights the soft mixture
+                # sum_m w_m * branch_m(x) collapses to w_argmax * branch_argmax(x),
+                # which is exactly what this computes. `all_hard` is what makes
+                # that identity hold, so the check above is load-bearing.
+                #
+                # Eval-only ON PURPOSE: `out[mask] = branch(x[mask])` removes
+                # mode_weights from the autograd graph entirely. The straight-
+                # through estimator in ConvAML_18Layer_Hybrid.forward relies on
+                # mode_weights being in the graph, otherwise the architecture
+                # parameters receive an exactly-zero gradient and the whole
+                # architecture search dies. Training keeps the differentiable
+                # mixture below.
+                out = None
+                for m, branch in enumerate((self.plain, self.resnet, self.vit)):
+                    mask = mode_idx == m
+                    if bool(mask.any()):
+                        y = branch(x[mask],
+                                   dim_mask=(dim_mask[mask] if dim_mask is not None else None))
+                        # Under autocast the branches do not all return the same
+                        # dtype (conv -> bf16, LayerNorm/GELU -> fp32), so the
+                        # buffer dtype has to follow the promoted result or
+                        # index_put_ raises a dtype mismatch.
+                        if out is None:
+                            out = torch.empty(x.shape, dtype=y.dtype, device=x.device)
+                        out[mask] = y
+                if out is None:                      # no sample matched (impossible)
+                    out = torch.empty_like(x)
+                return out
 
 
         # Soft continuous mixture for differentiable architecture search (DARTS)
