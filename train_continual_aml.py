@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
+from typing import Dict
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
@@ -607,6 +608,117 @@ class ProtoIsolator:
                 item['param'].data.copy_(torch.where(item['mask'] > 0, item['param'].data, item['snap']))
 
 
+class FisherEWC:
+    """Elastic Weight Consolidation over the shared trunk.
+
+    Motivation: the previous stability mechanism was L2-SP anchored on
+    (vision_encoder, prototype_selector) only, and shipped DISABLED
+    (--anchor-lam defaults to 0.0), so A_live collapsed across tasks
+    (98.05% -> 3.52% -> 28.99%). The alternative of storing a full 18-layer
+    snapshot per task is what this class exists to make unnecessary: EWC needs
+    one diagonal Fisher vector (one scalar per weight) plus the parameter value
+    at the end of each task, i.e. ~1.47M floats, shared across all tasks.
+
+        L_total = CE + (lambda/2) * sum_i F_i * (theta_i - theta*_i)^2
+
+    F is accumulated online as an *unbiased running mean of squared gradients*
+    over post-task batches, which is the standard diagonal-Fisher estimate and
+    needs no separate backward pass.
+    """
+
+    def __init__(self, model, ewc_lambda: float = 0.0):
+        self.model = model
+        self.lambda_ = ewc_lambda
+        self.enabled = ewc_lambda > 0.0
+        self._fisher: Dict[str, torch.Tensor] = {}   # within-task accumulator
+        self._fisher_all: Dict[str, torch.Tensor] = {}   # across ALL tasks
+        self._star: Dict[str, torch.Tensor] = {}
+        self._n = 0
+
+    @staticmethod
+    def _shared_trunk(model) -> Dict[str, torch.nn.Parameter]:
+        """Parameters shared by every task and therefore subject to drift."""
+        out = {}
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            # architecture prototypes are handled by ProtoIsolator, prototypes
+            # by per-task rows, and the domain router lives outside the model.
+            if any(k in n for k in ("structure_prototypes", "block_mode_prototypes",
+                                    "mode_prototypes", "proto_weights")):
+                continue
+            out[n] = p
+        return out
+
+    def penalty(self) -> torch.Tensor:
+        # Guard on _fisher_all (the across-task accumulator), NOT _fisher (the
+        # within-task one, which consolidate() resets). Guarding on the latter
+        # made the penalty identically zero for every task after the first.
+        if not self.enabled or not self._fisher_all or not self._star:
+            return torch.zeros((), device=next(self.model.parameters()).device)
+        total = None
+        params = dict(self.model.named_parameters())
+        for n, f in self._fisher_all.items():
+            p = params.get(n)
+            if p is None:
+                continue
+            d = (p - self._star[n]) ** 2 * f
+            total = d.sum() if total is None else total + d.sum()
+        if total is None:
+            dev = next(self.model.parameters()).device
+            return torch.zeros((), device=dev)
+        return 0.5 * self.lambda_ * total
+
+    @torch.no_grad()
+    def observe_batch(self) -> None:
+        """Accumulate squared gradients from the gradients already on the params.
+
+        Must be called after GradScaler.unscale_() and BEFORE
+        clip_grad_norm_(), otherwise the statistics carry the loss scale (or a
+        norm rescale) and the Fisher is off by a constant factor.
+        Reading .grad rather than calling autograd.grad again avoids an extra
+        backward pass per step and keeps the main graph untouched.
+        """
+        if not self.enabled:
+            return
+        for n, p in self._shared_trunk(self.model).items():
+            g = p.grad
+            if g is None:
+                continue
+            sq = g.detach().float() ** 2
+            prev = self._fisher.get(n)
+            self._fisher[n] = sq if prev is None else prev + sq
+        self._n += 1
+
+    @torch.no_grad()
+    def consolidate(self) -> None:
+        """Close the task window: average this task's Fisher, fold it into the
+        running across-task Fisher, and re-pin theta*.
+
+        The across-task accumulator is what penalty() reads. Folding into it
+        rather than replacing it matters: replacing made the penalty drop back
+        to exactly zero for every task after the first, i.e. EWC would have
+        silently done nothing. theta* is pinned to the MOST RECENT task
+        (sequential EWC) rather than to a per-task copy, which is what keeps
+        the stored state at one vector instead of one per task.
+        """
+        if not self.enabled or self._n == 0:
+            return
+        inv = 1.0 / float(self._n)
+        for n, f in self._fisher.items():
+            f.mul_(inv)
+            prev = self._fisher_all.get(n)
+            self._fisher_all[n] = f if prev is None else prev + f
+        params = dict(self.model.named_parameters())
+        self._star = {n: params[n].detach().clone() for n in self._fisher_all}
+        self._fisher = {}
+        self._n = 0
+
+    def state_bytes(self) -> int:
+        return sum(v.numel() for v in self._fisher_all.values()) + \
+            sum(v.numel() for v in self._star.values())
+
+
 def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-4,
                 isolator: ProtoIsolator = None, dom_head=None):
     """Low-LR pass over the pure replay set after each task: rebalances the
@@ -663,7 +775,8 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
 def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                scaler=None, w_pi_final=0.0, log_prefix="", replay: ReplayBuffer = None,
                isolator: ProtoIsolator = None, dom_head=None, task_idx=0,
-               anchor=None, anchor_lam=1e-3, aug="basic", workers=2, steps=0):
+               anchor=None, anchor_lam=1e-3, aug="basic", workers=2, steps=0,
+               arch_lr=3e-3, depth_cost=0.0, flops_cost=0.0, depth_target=0.0, ewc=None):
     trainloader, _ = get_task_data(name, os.path.join(_ROOT, "data"), workers=workers, aug=aug)
     _, testloader = get_task_data(name, os.path.join(_ROOT, "data"), workers=workers)
 
@@ -672,7 +785,13 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
     other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names) and p.requires_grad]
 
     opt = optim.AdamW(other_params, lr=1e-3, weight_decay=1e-4)
-    opt_arch = optim.AdamW(arch_params, lr=2e-4, weight_decay=1e-4)
+    # arch_lr: AdamW's step size is ~lr regardless of gradient magnitude, so the
+    # architecture logits can travel at most lr * n_steps. At the previous 2e-4 a
+    # whole 585-step task could move structure_prototypes by ~0.12, while flipping
+    # sigmoid(delta + 2.0) past the 0.5 gate needs |delta| ~ 2.0. The depth gates
+    # were therefore mathematically unable to close, and the FLOPs short-circuit
+    # had nothing to short-circuit. 3e-3 gives ~1.75 of travel per task.
+    opt_arch = optim.AdamW(arch_params, lr=arch_lr, weight_decay=1e-4)
     sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     sch_arch = optim.lr_scheduler.CosineAnnealingLR(opt_arch, T_max=epochs)
 
@@ -748,10 +867,34 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                         dom_logits = dom_head(z_norm)
                         loss = loss + 0.3 * F.cross_entropy(dom_logits[:, :task_idx + 1], task_lbl)
 
+                # Dynamic-depth sparsity: pushes gates closed. With depth_target>0
+                # this is a hinge, so it can prune *at most* (1-target) of the
+                # capacity and can never collapse the trunk to zero gates no
+                # matter how large the coefficient is.
+                if depth_cost > 0 and "layer_soft" in diag:
+                    ls = diag["layer_soft"].float()
+                    if depth_target > 0:
+                        pen = torch.relu(ls.mean() - depth_target)
+                    else:
+                        pen = ls.mean()
+                    loss = loss + depth_cost * pen
+
+                # Complexity regularisation on the chosen candidate block per
+                # layer. The model reports this in GFLOP/sample, so an
+                # O(0.01-1) coefficient is a gentle nudge rather than something
+                # that swamps the cross-entropy.
+                if flops_cost > 0 and "expected_gflops" in diag:
+                    loss = loss + flops_cost * diag["expected_gflops"].float()
+
                 # L2-SP anchor on shared encoder/router
                 if anchor_pairs is not None:
                     l2sp = sum((p - a).square().sum() for p, a in anchor_pairs)
                     loss = loss + anchor_lam * l2sp
+
+                # Elastic Weight Consolidation on the shared trunk: quadratic
+                # anchor weighted by the diagonal Fisher of the tasks seen so far.
+                if ewc is not None and ewc.enabled and ewc._fisher_all:
+                    loss = loss + ewc.penalty()
 
             if not torch.isfinite(loss):
                 continue
@@ -761,6 +904,8 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 scaler.unscale_(opt)
                 if not freeze:
                     scaler.unscale_(opt_arch)
+                if ewc is not None:
+                    ewc.observe_batch()
                 if isolator is not None:
                     isolator.mask_grad()
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
@@ -772,6 +917,8 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 scaler.update()
             else:
                 loss.backward()
+                if ewc is not None:
+                    ewc.observe_batch()
                 if isolator is not None:
                     isolator.mask_grad()
                 torch.nn.utils.clip_grad_norm_(other_params, 5.0)
@@ -803,8 +950,15 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             with torch.no_grad():
                 p_modes = torch.softmax(model.block_mode_prototypes, dim=-1).mean(dim=(0, 1))
                 mode_str = f" | [Plain: {p_modes[0]*100:.0f}%, ResNet: {p_modes[1]*100:.0f}%, ViT: {p_modes[2]*100:.0f}%]"
+        # Depth + cost telemetry: the whole point of P2 is that this number drops.
+        with torch.no_grad():
+            _ls = diag["layer_soft"].float()
+            depth_str = f" | [active L: {( _ls > 0.5).float().sum(1).mean():.2f}/18"
+            if "expected_mflops" in diag:
+                depth_str += f", {diag['expected_mflops'].float():.1f} MFLOP/s"
+            depth_str += "]"
         print(f"  {log_prefix}ep {epoch+1}/{epochs} | {time.time()-t0:5.1f}s | "
-              f"loss {avg_loss:.4f} | {name} acc {acc*100:.2f}%{mode_str}"
+              f"loss {avg_loss:.4f} | {name} acc {acc*100:.2f}%{mode_str}{depth_str}"
               f"{' [frozen]' if freeze else ''}", flush=True)
 
 
@@ -845,6 +999,38 @@ def main():
                     help='L2-SP encoder anchoring strength; >0 slows feature '
                          'drift BUT collapses per-domain specialization '
                          '(fingerprints converged to near-identical in v5)')
+    ap.add_argument('--arch-prior', type=str, default='staged',
+                    choices=['neutral', 'staged'],
+                    help='block_mode_prototypes init. staged (default) = the '
+                         'CoAtNet-style 3-stage prior. neutral = small symmetric '
+                         'noise, no hand-set hierarchy. Measured on MNIST at a '
+                         '4x60-step budget: staged reaches 89.9%, neutral stalls '
+                         'at 11.4%. Reason: with near-zero logits, '
+                         'gumbel_softmax(tau=0.8) is noise-dominated, so every '
+                         'layer switches branch almost every step and the trunk '
+                         'never co-adapts. Exact zeros are worse still - argmax '
+                         'breaks the tie to index 0 and pins all 18 layers to '
+                         'PlainConv. See experiments/dynamic_depth_routing_*.md')
+    ap.add_argument('--arch-lr', type=float, default=3e-3,
+                    help='LR for the architecture prototypes. AdamW travels ~lr '
+                         'per step, so this is the per-task budget for how far the '
+                         'gates can move; 2e-4 could not reach the 0.5 gate.')
+    ap.add_argument('--depth-cost', type=float, default=0.02,
+                    help='sparsity penalty on the depth gates. >0 is what makes '
+                         'layers actually prune so the P2 short-circuit can fire.')
+    ap.add_argument('--depth-target', type=float, default=0.0,
+                    help='if >0 the depth penalty becomes a hinge '
+                         'relu(mean-gate - target): prunes at most (1-target) and '
+                         'can never collapse the trunk whatever --depth-cost is.')
+    ap.add_argument('--flops-cost', type=float, default=0.0,
+                    help='complexity regularisation weight, GFLOP/sample. 0 = off. '
+                         'With the 8x8 token cap, ViT is the cheapest mode at 32x32 '
+                         'and 16x16, so this pushes THOSE STAGES toward ViT - the '
+                         'opposite of "Conv at shallow layers". At 8x8 Plain is '
+                         'cheapest again.')
+    ap.add_argument('--ewc-lambda', type=float, default=0.0,
+                    help='Elastic Weight Consolidation on the shared trunk. >0 '
+                         'anchors earlier tasks without a snapshot per task.')
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
 
@@ -865,7 +1051,8 @@ def main():
         print("[*] Initializing 18-Layer Hybrid AML Supernet (Plain CNN + ResNet + ViT)...")
         model = ConvAML_18Layer_Hybrid(
             K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=10,
-            norm_type=('bn' if args.norm == 'bn' else 'gn')
+            norm_type=('bn' if args.norm == 'bn' else 'gn'),
+            arch_prior=args.arch_prior
         ).to(device)
     else:
         print(f"[*] Initializing Legacy ConvAML_CIFAR_TrueDynamic (norm={args.norm})...")
@@ -889,6 +1076,12 @@ def main():
     slots = [None] * T          # per-domain structure slots
     dom_snaps = [None] * T      # per-domain frozen (encoder, selector) snapshots
     anchor_snap = None          # L2-SP snapshot of shared encoder/router
+    ewc = FisherEWC(model, args.ewc_lambda)
+    if ewc.enabled:
+        n_shared = sum(p.numel() for p in ewc._shared_trunk(model).values())
+        print(f"[*] EWC enabled (lambda={args.ewc_lambda}): anchoring {n_shared/1e6:.2f}M "
+              f"shared weights - one Fisher vector for ALL tasks, no per-task "
+              f"18-layer snapshot needed")
 
     for i, name in enumerate(tasks):
         print(f"\n===== TASK {i+1}/{T}: {name} =====", flush=True)
@@ -913,12 +1106,24 @@ def main():
                    task_idx=i,
                    anchor=(anchor_snap if args.anchor_lam > 0 else None),
                    anchor_lam=args.anchor_lam,
+                   arch_lr=args.arch_lr,
+                   depth_cost=args.depth_cost,
+                   flops_cost=args.flops_cost,
+                   depth_target=args.depth_target,
+                   ewc=ewc,
                    aug=args.aug,
                    workers=args.workers,
                    steps=args.steps)
 
         # Freeze this domain's structure into its slot & pristine router centroid
         _, el_self = get_task_data(name, os.path.join(_ROOT, "data"))
+
+        # Close the EWC task window: average the Fisher over this task and pin
+        # theta*, so the NEXT task is quadratically anchored to this solution.
+        if ewc.enabled:
+            ewc.consolidate()
+            print(f"  [ewc] consolidated Fisher over task {i+1}: "
+                  f"{ewc.state_bytes()/1e6:.2f}M values stored for all tasks so far")
 
         # Finalize domain centroid router for this task
         if isinstance(dom_head, TaskCentroidRouter):
