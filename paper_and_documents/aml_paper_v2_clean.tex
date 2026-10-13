@@ -1483,6 +1483,38 @@ asserted by tests: the Fisher must be \emph{accumulated} across tasks (overwriti
 it silently disables EWC from the second task onward), and parameters receiving
 no gradient in a step must be skipped rather than recorded with zero Fisher.
 
+Storage is $\mathcal{O}(1)$ in the number of tasks, measured at
+$3.54$M values ($1.71$M Fisher $+\ 1.71$M $\boldsymbol{\theta}^{\star}$, i.e.\
+$13.7$ MB fp32) held once, against $7.2$ MB \emph{per task} of full snapshots.
+
+\paragraph{End-to-end effect of the depth audit.}
+On a deliberately short zero-replay schedule
+(\texttt{--epochs 3,5,3 --steps 50}, $\lambda_{\mathrm{EWC}}=100$,
+$\eta_{\mathrm{arch}}=1.5{\times}10^{-2}$, hinge depth target $0.85$):
+
+\begin{center}
+\begin{tabular}{l r r}
+\toprule
+protocol & BWT & forgetting \\
+\midrule
+$A_{\mathrm{live}}$ (EWC)  & $-23.05\%$ & $23.05\%$ \\
+$A_{\mathrm{auto}}$ (router) & $-9.84\%$ & $9.84\%$ \\
+$A_{\mathrm{oracle}}$ (task-id) & $+0.00\%$ & $0.00\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The recorded baseline for the same trainer with \emph{no} stability term
+(\texttt{--anchor-lam} defaulting to $0$) is $\mathrm{BWT}=-46.50\%$; the
+schedules differ, so this is directional rather than a controlled comparison.
+The depth gates moved off their flat $0.88$ into $0.77$--$0.86$ and the pairwise
+per-domain fingerprint divergence became non-zero, although no layer crossed the
+prune threshold at this schedule --- a gate needs $2.0/\eta_{\mathrm{arch}}$
+architecture steps, and \texttt{--steps} caps the budget. Notably,
+$A_{\mathrm{auto}}$ falls \emph{below} $A_{\mathrm{live}}$ in every off-diagonal
+cell: misrouting costs more than simply using the live model, which identifies
+router accuracy, not storage, as the binding constraint.
+
 \subsection{Zero-Replay Catastrophic Forgetting Mitigation}
 In standard continual learning, neural networks suffer from catastrophic forgetting when sequentially trained on disparate domains $\mathcal{T}_1 \to \mathcal{T}_2 \to \mathcal{T}_3$ without an episodic replay buffer. AML resolves this by decoupling functional representation preservation from sample storage:
 

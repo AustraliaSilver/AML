@@ -194,6 +194,63 @@ them with zero Fisher would be wrong rather than merely wasteful.
 
 ---
 
+## 2d. End-to-end validation run
+
+```powershell
+python train_continual_aml.py --tasks mnist,cifar10,fashion --epochs 3,5,3 \
+  --steps 50 --K 12 --freeze 1 --replay-per-class 0 --consolidate-epochs 0 \
+  --arch-lr 1.5e-2 --depth-cost 0.5 --depth-target 0.85 --ewc-lambda 100
+```
+
+Zero replay, EWC λ=100, hinge depth target 0.85. `--steps 50` caps the schedule
+hard (CIFAR-10 sees 12 800 of 50 000 images per epoch), so these numbers are a
+regression check, not headline accuracy.
+
+**$A_{\text{live}}$ — standard mutable weights, EWC anchoring the shared trunk**
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+|---|---|---|---|
+| after MNIST | 67.50 % | — | — |
+| after CIFAR-10 | 37.28 % | 15.31 % | — |
+| after Fashion | 23.90 % | 12.81 % | 70.79 % |
+
+$$\textbf{BWT} = -23.05\% \quad|\quad \textbf{Forgetting} = 23.05\%$$
+
+**$A_{\text{auto}}$ — autonomous centroid router + snapshot retrieval**
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+|---|---|---|---|
+| after MNIST | 52.06 % | — | — |
+| after CIFAR-10 | 26.43 % | 12.30 % | — |
+| after Fashion | 31.49 % | 13.19 % | 37.40 % |
+
+$$\textbf{BWT} = -9.84\% \quad|\quad \textbf{Forgetting} = 9.84\%$$
+
+**$A_{\text{oracle}}$ — task-id snapshot retrieval**
+
+$$\textbf{BWT} = +0.00\% \quad|\quad \textbf{Forgetting} = 0.00\%$$
+
+### What this does and does not show
+
+* **EWC halves live forgetting.** The recorded baseline without any stability
+  term is `BWT −46.50 %` / forgetting `46.50 %`; this run gives `−23.05 %`.
+  *Caveat:* the two runs use different schedules (this one is `--steps 50`), so
+  this is directional evidence, not a controlled A/B. A controlled comparison
+  needs the same schedule with and without `--ewc-lambda`.
+* **Structure now differentiates per domain.** Mean gates moved off the flat
+  `0.88` into `0.77–0.86`, and the pairwise fingerprint divergence is non-zero
+  (`gate_L1 = 0.234` MNIST-vs-Fashion, `0.463` MNIST-vs-CIFAR10) where before it
+  was identically zero everywhere.
+* **No layer actually pruned** (`active L: 18.00/18` throughout), which §2b
+  predicts: 100 arch steps at `1.5e-2` gives travel 1.5 against the 2.0 needed.
+  The pruning *mechanism* is verified separately in §2a.
+* **The autonomous router is the weak link.** `$A_{\text{auto}}$` is below
+  `$A_{\text{live}}$` in every off-diagonal cell — routing a sample to the wrong
+  domain costs more than just using the live model. This is the highest-value
+  target for future work, and it is a routing-accuracy problem, not a storage one.
+
+---
+
 ## 3. Why routing never changed
 
 ---

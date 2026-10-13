@@ -148,6 +148,32 @@ The curve is non-linear because early layers dominate wall-clock, and per-sample
 skipping is nearly worthless (1.04×) since the block still runs for the open half
 of the batch.
 
+#### Measured end-to-end effect on forgetting
+
+Zero-replay run with `--ewc-lambda 100 --arch-lr 1.5e-2 --depth-cost 0.5
+--depth-target 0.85`, `--epochs 3,5,3 --steps 50` (a deliberately short schedule,
+so treat this as a regression check rather than headline accuracy):
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+| :--- | :---: | :---: | :---: |
+| after MNIST | 67.50% | — | — |
+| after CIFAR-10 | 37.28% | 15.31% | — |
+| after Fashion | 23.90% | 12.81% | 70.79% |
+
+$$A_{\text{live}}\ \textbf{BWT} = -23.05\% \quad|\quad \textbf{Forgetting} = 23.05\%$$
+
+against a recorded `-46.50 %` for the same trainer with **no** stability term
+(`--anchor-lam` shipped disabled). The schedules differ, so this is directional
+evidence, not a controlled A/B. Under the autonomous router, forgetting is
+`9.84 %`; under task-oracle snapshot retrieval it is `0.00 %`.
+
+The depth gates moved off their flat `0.88` into `0.77–0.86` and the per-domain
+fingerprint divergence became non-zero (`gate_L1` 0.23–0.46, previously 0.00),
+but no layer crossed the prune threshold at this schedule — `--steps` caps the
+budget, and a gate needs `2.0/arch_lr` arch-trained steps (see the investigation
+log §2b). No layer pruned in this run; the pruning mechanism itself is verified
+directly by driving the gates and measuring latency.
+
 Three corrections to the original proposals are recorded in full, with
 measurements, in the investigation log:
 
