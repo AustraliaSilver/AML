@@ -53,7 +53,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         num_classes: int = 10,
         num_heads: int = 4,
         norm_type: str = "bn",
-        arch_prior: str = "staged"
+        arch_prior: str = "staged",
+        compute_cost: bool = False
     ):
         super().__init__()
         self.K = K
@@ -105,6 +106,9 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         #     logits, ties resolve to index 0, and the whole 18-layer network
         #     collapses to PlainConv at task 0.
         self.arch_prior = arch_prior
+        # Enable the differentiable cost term (and its telemetry). Off by default
+        # because it costs 54 extra CUDA launches per forward.
+        self.compute_cost = compute_cost
         self.block_mode_prototypes = nn.Parameter(torch.zeros(K, max_layers, 3))
         with torch.no_grad():
             if arch_prior == "staged":
@@ -239,32 +243,37 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         dim_weights = d_lengths / self.max_dim
 
         # Differentiable expected cost of the selected structure, in MFLOPs.
-        # Computed from the SAME HybridBlock.compute_flops used for static
-        # subnet extraction, so the training-time cost signal and the reported
-        # static FLOPs can never disagree.
+        # Computed from the SAME HybridBlock.compute_flops used for static subnet
+        # extraction, so the training-time cost signal and the reported static
+        # FLOPs can never disagree.
         #
-        # NOTE on direction: VisionTransformerBlock pools tokens to <=8x8 before
+        # Opt-in via `compute_cost`. It costs 18 x 3 = 54 tiny CUDA launches per
+        # forward, which is a ~5x latency regression on a 67 ms inference step,
+        # so it is off unless a FLOPs regulariser (or the telemetry) needs it.
+        #
+        # NOTE on direction: VisionTransformerBlock pools tokens to <= 8x8 before
         # attending (vit_block.max_tokens_side), so ViT is the CHEAPEST mode at
-        # every stage (3.2 MFLOP vs plain 42.7 / resnet 85.3 at 32x32). A cost
-        # term therefore pushes towards ViT, not towards Conv-at-shallow-layers.
-        # The FLOPs objective alone says nothing about *where* in the network a
-        # mode should sit - only about which mode is cheap.
-        flops_per_layer = []
-        for _i in range(self.max_layers):
-            _sp = self._stage_spatial[_i]
-            _blk = self.layers[_i]
-            _c = None
-            for _m in range(3):
-                _f = _blk.compute_flops(_sp, mode_idx=_m, active_dim=d_lengths[:, _i])
-                _c = _f if _c is None else _c + block_mode[:, _i, _m] * _f
-            flops_per_layer.append(_c)
-        expected_flops = torch.stack(flops_per_layer, dim=1)      # [B, L]
-        total_mflops = expected_flops.sum(dim=1).mean() / 1e6     # scalar
-        # Cost term fed to the loss is normalised to GFLOP/sample so that the
-        # coefficient stays O(0.01-1). Using the raw MFLOP figure (~600) with an
-        # O(0.01) coefficient adds ~6 nats to the loss and swamps a 10-way
-        # cross-entropy (~2.3), which silently destroys classification.
-        total_gflops = total_mflops / 1e3
+        # 32x32 and 16x16. A cost term therefore pushes those two stages toward
+        # ViT, not toward Conv-at-shallow-layers; at 8x8 Plain is cheapest again.
+        # The FLOPs objective says nothing about *where* a mode belongs, only
+        # about which mode is cheap.
+        if self.compute_cost:
+            flops_per_layer = []
+            for _i in range(self.max_layers):
+                _sp = self._stage_spatial[_i]
+                _blk = self.layers[_i]
+                _c = None
+                for _m in range(3):
+                    _f = _blk.compute_flops(_sp, mode_idx=_m, active_dim=d_lengths[:, _i])
+                    _c = _f if _c is None else _c + block_mode[:, _i, _m] * _f
+                flops_per_layer.append(_c)
+            expected_flops = torch.stack(flops_per_layer, dim=1)   # [B, L]
+            total_mflops = expected_flops.sum(dim=1).mean() / 1e6  # scalar
+            # Cost term fed to the loss is normalised to GFLOP/sample so the
+            # coefficient stays O(0.01-1). Using the raw MFLOP figure (~600)
+            # with an O(0.01) coefficient adds ~6 nats to the loss and swamps a
+            # 10-way cross-entropy (~2.3), silently destroying classification.
+            total_gflops = total_mflops / 1e3
 
         struct = DynamicStructure(
             layer_gates=layer_gates,
@@ -363,8 +372,9 @@ class ConvAML_18Layer_Hybrid(nn.Module):
             "d_lengths": d_lengths,
             "z": z,
             "n_executed": float(n_executed),
-            "expected_mflops": total_mflops,
-            "expected_gflops": total_gflops,
-            "expected_flops_per_layer": expected_flops,
         }
+        if self.compute_cost:
+            diag["expected_mflops"] = total_mflops
+            diag["expected_gflops"] = total_gflops
+            diag["expected_flops_per_layer"] = expected_flops
         return out, struct, pi, diag

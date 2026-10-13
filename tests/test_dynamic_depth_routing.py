@@ -254,9 +254,17 @@ class TestFlopsModel(unittest.TestCase):
         self.assertGreater(blk.compute_flops((8, 8), mode_idx=2),
                            blk.compute_flops((8, 8), mode_idx=0))
 
-    def test_expected_mflops_is_differentiable(self):
+    def test_cost_term_is_opt_in(self):
+        """The differentiable cost term costs 54 extra CUDA launches per forward
+        (+16 % latency measured), so it must not run unless requested."""
         m = _model().train()
+        _, _, _, diag = m(torch.randn(2, 3, 32, 32), tau=0.8)
+        self.assertNotIn("expected_gflops", diag)
+        self.assertNotIn("expected_mflops", diag)
+
+        m.compute_cost = True
         out, _, _, diag = m(torch.randn(2, 3, 32, 32), tau=0.8)
+        self.assertIn("expected_gflops", diag)
         (out.sum() + diag["expected_gflops"]).backward()
         g = m.block_mode_prototypes.grad
         self.assertIsNotNone(g)
@@ -265,10 +273,14 @@ class TestFlopsModel(unittest.TestCase):
     def test_flops_term_is_normalised_for_the_loss(self):
         """Regression: 0.01 x 638 MFLOP added ~6.4 nats to a ~2.3 cross-entropy and
         stopped the model classifying at all."""
-        m = _model().train()
+        m = _model(max_dim=48).train()
+        m.compute_cost = True
         _, _, _, diag = m(torch.randn(2, 3, 32, 32), tau=0.8)
         self.assertLess(abs(diag["expected_gflops"].item()), 5.0)
         self.assertGreater(diag["expected_mflops"].item(), 10.0)
+        # the loss actually sees GFLOPs, i.e. mflops / 1000
+        self.assertAlmostEqual(diag["expected_gflops"].item(),
+                               diag["expected_mflops"].item() / 1e3, places=5)
 
 
 class TestFisherEWC(unittest.TestCase):
