@@ -1340,54 +1340,6 @@ As shown in Figure~\ref{fig:ablation_grad}, the Hard Step penalty causes immedia
 We varied the steepness $\beta \in \{5, 10, 20, 40\}$ and penalty strength $\lambda \in \{0.5, 1.0, 2.0, 4.0\}$. We found that $\beta=20$ and $\lambda=2$ provides the optimal balance. If $\beta$ is too small ($\beta=5$), the penalty encroaches too far into the valid budget region ($r < 1$), artificially penalizing architectures that are safely under budget. If $\lambda$ is too high ($\lambda=4$), the gradients aggressively prune the network before the weights can properly learn the data distribution, leading to premature convergence to random guessing models.
 
 
-\section{Application: Minecraft Autonomous Agent via AML and HtS Memory}
-%======================================================================
-To validate the practical scalability, real-time inference latency, and temporal adaptability of Architecture Mode Learning (AML), we engineered a fully autonomous embodied agent for the 3D voxel environment, Minecraft. This application rigorously tests the synthesis of continuous high-frequency telemetry streams, dynamic neural routing, and physical action execution outside of sanitized sandbox environments (e.g., OpenAI Gym).
-
-\subsection{The Embodied Agent Challenge: Beyond Pixel-level Processing}
-Traditional reinforcement learning approaches to Minecraft (e.g., MineRL) rely heavily on Convolutional Neural Networks (CNNs) processing raw pixel data. This approach is notoriously sample-inefficient, requiring millions of frames and extensive GPU clusters to achieve rudimentary spatial awareness. Furthermore, pixel processing induces significant inference latency, bottlenecking the agent's reaction time. 
-
-To circumvent this, we designed a direct telemetry extraction pipeline that accesses the underlying geometric and semantic game state in zero-copy memory. Our agent utilizes a lightweight, high-fidelity internal state vector, allowing the neural routing algorithm to focus entirely on behavioral logic rather than computer vision feature extraction.
-
-\subsection{High-Fidelity Asynchronous Telemetry Pipeline}
-The system is bifurcated into a high-frequency telemetry exporter (implemented as a Java/Fabric Mod) and an asynchronous Python-based neural executor. 
-
-\paragraph{Java Telemetry Injection.} We hooked directly into the Minecraft client's \texttt{HudRenderCallback} to extract the environmental state at the maximum engine framerate (up to 144 Hz). A critical challenge in standard Minecraft telemetry is the inability of default raycasting to detect non-solid fluids, leading to semantic blindness when the agent faces water or lava. We resolved this by overriding the \texttt{RaycastContext} with \texttt{FluidHandling.ANY}, explicitly intersecting fluid hitboxes. The extracted state is serialized into a highly compressed JSON payload and broadcasted via an asynchronous UDP socket (Port 9090) to strictly minimize Inter-Process Communication (IPC) latency.
-
-The instantaneous state vector $S_t \in \mathbb{R}^9$ consists of:
-\begin{itemize}
-    \item \textbf{Vital metrics:} Health Points (\texttt{hp}), Hunger (\texttt{food}), Experience (\texttt{xp\_lvl}).
-    \item \textbf{Kinematics:} Euler angles (\texttt{pitch}, \texttt{yaw}) to represent 3D orientation.
-    \item \textbf{Physics State:} Boolean flags mapped to floats for \texttt{sprint}, \texttt{sneak}, and \texttt{ground} contact, crucial for detecting fall trajectories.
-    \item \textbf{Semantic Raycast Target:} A mapped float representing the entity directly in the crosshair (\texttt{MISS=0, BLOCK=1, WATER=2, LAVA=3, ENTITY=4}).
-\end{itemize}
-
-\subsection{Overcoming Temporal Myopia: History-to-State (HtS) Memory}
-A fundamental limitation of evaluating instantaneous states $S_t$ independently is the total loss of temporal context. An agent observing a static frame cannot distinguish whether it is walking forward, falling off a cliff, or stationary. Traditional solutions rely on Recurrent Neural Networks (LSTMs or GRUs), which introduce steep training overhead, vanishing gradients, and complicate the continuous routing space of AML.
-
-To resolve this while preserving a feed-forward architecture, we introduced the \textbf{History-to-State (HtS) Memory} mechanism. We maintain a sliding window buffer $B = \{S_{t-N+1}, \dots, S_t\}$ of size $N=10$ frames (representing roughly 0.5 seconds of execution time at a stable 20 Ticks-Per-Second). The buffer is flattened into a continuous spatial-temporal vector $X_t \in \mathbb{R}^{90}$:
-\begin{equation}
-    X_t = \text{Flatten}\Big(\bigoplus_{i=0}^{N-1} S_{t-i}\Big)
-\end{equation}
-This formulation allows the downstream Multi-Layer Perceptron (MLP) within the AML framework to implicitly derive first-order (velocity) and second-order (acceleration) temporal derivatives. By feeding $X_t$ directly into the ModelGenerator, the AML Supernet can dynamically route computational paths based not just on static spatial complexity, but on temporal inertia.
-
-\subsection{Experimental Results and The Cardinality Paradox}
-To systematically evaluate the learning trajectory of the embodied agent, we conducted a staged data collection and training protocol. 
-
-\paragraph{Experiment 1: Proof of Concept.} We initialized the model with a severely data-starved dataset of $N=789$ frames (approx. 40 seconds of gameplay). The human demonstrator executed 122 unique action combinations (classes). The model converged in 0.70 seconds, achieving a baseline accuracy of \textbf{22.6\%}. While mathematically better than random chance, the agent exhibited erratic behavior in-game due to catastrophic overfitting.
-
-\paragraph{Experiment 2: Scaling Data.} We expanded the dataset to $N=2,940$ frames (230 unique classes). The accuracy surged to \textbf{35.7\%}, and the agent demonstrated nascent awareness of its environment (e.g., initiating jumps when approaching blocks).
-
-\paragraph{Experiment 3: The Cardinality Paradox.} Scaling the dataset further to $N=5,738$ frames resulted in an unexpected drop in accuracy to \textbf{33.2\%}. Analysis revealed that the human demonstrator had executed highly complex macro maneuvers (e.g., \texttt{Ctrl+W+Space+LeftClick}), expanding the target space to 328 unique classes. This triggered the Cardinality Paradox: the difficulty of the classification task (328 discrete logits) outpaced the information gain from the linear increase in data samples, resulting in heightened cross-entropy loss ($2.4410$).
-
-\paragraph{Experiment 4: HtS Memory Ablation Breakthrough.} We applied our proposed HtS Memory ($N=10$) on the exact same dataset of $5,738$ frames and 328 classes. Without adding a single new data point, the model's accuracy immediately rebounded to \textbf{37.8\%}. This empirical result conclusively proves that the static frame assumption was an informational bottleneck. The $90$-dimensional temporal vector provided the necessary kinematic context for the AML architecture to resolve ambiguous states that previously confused the static model.
-
-\subsection{Real-time Neural Routing and Execution Engine}
-During inference, the continuous UDP telemetry stream is ingested by the Python daemon. The flattened temporal vector $X_t$ is passed through the AML TaskNetwork. The output is a highly dimensional, sparse categorical distribution over the Action Map. 
-
-The argmax of this distribution is immediately compiled into operating-system-level physical macro execution via the \texttt{pynput} library. The system natively handles complex modifier encodings (e.g., the ASCII control character \texttt{\textbackslash x17} generated by pressing \texttt{Ctrl+W}). The entire pipeline---from Java telemetry extraction to neural prediction and physical key execution---resolves in under 50 milliseconds. This ultra-low latency, combined with the dynamic routing of AML and the temporal awareness of HtS Memory, enables fluid, human-like autonomous gameplay.
-
-
 %======================================================================
 \section{18-Layer Hybrid Supernet and Zero-Replay Continual Learning}
 \label{sec:continual_learning}
@@ -1476,9 +1428,6 @@ Extensive experiments on MNIST, Fashion-MNIST, and CIFAR-10 under severe data-st
     \item On CIFAR-10 the corrected accounting produces an honest negative: the router rejects the residual branch ($2.5\%$) and collapses budget, and static ResNet-8 ($0.443$/$0.088$) wins. Earlier drafts of this work reported top efficiency on all three datasets; that measurement charged residual-mode layers at plain-layer cost and is superseded.
     \item The block-mode gates are now \textbf{genuinely dataset-sensitive} ($43\%$/$54\%$/$2.5\%$ residual routing on MNIST/Fashion/CIFAR) rather than saturating at $0\%$/$98.8\%$ as in the cost-indifferent system --- the behavioural difference that motivated the cost correction.
 \end{itemize}
-
-\paragraph{Real-World Validation: Minecraft Embodied Agent.}
-We further validated AML's practical applicability by engineering a fully autonomous Minecraft agent that operates in real-time. This application revealed the \textbf{Cardinality Paradox}: scaling the dataset from 2,940 to 5,738 frames paradoxically \emph{decreased} accuracy from $35.7\%$ to $33.2\%$ because the target action space expanded faster (from 230 to 328 unique classes) than the data could compensate. The introduction of our \textbf{History-to-State (HtS) Memory} mechanism---a sliding window buffer that flattens 10 consecutive state frames into a 90-dimensional temporal vector---resolved this paradox, recovering accuracy to $37.8\%$ without adding a single new training sample. This demonstrates AML's ability to leverage temporal context for embodied decision-making, a capability absent from all static architectures.
 
 \paragraph{Future Directions.}
 We envision several promising extensions of Architecture Mode Learning:
