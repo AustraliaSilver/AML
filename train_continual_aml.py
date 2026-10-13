@@ -1111,6 +1111,11 @@ def main():
                          '--route-tau) to the k most likely domains. 0 = retry '
                          'under every seen snapshot, which loads ~1.5M params per '
                          'domain per batch. k=2 is the usual choice.')
+    ap.add_argument('--shared-backbone', type=int, default=0,
+                    help='P4-3A: share one backbone across all tasks - store NO '
+                         'per-task copy of stem / 18 layers / ln (5.9 MB per task) '
+                         'and rely on EWC alone to retain earlier domains. '
+                         'Per-task state drops to ~1.2 MB, O(1) in depth.')
     ap.add_argument('--auto-live-thresh', type=float, default=0.0,
                     help='open-set fallback: if no snapshot reaches this softmax '
                          'confidence for a sample, evaluate it with the current '
@@ -1119,6 +1124,11 @@ def main():
                          'more than snapshot retrieval gained.')
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
+    shared_backbone = bool(args.shared_backbone)
+    if shared_backbone and args.ewc_lambda <= 0:
+        print("[!] --shared-backbone without --ewc-lambda>0 has NOTHING holding "
+              "the shared weights in place; A_live will collapse. "
+              "This is the intended experiment, not a bug.")
 
     set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1252,11 +1262,17 @@ def main():
             "enc": {k: v.detach().clone() for k, v in model.vision_encoder.state_dict().items()},
             "sel": {k: v.detach().clone() for k, v in model.prototype_selector.state_dict().items()},
         }
-        if hasattr(model, "layers"):
+        if hasattr(model, "layers") and not shared_backbone:
             dom_snaps[i]["stem"] = {k: v.detach().clone() for k, v in model.stem.state_dict().items()}
             dom_snaps[i]["layers"] = {k: v.detach().clone() for k, v in model.layers.state_dict().items()}
             if hasattr(model, "ln"):
                 dom_snaps[i]["ln"] = {k: v.detach().clone() for k, v in model.ln.state_dict().items()}
+        if shared_backbone and hasattr(model, "layers"):
+            n_l = sum(p.numel() for p in model.layers.parameters())
+            print(f"  [shared-backbone] 3A: no per-task copy of stem + 18 layers "
+                  f"+ ln ({n_l/1e6:.2f}M params, "
+                  f"{n_l*4/1e6:.2f} MB) - EWC is solely responsible for "
+                  f"retaining earlier domains")
         if hasattr(model, "structure_prototypes"):
             dom_snaps[i]["struct_heads"] = {
                 "sprotos": model.structure_prototypes.detach().clone(),
@@ -1273,7 +1289,9 @@ def main():
             dom_snaps[i]["protos"] = {"q": torch.round(pw / scale).to(torch.int8).cpu(),
                                       "scale": scale.cpu()}
             mb = dom_snaps[i]["protos"]["q"].numel() / 1e6
-            print(f"  [snap] stored enc+sel+struct+prototypes(int8, {mb:.0f} MB-elems) for '{name}'")
+            tag = "enc+sel+struct+prototypes" if shared_backbone else \
+                  "enc+sel+stem+layers+ln+struct+prototypes"
+            print(f"  [snap] stored {tag}(int8, {mb:.0f} MB-elems) for '{name}'")
         else:
             dom_snaps[i]["protos"] = pw.to("cpu", torch.float32).clone()
             print(f"  [snap] stored enc+sel+struct+prototypes(fp32) for '{name}'")

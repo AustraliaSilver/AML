@@ -1627,6 +1627,16 @@ We envision several promising extensions of Architecture Mode Learning:
     \item \textbf{Per-sample routing:} Extending from per-task to per-sample routing would enable different images within a single batch to traverse entirely different computational graphs, maximizing the efficiency gains for heterogeneous-difficulty datasets. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Candidate-block dispatch on the routing sub-batch is implemented and verified numerically equivalent for one-hot routing, but it is currently worth nothing in practice: on the released checkpoints the per-batch mode assignment is already uniform, so the pre-existing single-branch fast path already absorbs the win. The remaining open question is how to make mode routing non-uniform in the first place without destabilising weight training.
     
     \item \textbf{Online and continual learning:} Coupling AML with elastic weight consolidation would allow the architecture to dynamically expand for new tasks while protecting previously learned knowledge through the Ghost Layer mechanism. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Diagonal-Fisher EWC over the shared trunk is now implemented and tested. What remains open is the stronger variant: dropping the per-task snapshot entirely in favour of a single shared backbone plus task-conditioned sparse adapters, which would reduce per-task state from the current $7.2\,\mathrm{MB}$ to a bitmask plus quantised prototypes. We did not attempt this here, because removing the $18$-layer snapshot without first validating that EWC holds $A_{\text{live}}$ steady is precisely the configuration that currently collapses accuracy.
+
+\emph{(Subsequently measured --- Section~\ref{sec:depth_audit}.)} Under
+\texttt{--shared-backbone}, a controlled A/B at an identical schedule shows the
+trade cuts the \emph{opposite} way from the usual expectation:
+$A_{\text{live}}$ forgetting falls from $23.05\%$ to $13.91\%$ and per-task
+state from $7.2\,\mathrm{MB}$ to $\approx 1.2\,\mathrm{MB}$, while
+$A_{\text{oracle}}$ forgetting rises from $0.00\%$ to $9.00\%$ --- unavoidable,
+since there is a single shared trunk and therefore nothing to retrieve. The
+setting is a deployment-dependent trade rather than a strict improvement, and it
+is reported as single-seed evidence at a short schedule.
     
     \item \textbf{Reinforcement learning integration:} Combining AML with policy gradient methods (PPO, SAC) would enable embodied agents to optimize their own cognitive architecture as part of their core policy, rather than relying on human-designed networks.
     

@@ -174,6 +174,27 @@ budget, and a gate needs `2.0/arch_lr` arch-trained steps (see the investigation
 log §2b). No layer pruned in this run; the pruning mechanism itself is verified
 directly by driving the gates and measuring latency.
 
+#### Shared backbone (P4-3A) — a trade, not a free win
+
+`--shared-backbone 1` stores no per-task copy of the trunk and leaves EWC solely
+responsible for retention. Same schedule, same seed, only that flag differs:
+
+| | per-task snapshot | shared backbone |
+| :--- | :---: | :---: |
+| per-task state | 7.2 MB | **≈1.2 MB** |
+| $A_{\text{live}}$ forgetting | 23.05 % | **13.91 %** |
+| $A_{\text{auto}}$ forgetting | 9.84 % | 9.23 % |
+| $A_{\text{oracle}}$ forgetting | **0.00 %** | 9.00 % |
+
+It **halves** live forgetting (MNIST after CIFAR-10: 37.28 % → 65.81 %) and cuts
+per-task storage 6×, but it **cannot** keep oracle zero-forgetting — with one
+shared trunk there is no second trunk to retrieve. Enable it when deployment does
+not supply a task id. These are single-seed numbers at a short schedule; a
+multi-seed comparison is needed before treating the gain as real.
+
+Three corrections to the original proposals are recorded in full, with
+measurements, in the investigation log:
+
 Three corrections to the original proposals are recorded in full, with
 measurements, in the investigation log:
 

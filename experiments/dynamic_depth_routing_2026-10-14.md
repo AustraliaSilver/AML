@@ -294,6 +294,63 @@ on the way: evaluating without the task's `pi_mask` let untrained prototype rows
 vote (reported 12.5 % for a model that trains to 54 %), and the three-task
 checkpoints had been overwritten by a later smoke run.
 
+### 3A — shared backbone, no per-task 18-layer copy
+
+`--shared-backbone 1` stores **no** per-task copy of `stem`, the 18 `layers`, or
+`ln`. Per-task state drops from 7.2 MB to ≈1.2 MB (encoder + prototype selector +
+structure heads + int8 prototypes), and the 5.86 MB trunk copy becomes a single
+shared set of weights that EWC alone has to protect.
+
+`evaluate` already restores the trunk conditionally (`if "layers" in snaps[d]`),
+so this required no change to the retrieval path — only to what gets written.
+
+The honest risk, stated up front: `A_live` decayed to `3.52 %` in the historical
+record with no stability term at all, so removing the snapshot without EWC holding
+the weights is exactly the configuration that collapses. The flag warns when it is
+combined with `--ewc-lambda 0`:
+
+```
+[!] --shared-backbone without --ewc-lambda>0 has NOTHING holding the shared
+    weights in place; A_live will collapse.
+```
+
+<results placeholder>
+
+**Controlled A/B** — identical command, identical schedule, identical seed, the
+only difference being `--shared-backbone`:
+
+| | per-task 18-layer snapshot | `--shared-backbone` (3A) |
+|---|---|---|
+| per-task state | 7.2 MB | **≈1.2 MB** |
+| trunk copies | 1 per task (5.86 MB each) | **1 shared, 0 copies** |
+| $A_{\text{live}}$ BWT | −23.05 % | **−13.91 %** |
+| $A_{\text{live}}$ forgetting | 23.05 % | **13.91 %** |
+| $A_{\text{auto}}$ BWT | −9.84 % | −9.23 % |
+| $A_{\text{oracle}}$ BWT | **+0.00 %** | −9.00 % |
+
+Cell-by-cell, $A_{\text{live}}$ after CIFAR-10 on MNIST went **37.28 % → 65.81 %**,
+and after Fashion **23.90 % → 48.78 %**.
+
+**Interpretation.** The trade is exactly the one the proposal predicted, and it
+cuts the opposite way from what "zero-forgetting" papers usually claim. Giving up
+the per-task trunk copy:
+* **halves live forgetting** (23.05 % → 13.91 %), because every task now optimises
+  the same weights and the structure has to serve all of them rather than each
+  task getting a private copy; and
+* **destroys task-oracle exactness** (0.00 % → 9.00 %), which is unavoidable —
+  with one shared trunk there is no second trunk to retrieve.
+
+So 3A is *not* a strict improvement: it trades a headline "zero forgetting under
+oracle retrieval" claim for lower average error and 6× less per-task storage.
+Which side wins depends on whether the deployment protocol supplies a task id.
+
+**Caveat, stated plainly.** These are single runs at a deliberately short
+schedule (`--steps 50`, so CIFAR-10 sees a quarter of one epoch). Run-to-run
+variance under `cudnn.benchmark` plus non-deterministic reductions is
+substantial, and a 28-point swing in one cell is larger than we would trust from
+one seed. **A multi-seed comparison is required before treating the 3A
+improvement as real.** We report it as suggestive, and ship the flag default-off.
+
 ---
 
 ## 3. Why routing never changed
