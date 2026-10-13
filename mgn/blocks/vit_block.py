@@ -24,6 +24,11 @@ class VisionTransformerBlock(BaseDynamicBlock):
         super().__init__(in_channels, out_channels)
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
+        # Tokens are pooled to at most this many pixels per side before the
+        # attention, bounding attention cost at O(64^2) regardless of input
+        # resolution. forward() and compute_flops() both read this single
+        # constant so the analytic cost model cannot drift from the real one.
+        self.max_tokens_side = 8
         
         # 1x1 projection if in_channels != out_channels
         if in_channels != out_channels:
@@ -55,10 +60,10 @@ class VisionTransformerBlock(BaseDynamicBlock):
 
         # MobileViT optimization: If spatial dimension >= 16, downscale tokens to max 8x8 (64 tokens)
         # to accelerate self-attention from O(1024^2) down to O(64^2) - 256x faster attention
-        needs_downsample = H > 8 or W > 8
+        needs_downsample = H > self.max_tokens_side or W > self.max_tokens_side
         if needs_downsample:
-            x_down = F.adaptive_avg_pool2d(x, (8, 8))
-            H_tok, W_tok = 8, 8
+            x_down = F.adaptive_avg_pool2d(x, (self.max_tokens_side, self.max_tokens_side))
+            H_tok, W_tok = self.max_tokens_side, self.max_tokens_side
         else:
             x_down = x
             H_tok, W_tok = H, W
@@ -115,11 +120,18 @@ class VisionTransformerBlock(BaseDynamicBlock):
 
     def compute_flops(self, spatial_size: Tuple[int, int], active_dim: Optional[float] = None) -> float:
         h, w = spatial_size
-        n = float(h * w)
+        # forward() pools tokens down to MAX_TOKENS_SIDE before the attention
+        # (MobileViT optimisation), so the attention cost is driven by the
+        # POOLED token count, not h*w. Using h*w here overstated this block by
+        # up to 256x at 32x32 and made the analytic model rank ViT as the most
+        # expensive mode when it is in fact the cheapest at every stage.
+        needs_downsample = h > self.max_tokens_side or w > self.max_tokens_side
+        side = self.max_tokens_side if needs_downsample else h
+        n = float(side * side)
         d = active_dim if active_dim is not None else float(self.out_channels)
-        
-        # In proj flops
-        in_f = (2.0 * self.in_channels * d * n) if self.in_channels != self.out_channels else 0.0
+
+        # Pool/reshape overhead when down-sampling (avg-pool read + nearest up-sample write)
+        pool_f = (2.0 * h * w * d * 2.0) if needs_downsample else 0.0
         # QKV linear: 3 * 2 * n * d * d
         qkv_f = 6.0 * n * d * d
         # Attention: Q @ K^T is 2 * num_heads * n * n * head_dim = 2 * n^2 * d
@@ -129,4 +141,4 @@ class VisionTransformerBlock(BaseDynamicBlock):
         proj_f = 2.0 * n * d * d
         # MLP: 2 * 2 * n * d * (mlp_ratio * d)
         mlp_f = 4.0 * n * d * (d * self.mlp_ratio)
-        return in_f + qkv_f + attn_f + proj_f + mlp_f
+        return pool_f + qkv_f + attn_f + proj_f + mlp_f
