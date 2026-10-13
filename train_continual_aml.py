@@ -229,7 +229,8 @@ def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
 
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
-             snaps=None, route_tau=None, dom_truth=None, pi_mask=None, amb_topk=0):
+             snaps=None, route_tau=None, dom_truth=None, pi_mask=None, amb_topk=0,
+             auto_live_thresh=0.0):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -242,7 +243,11 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     amb_topk: restrict the ambiguous-sample retry to the k most likely domains.
     0 (default) keeps the original behaviour of retrying under every seen
     snapshot, which costs a full load_state_dict of enc + sel + stem + 18
-    layers + ln per domain per batch."""
+    layers + ln per domain per batch.
+    auto_live_thresh: open-set fallback. If no snapshot reaches this softmax
+    confidence for a sample, evaluate it with the current live weights instead.
+    0 disables it. Motivated by A_auto scoring below A_live in every
+    off-diagonal cell, i.e. misrouting costing more than it gained."""
     model.eval()
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
@@ -250,6 +255,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     pi_ent_sum, n = 0.0, 0
     gate_list = []
     route_hits = route_n = 0
+    n_live_fallback = 0
     route_hist = torch.zeros(max(len(slots) if slots else 1, 1), device=device)
     use_route = dom_head is not None and slots is not None
     use_snaps = use_route and snaps is not None
@@ -420,6 +426,27 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 out[amb_t] = best_out.to(out.dtype)
                 pi[amb_t] = best_pi
                 ls_full[amb_t] = best_ls
+
+            # Open-set fallback: if NO snapshot produced a confident prediction for
+            # a sample, it is likely out-of-distribution for every seen domain and
+            # the current (live) weights are a better bet than a confidently wrong
+            # snapshot. Measured motivation: A_auto fell below A_live in every
+            # off-diagonal cell, i.e. misrouting was costing more than the
+            # snapshot protocol gained.
+            if auto_live_thresh > 0:
+                conf_all = out.float().softmax(-1).max(-1).values
+                lowc = conf_all < auto_live_thresh
+                if bool(lowc.any()):
+                    with torch.amp.autocast('cuda', **ac):
+                        o_live, st_l, p_l, dg_l = model(x[lowc], tau=0.1,
+                                                        struct_override=(override[0][lowc],
+                                                                         override[1][lowc]),
+                                                        pi_mask=pi_mask)
+                    out[lowc] = o_live
+                    pi[lowc] = p_l.float()
+                    ls_full[lowc] = dg_l["layer_soft"].float()
+                    n_live_fallback += int(lowc.sum().item())
+
             gate_soft_sum += ls_full.mean(0)
             bm_res_sum += bm_wsum / max(wtot, 1)
             gate_list.append(ls_full)
@@ -450,6 +477,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
         "gate_tensor": torch.cat(gate_list, 0),
         "route_acc": (route_hits / route_n) if route_n else None,
         "route_hist": route_hist.cpu(),
+        "live_fallback_frac": (n_live_fallback / total) if total else 0.0,
     }
     return correct / total, fp
 
@@ -1083,6 +1111,12 @@ def main():
                          '--route-tau) to the k most likely domains. 0 = retry '
                          'under every seen snapshot, which loads ~1.5M params per '
                          'domain per batch. k=2 is the usual choice.')
+    ap.add_argument('--auto-live-thresh', type=float, default=0.0,
+                    help='open-set fallback: if no snapshot reaches this softmax '
+                         'confidence for a sample, evaluate it with the current '
+                         'live weights. 0 = disabled. A_auto was measured below '
+                         'A_live in every off-diagonal cell, so misrouting cost '
+                         'more than snapshot retrieval gained.')
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
 
@@ -1274,12 +1308,13 @@ def main():
             # Domain-IL (Autonomous routing via Centroid / dom_head without truth)
             acc_auto = acc_oracle
             if use_route:
-                acc_auto, _ = evaluate(model, el, device, amp_dtype,
+                acc_auto, fp_auto = evaluate(model, el, device, amp_dtype,
                                        dom_head=dom_head,
                                        slots=slots[:i + 1],
                                        snaps=dom_snaps[:i + 1],
                                        route_tau=args.route_tau, dom_truth=None,
-                                       pi_mask=pi_mask_j, amb_topk=args.amb_topk)
+                                       pi_mask=pi_mask_j, amb_topk=args.amb_topk,
+                                       auto_live_thresh=args.auto_live_thresh)
 
             # Live mutable supernet
             acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j)
@@ -1290,7 +1325,10 @@ def main():
             if j == i:
                 fingerprints[name] = fp
             tag = "routed" if use_route else "live"
-            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): auto: {acc_auto*100:.2f}% | oracle: {acc_oracle*100:.2f}% | live: {acc_live*100:.2f}%", flush=True)
+            lf = ""
+            if use_route and args.auto_live_thresh > 0:
+                lf = f" | live-fallback {fp_auto['live_fallback_frac']*100:.0f}%"
+            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): auto: {acc_auto*100:.2f}% | oracle: {acc_oracle*100:.2f}% | live: {acc_live*100:.2f}%{lf}", flush=True)
 
         torch.save(model.state_dict(), os.path.join(_ROOT, f"aml_continual_after_{name}.pth"))
 

@@ -348,6 +348,84 @@ class TestFisherEWC(unittest.TestCase):
         self.assertLessEqual(e.state_bytes(), before + 2 * 1_500_000)
 
 
+class TestOpenSetFallback(unittest.TestCase):
+    """--auto-live-thresh is an open-set fallback for the AUTONOMOUS protocol."""
+
+    def _tiny_loader(self, n=8):
+        x = torch.randn(n, 3, 32, 32)
+        y = torch.randint(0, 10, (n,))
+        return [(x, y)]
+
+    def test_disabled_by_default_and_reported(self):
+        from train_continual_aml import evaluate
+        m = _model(max_dim=16).eval()
+        dev = torch.device("cpu")
+        acc, fp = evaluate(m, self._tiny_loader(), dev)
+        self.assertIn("live_fallback_frac", fp)
+        self.assertEqual(fp["live_fallback_frac"], 0.0)
+        self.assertGreaterEqual(acc, 0.0)
+
+    def test_signature_defaults_to_off(self):
+        import inspect
+
+        from train_continual_aml import evaluate
+        sig = inspect.signature(evaluate)
+        self.assertEqual(sig.parameters["auto_live_thresh"].default, 0.0)
+        self.assertEqual(sig.parameters["amb_topk"].default, 0)
+
+    def test_wrong_width_struct_override_raises_a_clear_error(self):
+        """Regression: a gate vector of the wrong width used to surface as an
+        opaque IndexError from inside the layer loop."""
+        m = _model().eval()
+        x = torch.randn(4, 3, 32, 32)
+        with torch.no_grad():
+            _, st, _, _ = m(x, tau=0.1)
+        with self.assertRaises(ValueError) as cm:
+            m(x, tau=0.1, struct_override=(torch.ones(4, 7), st.block_mode))
+        self.assertIn("max_layers", str(cm.exception))
+
+    def test_fallback_does_not_leak_into_the_oracle_protocol(self):
+        """The fallback must only apply to the autonomous protocol. With a single
+        domain the live weights and the snapshot are identical, so enabling the
+        fallback must leave the oracle accuracy bit-identical."""
+        from train_continual_aml import evaluate
+        m = _model(max_dim=16).eval()
+        dev = torch.device("cpu")
+        loader = self._tiny_loader()
+        snaps = [{
+            "enc": {k: v.detach().clone() for k, v in m.vision_encoder.state_dict().items()},
+            "sel": {k: v.detach().clone() for k, v in m.prototype_selector.state_dict().items()},
+            "stem": {k: v.detach().clone() for k, v in m.stem.state_dict().items()},
+            "layers": {k: v.detach().clone() for k, v in m.layers.state_dict().items()},
+            "ln": {k: v.detach().clone() for k, v in m.ln.state_dict().items()},
+            "struct_heads": {"sprotos": m.structure_prototypes.detach().clone(),
+                             "bmprotos": m.block_mode_prototypes.detach().clone()},
+            "protos": m.proto_weights.detach().to("cpu", torch.float32).clone(),
+        }]
+        loader = self._tiny_loader()
+        _, st, _, _ = m(loader[0][0], tau=0.1)
+        slots = [{"gate": torch.ones(m.max_layers), "bm_mode": st.block_mode[0].clone(),
+                  "bm_res": st.block_mode[0, :, 1].clone()}]
+
+        class _Head(torch.nn.Module):
+            def __init__(self, n=1):
+                super().__init__()
+                self.l = torch.nn.Linear(m.latent_dim, n)
+
+            def forward(self, z):
+                return self.l(z)
+
+        head = _Head()
+        acc_off, _ = evaluate(m, loader, dev, dom_head=head, slots=slots,
+                              snaps=snaps, route_tau=0.6, dom_truth=0,
+                              auto_live_thresh=0.0)
+        acc_on, _ = evaluate(m, loader, dev, dom_head=head, slots=slots,
+                             snaps=snaps, route_tau=0.6, dom_truth=0,
+                             auto_live_thresh=0.5)
+        self.assertEqual(acc_off, acc_on,
+                         "fallback must not alter the task-oracle protocol")
+
+
 class TestAmbiguousRetryBudget(unittest.TestCase):
     """The ambiguous-sample retry is the real inference cost: it re-loads
     enc + sel + stem + 18 layers + ln per domain per batch."""

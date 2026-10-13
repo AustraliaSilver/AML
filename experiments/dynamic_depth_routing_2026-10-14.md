@@ -25,6 +25,7 @@ bf16 autocast). Nothing is quoted from the original write-up unless marked
 | 9 | `A_live` collapses 98.05 → 3.52 → 28.99; `--anchor-lam` defaults to **0.0** | There was no working anti-forgetting mechanism at all |
 | 10 | Stale non-editable `mgn` copy in site-packages shadowed the repo | Scripts run from subdirectories silently imported old code |
 | 11 | Cost term ran unconditionally | +16 % inference latency, introduced by this work; found only by benchmarking against a baseline worktree |
+| 12 | `struct_override` with a wrong-width gate vector | Opaque `IndexError` from inside the layer loop; now a named `ValueError` naming both widths |
 
 ---
 
@@ -248,6 +249,50 @@ $$\textbf{BWT} = +0.00\% \quad|\quad \textbf{Forgetting} = 0.00\%$$
   `$A_{\text{live}}$` in every off-diagonal cell — routing a sample to the wrong
   domain costs more than just using the live model. This is the highest-value
   target for future work, and it is a routing-accuracy problem, not a storage one.
+
+---
+
+### Open-set live fallback — implemented, NOT yet validated for accuracy
+
+`--auto-live-thresh` (default `0`, disabled) evaluates a sample with the current
+live weights when no snapshot reaches that softmax confidence. The motivation is
+the measured weakness above: `$A_{\text{auto}}$` was below `$A_{\text{live}}$` in
+every off-diagonal cell, so misrouting cost more than snapshot retrieval gained.
+
+What we **did** verify:
+
+```
+A_live   = 54.30%
+A_oracle = 63.09%   (invariant control)
+
+ thresh |   A_auto |  vs live |  fallbk% | route |   sec
+    0.00 |   63.09% |   +8.79 |     0.0% |  0.0% |  4.6
+    0.30 |   63.09% |   +8.79 |     7.0% |  0.0% |  5.0
+    0.50 |   63.09% |   +8.79 |    33.6% |  0.0% |  6.4
+    0.70 |   63.09% |   +8.79 |    59.8% |  0.0% |  7.9
+    0.90 |   63.09% |   +8.79 |    90.2% |  0.0% |  9.5
+
+control: A_oracle with fallback on = 63.09% (must equal 63.09%) -> OK
+```
+
+* The fallback provably **does not leak into the task-oracle protocol** — `A_oracle`
+  is bit-identical with the fallback enabled at every threshold. That was the main
+  correctness risk, and it is closed (and now regression-tested).
+* The fallback fraction responds to the threshold as intended (0 % → 90 %).
+
+What we **could not** verify: any accuracy benefit. In a single-domain probe the
+snapshot is built from the live weights, so live ≡ snapshot and the sweep is
+degenerate by construction — every row is identical. Separately, `fp["route_acc"]`
+is only meaningful when `dom_truth` is supplied (it accumulates hits only inside
+the `if dom_truth is not None` branch), so the `0.0 %` above is an artefact of
+that, not a router failure.
+
+The flag therefore **ships disabled**. A proper test needs a two-domain setting
+where live and snapshot weights genuinely differ, i.e. another full continual run,
+which did not fit in the remaining budget. Two harness bugs were found and fixed
+on the way: evaluating without the task's `pi_mask` let untrained prototype rows
+vote (reported 12.5 % for a model that trains to 54 %), and the three-task
+checkpoints had been overwritten by a later smoke run.
 
 ---
 

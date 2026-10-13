@@ -308,6 +308,14 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         if self.training:
             skip_layer = partial_layer = [False] * self.max_layers
         else:
+            if layer_gates.shape[-1] != self.max_layers:
+                # Previously this surfaced as an opaque IndexError deep inside
+                # the layer loop, because the skip mask list is sized from
+                # self.max_layers while layer_gates came from struct_override.
+                raise ValueError(
+                    f"layer_gates has {layer_gates.shape[-1]} layers but this "
+                    f"model has max_layers={self.max_layers}; struct_override "
+                    f"must supply one gate per layer")
             sk = (layer_gates.detach() <= self.gate_skip_eps)   # [B, L] True = skip
             agg = torch.stack((sk.all(dim=0), sk.any(dim=0)))   # [2, L]
             a0, a1 = agg.tolist()                               # single sync

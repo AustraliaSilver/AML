@@ -107,6 +107,7 @@ python train_continual_aml.py \
 | `--arch-prior` | `staged` | `staged` = CoAtNet-style 3-stage prior. `neutral` = small symmetric noise. Measured at a 4×60-step budget: staged 89.9 %, neutral 11.4 %. |
 | `--ewc-lambda` | `0.0` | Elastic Weight Consolidation on the shared trunk. `>0` is what lets forgetting be bounded without storing an 18-layer snapshot per task. |
 | `--amb-topk` | `0` | Restrict the ambiguous-sample retry (router margin `< --route-tau`) to the k most likely domains. `0` retries under every seen snapshot, which re-loads enc + sel + stem + 18 layers + ln (~1.5 M parameters) per domain per batch. `2` is the usual choice. |
+| `--auto-live-thresh` | `0.0` | Open-set fallback for the autonomous protocol: evaluate with live weights when no snapshot reaches this confidence. **Disabled by default** — correctness is verified (it cannot alter `A_oracle`) but an accuracy benefit has not been demonstrated. See the investigation log. |
 
 Depth telemetry is printed every epoch:
 
