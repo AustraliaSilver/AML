@@ -1,4 +1,3 @@
-import pytest
 import torch
 import torch.nn.functional as F
 from mgn.blocks import ConvAML_18Layer_Hybrid

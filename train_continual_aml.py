@@ -614,6 +614,7 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
     other_params = [p for n_, p in model.named_parameters() if not any(k in n_ for k in arch_names) and p.requires_grad]
     opt = optim.AdamW(other_params, lr=lr, weight_decay=1e-4)
+    opt_arch = optim.AdamW(arch_params, lr=lr * 0.2, weight_decay=1e-4)
     opt_dom = None
     if dom_head is not None and not isinstance(dom_head, TaskCentroidRouter):
         opt_dom = optim.AdamW(dom_head.parameters(), lr=1e-3, weight_decay=0.0)
@@ -856,7 +857,7 @@ def main():
     assert len(ep_list) == len(tasks)
 
     if args.model_type == 'hybrid18':
-        print(f"[*] Initializing 18-Layer Hybrid AML Supernet (Plain CNN + ResNet + ViT)...")
+        print("[*] Initializing 18-Layer Hybrid AML Supernet (Plain CNN + ResNet + ViT)...")
         model = ConvAML_18Layer_Hybrid(
             K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=10,
             norm_type=('bn' if args.norm == 'bn' else 'gn')

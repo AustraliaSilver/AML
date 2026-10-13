@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from typing import Optional, Tuple
 from .base import BaseDynamicBlock
 from .cnn_block import PlainConvBlock, ResNetBlock
