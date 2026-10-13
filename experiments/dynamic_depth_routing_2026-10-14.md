@@ -155,6 +155,49 @@ before and after training, i.e. the structure is the initialisation.
 
 ---
 
+## 2b. How much training a gate actually needs
+
+To close, a logit must travel from `0` to `-2` (`sigmoid(δ + 2) = 0.5`). AdamW
+travels ≈`lr` per step, so the required arch-trained step count is `2.0 / arch_lr`:
+
+| `--arch-lr` | steps needed | reachable in the production schedule? |
+|---|---|---|
+| `2e-4` (previous default) | 10 000 | no — hence 0/216 gates ever closed |
+| `3e-3` (new default) | 667 | yes: MNIST 5 ep × 234 = 1 170 steps; CIFAR-10 28 ep × 195 = 5 460 |
+| `1.5e-2` | 134 | yes, comfortably |
+
+**`--steps` caps batches per epoch**, so a short validation run cannot demonstrate
+depth pruning no matter how large `--arch-lr` is. In the validation run below
+(`--steps 50`, 3 epochs, 2 of them arch-trained = 100 arch steps at `1.5e-2`,
+travel 1.5 against the 2.0 required) the gates stayed at `18.00/18` for all three
+epochs. That is the expected arithmetic, not a failure of the mechanism — the
+mechanism itself is verified directly in §2a by driving the gates to a target
+retention and measuring latency and exactness.
+
+## 2c. EWC storage is O(1) in the number of tasks
+
+```
+[*] EWC enabled (lambda=100.0): anchoring 1.77M shared weights
+[ewc] consolidated Fisher over task 1: 3.42M values stored for all tasks so far
+```
+
+3.42 M values = 1.71 M Fisher + 1.71 M θ*, i.e. 13.7 MB fp32 (6.8 MB fp16) held
+**once**, against 7.2 MB per task of full snapshots (21.6 MB at `T=3`). The
+snapshot cost is `O(T)`; the EWC cost is `O(1)`. At `T=10` the comparison is
+72 MB versus 13.7 MB.
+
+Only the 152 of 398 shared parameters that actually receive a gradient are
+recorded — routing is batch-consistent during training, so the two unselected
+candidate branches of each `HybridBlock` are never touched. Those branches do not
+drift either (AdamW skips parameters with no gradient), which is why recording
+them with zero Fisher would be wrong rather than merely wasteful.
+
+---
+
+## 3. Why routing never changed
+
+---
+
 ## 4. Per-sample MoE dispatch: correct only as an inference optimisation
 
 ### 4.1 It is currently worth nothing
