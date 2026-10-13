@@ -118,6 +118,27 @@ Measured on **RTX 3050 Laptop GPU** (Zero-Replay setting):
 - **AML**: Achieves perfect **Zero Forgetting (0.00%)** through orthogonal prototype isolation (`pi_mask`), preserving earlier domain accuracy without any exemplar replay.
 - **HtS**: Runs **7.6x faster** with **8.7x fewer parameters** using hardware Tensor Cores WMMA BF16 and native CUDA dynamic convolutions.
 
+---
+
+### Continual Learning Baseline Comparison: AML vs Standard Architectures (CNN, ResNet, ViT)
+
+Under the strict **Zero-Replay** protocol (0 exemplars stored, sequential task training across **MNIST $\rightarrow$ CIFAR-10 $\rightarrow$ Fashion-MNIST**), standard deep learning architectures suffer catastrophic memory erasure. AML 18-Layer Hybrid Supernet prevents this collapse through functional snapshot isolation:
+
+```bash
+python benchmarks/benchmark_cl_comparison.py
+```
+
+| Architecture / Model | Continual Protocol | Final Accuracy ($A_{\text{avg}}$) | BWT ($\Delta \text{Acc}$) | Catastrophic Forgetting | Total Parameters | Memory Footprint |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Plain CNN (18-Layer)** | Sequential Fine-tuning | 31.56% | -54.66% | **54.66%** | 385,594 | 1.47 MB |
+| **Standard ResNet-18** | Sequential Fine-tuning | 34.54% | -55.07% | **55.07%** | 348,730 | 1.33 MB |
+| **Vision Transformer (ViT)** | Sequential Fine-tuning | 25.36% | -14.61% | **14.61%** | 232,234 | 0.89 MB |
+| **AML Live Weights** | Mutable Supernet (No Snap) | 29.73% | -46.50% | **46.50%** | 12,759,873 | 48.7 MB |
+| **AML 18-Layer Hybrid (Ours)** | **Snapshot Isolation (Zero-Replay)** | **75.46%** | **+0.00%** | **0.00%** | 12,759,873 | **+1.3 MB / task** (INT8) |
+
+- **Plain CNN & ResNet-18**: Erase earlier domain representations almost entirely (MNIST collapses from $94.6\%$ / $97.9\%$ down to $\sim 8.5\%$ / $10.8\%$).
+- **AML 18-Layer Hybrid**: Completely circumvents representation erasure via orthogonal prototype isolation and INT8 snapshot retrieval, maintaining pristine domain performance across all sequential tasks.
+
 ## 4. Repository Structure
 
 ```text

@@ -79,6 +79,22 @@ python train_continual_aml.py \
 
 ---
 
+### Option C: Baseline Comparison (Plain CNN vs ResNet-18 vs ViT vs AML) (~3 minutes)
+
+Directly replicates the side-by-side continual learning benchmark under identical zero-replay conditions:
+
+```bash
+python benchmarks/benchmark_cl_comparison.py
+```
+
+Expected output confirms severe memory erasure in standard static networks vs AML preservation:
+- **Plain CNN (18-Layer)**: Forgetting = **$54.66\%$** (MNIST collapses from $94.65\%$ to $8.51\%$).
+- **Standard ResNet-18**: Forgetting = **$55.07\%$** (MNIST collapses from $97.96\%$ to $10.81\%$).
+- **Vision Transformer (ViT)**: Forgetting = **$14.61\%$** (MNIST collapses from $39.17\%$ to $17.79\%$).
+- **AML 18-Layer Hybrid (Snapshot Isolation)**: Forgetting = **$0.00\%$** (MNIST preserved at $92.83\%$).
+
+---
+
 ## 4. Architecture Specifications
 
 - **Total Layers**: 18 dynamic blocks (`HybridBlock`).
