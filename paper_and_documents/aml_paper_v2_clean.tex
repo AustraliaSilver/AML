@@ -1411,6 +1411,32 @@ replace it with an identity and change the routed model's output. Only
 $g^{(l)} \le \epsilon$ is an exact identity, and equivalence to the
 unshort-circuited computation is asserted bit-exactly on CPU in the test suite.
 
+The saving is real but strongly non-linear in \emph{which} layers are closed
+(batch 64, $\text{max\_dim}=48$, bf16, RTX~3050):
+
+\begin{center}
+\begin{tabular}{r r r r}
+\toprule
+layers closed & executed & latency & speed-up \\
+\midrule
+0  & 18 & 276.3\,ms & 1.00$\times$ \\
+8  & 10 & 235.8\,ms & 1.17$\times$ \\
+12 &  6 & 200.6\,ms & 1.38$\times$ \\
+17 &  1 &  40.4\,ms & 6.83$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Because the early, high-resolution layers dominate wall-clock, pruning the twelve
+cheapest blocks buys only $1.38\times$ while collapsing the trunk to a single
+block buys $6.83\times$. Per-sample skipping is close to worthless in isolation
+($1.04\times$): the block still executes for the open half of the batch and the
+gather/scatter overhead consumes the remainder. A related regression we
+introduced and then removed is worth recording: computing the differentiable
+cost term costs $18\times 3 = 54$ small CUDA launches per forward, i.e.\ $+16\%$
+inference latency, so it is opt-in and switched on only when a FLOPs regulariser
+actually consumes it.
+
 \paragraph{Per-sample mode dispatch, and the gradient it destroys.}
 Routing weights are one-hot at inference, so
 $\sum_m w_m\, b_m(x) = w_{\arg\max}\, b_{\arg\max}(x)$ and each candidate block

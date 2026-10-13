@@ -24,6 +24,7 @@ bf16 autocast). Nothing is quoted from the original write-up unless marked
 | 8 | Full snapshot is **7.2 MB/task**, not "tens of MB" | Overstated ~3× in the proposal |
 | 9 | `A_live` collapses 98.05 → 3.52 → 28.99; `--anchor-lam` defaults to **0.0** | There was no working anti-forgetting mechanism at all |
 | 10 | Stale non-editable `mgn` copy in site-packages shadowed the repo | Scripts run from subdirectories silently imported old code |
+| 11 | Cost term ran unconditionally | +16 % inference latency, introduced by this work; found only by benchmarking against a baseline worktree |
 
 ---
 
@@ -83,7 +84,60 @@ eliminated. Raising the LR to 3e-3 gives ≈ 1.75 of travel per task.
 
 ---
 
-## 3. Why routing never changed
+## 2a. What the short-circuit actually buys
+
+Once gates can close, the saving is real and monotone (RTX 3050, batch 64,
+`max_dim=48`, bf16 autocast, `cudnn.benchmark=True`):
+
+| layers closed | `n_executed` | latency | speed-up |
+|---|---|---|---|
+| 0 | 18 | 276.32 ms | 1.00× |
+| 2 | 16 | 267.02 ms | 1.03× |
+| 4 | 14 | 260.33 ms | 1.06× |
+| 6 | 12 | 253.50 ms | 1.09× |
+| 8 | 10 | 235.80 ms | 1.17× |
+| 12 | 6 | 200.57 ms | 1.38× |
+| 17 | 1 | 40.44 ms | **6.83×** |
+| per-sample (half the batch closed on layers 6-11) | 18 | 266.39 ms | 1.04× |
+
+Exactness was verified against the **old** always-evaluate loop using the *same*
+gates, for every configuration above plus the per-sample case:
+
+```
+closed= 0  max|delta feature| = 0.00e+00
+closed= 4  max|delta feature| = 0.00e+00
+closed= 8  max|delta feature| = 0.00e+00
+closed=12  max|delta feature| = 0.00e+00
+closed=17  max|delta feature| = 0.00e+00
+per-sample          max|delta feature| = 0.00e+00
+```
+
+Note that closing a layer legitimately changes the network's function, so the
+reference must use the *same* gates. Comparing the short-circuited network
+against an all-open one measures nothing.
+
+The curve is strongly non-linear: the early layers dominate wall-clock, so
+closing layers 6-17 (the 12 cheapest blocks) buys only 1.38×, while closing 17
+layers buys 6.83×. Per-sample skipping is nearly free of benefit (1.04×) because
+the block still runs for the open half of the batch and the gather/scatter
+overhead eats what is left.
+
+### Regression guard
+
+Benchmarking the above exposed a regression **introduced by this work**: the
+differentiable cost term runs `compute_flops` 18 × 3 = 54 times per forward, and
+those small CUDA launches cost 275 → 319 ms (+16 %). It is now behind
+`model.compute_cost` (default `False`), enabled by the trainer only when
+`--flops-cost > 0`. Verified against a detached worktree at `7a9b920`:
+
+| build | plain forward | with `struct_override` |
+|---|---|---|
+| baseline `7a9b920` | 277.60 ms | 276.47 ms |
+| this branch | 275.09 ms | 278.20 ms |
+
+No regression, and the 1.91× dispatch figure in §4.1 still holds.
+
+---
 
 Softmax of the hard-coded init, and of the trained parameters:
 

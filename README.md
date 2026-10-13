@@ -131,8 +131,22 @@ python train_continual_aml.py --model-type hybrid18 \
 ```
 
 ```python
-python -m unittest tests.test_dynamic_depth_routing   # 22 tests, CI-enforced
+python -m unittest tests.test_dynamic_depth_routing   # 23 tests, CI-enforced
 ```
+
+Measured wall-clock effect of the depth short-circuit (RTX 3050, batch 64, bf16),
+verified bit-identical against the old always-evaluate loop:
+
+| layers closed | `n_executed` | latency | speed-up |
+|---|---|---|---|
+| 0 | 18 | 276.3 ms | 1.00× |
+| 8 | 10 | 235.8 ms | 1.17× |
+| 12 | 6 | 200.6 ms | 1.38× |
+| 17 | 1 | 40.4 ms | **6.83×** |
+
+The curve is non-linear because early layers dominate wall-clock, and per-sample
+skipping is nearly worthless (1.04×) since the block still runs for the open half
+of the batch.
 
 Three corrections to the original proposals are recorded in full, with
 measurements, in the investigation log:
