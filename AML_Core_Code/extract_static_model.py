@@ -75,11 +75,29 @@ class StaticHybridBlock(nn.Module):
     softmax(block_mode_prototypes) is averaged over the batch, and the argmax
     branch is compiled away. That matches HybridBlock.forward, which collapses
     to the same single branch once the weights are one-hot.
+
+    The depth gate must be carried too. The mother computes
+
+        h_new = gate_c * h_cand + (1.0 - gate_c) * h          # i > 0, gate open
+        h_new = h                                             # gate <= gate_skip_eps
+        h_new = layer(h)                                     # i == 0, gate ignored
+
+    so a layer whose gate has closed contributes nothing, and a half-open layer
+    contributes half. Dropping the gate and running every block at full strength
+    would silently change the function the supernet learned - which is exactly
+    what --depth-cost is there to shape.
     """
 
-    def __init__(self, block, mode_idx, dim_mask):
+    def __init__(self, block, mode_idx, dim_mask, gate=1.0, is_first=False,
+                 gate_skip_eps=1e-6):
         super().__init__()
         self.mode_idx = mode_idx
+        self.is_first = is_first
+        self.gate_skip_eps = gate_skip_eps
+        # A closed gate is compiled out entirely, so the child never pays for a
+        # block the mother would have skipped.
+        self.is_active = bool(is_first or gate > gate_skip_eps)
+        self.register_buffer('gate', torch.tensor(float(gate)))
         self.register_buffer('dim_mask', dim_mask)
         if mode_idx == 0:
             self.body = block.plain
@@ -91,7 +109,13 @@ class StaticHybridBlock(nn.Module):
             raise ValueError(f"invalid mode {mode_idx}")
 
     def forward(self, x):
-        return self.body(x, dim_mask=self.dim_mask)
+        if not self.is_active:
+            return x
+        out = self.body(x, dim_mask=self.dim_mask)
+        if self.is_first:
+            return out
+        g = self.gate
+        return g * out + (1.0 - g) * x
 
 
 class StaticChildModel(nn.Module):
@@ -103,8 +127,9 @@ class StaticChildModel(nn.Module):
     """
 
     def __init__(self, layers, fc_weight, fc_bias, pool_after=(5, 11), ln=None,
-                 stem=None):
+                 stem=None, dropout_p=0.2):
         super().__init__()
+        self.dropout_p = dropout_p
         # The 18-layer hybrid's trunk starts with a 3-channel conv stem; the
         # legacy supernet did not have one, so it stays optional.
         self.stem = stem
@@ -128,7 +153,10 @@ class StaticChildModel(nn.Module):
 
         h = self.pool(h).view(x.shape[0], -1)
         h = self.ln(h)
-        h = F.dropout(h, p=0.2, training=self.training)
+        # The hybrid trunk uses p=0.1 (hybrid_18.py:411); the legacy supernet used
+        # 0.2. Carrying the wrong rate would make the child a different function
+        # at train time than the model it was distilled from.
+        h = F.dropout(h, p=self.dropout_p, training=self.training)
         return self.fc(h)
 
 
@@ -229,6 +257,10 @@ def extract_child_hybrid18(mother_model, x_dummy):
     from mgn.blocks.hybrid_18 import ConvAML_18Layer_Hybrid  # noqa: F401
     from mgn.blocks.hybrid_router import HybridBlock  # noqa: F401
 
+    # hybrid_18.py:411. The legacy supernet used 0.2; these constants must not
+    # drift from the model they are meant to replicate.
+    DROPOUT_P = 0.1
+
     if not isinstance(mother_model, ConvAML_18Layer_Hybrid):
         raise TypeError(f"expected ConvAML_18Layer_Hybrid, got "
                         f"{type(mother_model).__name__}")
@@ -243,9 +275,19 @@ def extract_child_hybrid18(mother_model, x_dummy):
     pi = F.softmax(mother_model.prototype_selector(z), dim=-1).mean(0)   # [K]
 
     delta = (pi @ mother_model.structure_prototypes).reshape(-1)          # [L + L*D]
-    # d_lengths[L,1] broadcast against arange[1,D] -> [L,D], then [D,1,1] per layer
+    # Depth gate: sigmoid(delta[:L] + 2.0), binarised exactly as the mother does
+    # at eval (hybrid_18.py:238 then :260). Layer 0 is excluded - the mother
+    # deliberately ignores its gate because it sets the feature scale.
+    layer_gates = (torch.sigmoid(delta[:L] + 2.0) > 0.5).float()
+
+    # Width floor is the MOTHER's (hybrid_18.py:244), not the legacy 24.0.
+    # Copying the legacy constant would clamp this supernet to a narrower channel
+    # set than it was trained with. The mother hardcodes the literal rather than
+    # exposing it, so the value is mirrored here and the source line named.
+    MIN_ACTIVE_DIM = 16.0
     d_lengths = torch.clamp(
-        torch.sigmoid(delta[L:].view(L, D).mean(-1, keepdim=True) + 2.0) * D, min=24.0)
+        torch.sigmoid(delta[L:].view(L, D).mean(-1, keepdim=True) + 2.0) * D,
+        min=MIN_ACTIVE_DIM)
     dim_masks = torch.sigmoid(10.0 * (d_lengths - torch.arange(
         D, device=device).float().view(1, D)))                          # [L, D]
 
@@ -259,7 +301,10 @@ def extract_child_hybrid18(mother_model, x_dummy):
         if not isinstance(blk, HybridBlock):
             raise TypeError(f"layer {i} is {type(blk).__name__}, expected HybridBlock")
         mask = dim_masks[i].view(D, 1, 1)
-        layers.append(StaticHybridBlock(blk, int(modes[i]), mask))
+        layers.append(StaticHybridBlock(blk, int(modes[i]), mask,
+                                        gate=float(layer_gates[i]),
+                                        is_first=(i == 0),
+                                        gate_skip_eps=mother_model.gate_skip_eps))
 
     # Head: the prototype-weighted classifier collapses the same way, because pi
     # has already been averaged over the batch.
@@ -277,7 +322,8 @@ def extract_child_hybrid18(mother_model, x_dummy):
                           mother_model.wo_size + mother_model.num_classes])
 
     child = StaticChildModel(layers, w_out, b_out, pool_after=(5, 11),
-                             ln=mother_model.ln, stem=mother_model.stem)
+                             ln=mother_model.ln, stem=mother_model.stem,
+                             dropout_p=DROPOUT_P)
     return child.to(device).eval()
 
 

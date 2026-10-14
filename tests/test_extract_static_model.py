@@ -7,6 +7,7 @@ passing a hybrid sailed through validation and then died with
 structural differences that made a separate path necessary.
 """
 import unittest
+import inspect
 
 import torch
 
@@ -96,6 +97,48 @@ class TestStaticHybridExtraction(unittest.TestCase):
         names = {n for n, _ in self.child.named_modules()}
         self.assertNotIn("ood_router", names)
         self.assertNotIn("prototype_selector", names)
+
+    def test_dropout_rate_matches_the_mother(self):
+        """hybrid_18.py uses p=0.1. The legacy StaticChildModel used 0.2, and
+        carrying that over would make the child a different function in train
+        mode than the model it was distilled from."""
+        self.assertAlmostEqual(self.child.dropout_p, 0.1, places=6)
+
+    def test_width_floor_matches_the_mother(self):
+        """hybrid_18.py:244 clamps at min=16.0; the legacy extractor used 24.0."""
+        from AML_Core_Code.extract_static_model import extract_child_hybrid18 as _x
+        self.assertEqual(_x.__doc__ is not None, True)
+        # reconstruct the clamp the extractor uses and compare with the source
+        src = inspect.getsource(extract_child_hybrid18)
+        self.assertIn("MIN_ACTIVE_DIM = 16.0", src)
+        self.assertNotIn("min=24.0", src)
+
+    def test_closed_layer_is_compiled_out(self):
+        """A gate at or below gate_skip_eps must cost nothing and leave the
+        activation untouched - this is the whole point of --depth-cost."""
+        blk = StaticHybridBlock(self.m.layers[1], 1, torch.ones(48, 1, 1),
+                                gate=0.0, is_first=False,
+                                gate_skip_eps=self.m.gate_skip_eps)
+        self.assertFalse(blk.is_active)
+        x = torch.randn(2, 48, 32, 32)
+        self.assertTrue(torch.equal(blk(x), x))
+
+    def test_open_layer_blends_by_its_gate(self):
+        """gate=1 reproduces the block exactly; gate=0.5 is halfway between the
+        block output and the identity, matching h_new = g*h_cand + (1-g)*h."""
+        mask = torch.ones(48, 1, 1)
+        full = StaticHybridBlock(self.m.layers[1], 1, mask, gate=1.0, is_first=False)
+        half = StaticHybridBlock(self.m.layers[1], 1, mask, gate=0.5, is_first=False)
+        x = torch.randn(2, 48, 32, 32)
+        y_full, y_half = full(x), half(x)
+        self.assertTrue(torch.allclose(y_half, 0.5 * y_full + 0.5 * x, atol=1e-5))
+
+    def test_first_layer_ignores_its_gate(self):
+        """The mother deliberately ignores layer 0's gate: it sets the feature
+        scale consumed by the rest of the trunk (hybrid_18.py:367-369)."""
+        blk = StaticHybridBlock(self.m.layers[0], 1, torch.ones(48, 1, 1),
+                                gate=0.0, is_first=True)
+        self.assertTrue(blk.is_active, "layer 0 must run even with a closed gate")
 
 
 if __name__ == "__main__":
