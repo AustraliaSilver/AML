@@ -314,8 +314,8 @@ Zero-replay, RTX 3050 Laptop GPU:
 
 | Engine / Method | Final ACC | BWT | Forgetting | Runtime | Parameters | Model size |
 | :-- | --: | --: | --: | --: | --: | --: |
-| **AML (live weights, no replay)** | **29.73 %** | **+0.00 %** | **0.00 %** | 183.4 s | 1,874,073 | 7.5 MB |
-| **AML (snapshot retrieval)** | **33.34 %** | **+0.00 %** | **0.00 %** | 183.4 s | 1,874,073 | 7.5 MB |
+| **AML (live weights, no replay)** | **29.73 %** | **+0.00 %** | **0.00 %** | 183.4 s | 1,871,385 | 7.49 MB |
+| **AML (snapshot retrieval)** | **33.34 %** | **+0.00 %** | **0.00 %** | 183.4 s | 1,871,385 | 7.49 MB |
 | **HtS (Tensor Cores WMMA BF16)** | **36.98 %** | −33.15 % | 33.15 % | **24.2 s** | **1,468,790** | **5.8 MB** |
 
 - **AML** achieves zero forgetting through orthogonal prototype isolation (`pi_mask`).
@@ -334,8 +334,8 @@ Strict zero-replay, MNIST → CIFAR-10 → Fashion-MNIST:
 | Plain CNN (18-layer) | sequential fine-tuning | 31.56 % | −54.66 % | **54.66 %** | 385,594 | 1.47 MB |
 | Standard ResNet-18 | sequential fine-tuning | 34.54 % | −55.07 % | **55.07 %** | 348,730 | 1.33 MB |
 | Vision Transformer (ViT) | sequential fine-tuning | 25.36 % | −14.61 % | **14.61 %** | 232,234 | 0.89 MB |
-| AML live weights | mutable supernet, no snapshot | 29.73 % | −46.50 % | **46.50 %** | 1,874,073 | 7.5 MB |
-| **AML 18-layer hybrid (ours)** | **snapshot isolation (zero-replay)** | **75.46 %** | **+0.00 %** | **0.00 %** | 1,874,073 | **+7.2 MB / task** |
+| AML live weights | mutable supernet, no snapshot | 29.73 % | -46.50 % | **46.50 %** | 1,871,385 | 7.49 MB |
+| **AML 18-layer hybrid (ours)** | **snapshot isolation (zero-replay)** | **75.46 %** | **+0.00 %** | **0.00 %** | 1,871,385 | **+7.5 MB / task** |
 
 Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 
@@ -355,10 +355,23 @@ Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 > **Parameter-count correction (2026-10-14).** These tables previously credited the
 > hybrid18 model with **12,759,873** parameters. That figure belongs to the legacy
 > `ConvAML_CIFAR_TrueDynamic` (`train.py`), which materialises every convolutional
-> kernel inside `proto_weights` and is therefore **6.81×** larger.
+> kernel inside `proto_weights` and is therefore **6.82×** larger.
 > `ConvAML_18Layer_Hybrid` — the model every number in this file measures — has
-> **1,874,073** parameters (7.5 MB fp32). Its deployed cost in snapshot mode is
-> `+7.2 MB` per task.
+> **1,871,385** parameters (7.49 MB fp32) at the default `--norm in`. Its deployed
+> cost in snapshot mode is `+7.5 MB` per task.
+>
+> The count depends on `--norm`, because each norm type carries a different number
+> of affine parameters. Measured directly, not derived:
+>
+> | `--norm` | Parameters | Size |
+> | :-- | --: | --: |
+> | `bn` (BatchNorm) | 1,874,073 | 7.50 MB |
+> | **`in` (InstanceNorm, default)** | **1,871,385** | **7.49 MB** |
+> | `gn1` (GroupNorm) | 1,876,761 | 7.51 MB |
+>
+> The earlier `1,874,073` in this file was the BatchNorm figure, measured before
+> `--norm` was made to reach the vision encoder and the stem — see B21 in
+> `experiments/dynamic_depth_routing_2026-10-14.md`.
 
 ---
 

@@ -141,9 +141,11 @@ A[2,2] cifar10: auto 33.55% | oracle 33.55% | route_acc 100.00%
 > `vision_encoder` và `stem` từ `BatchNorm2d` cứng sang `make_norm(norm_type, ...)`
 > (xem README.md mục 3.1a và B21 trong
 > `experiments/dynamic_depth_routing_2026-10-14.md`). Số tham số đã được đo lại
-> trực tiếp từ `ConvAML_18Layer_Hybrid`: **1,871,385 tham số = 7.49 MB**, và mỗi
-> task lưu khoảng **7.5 MB** snapshot. Con số `12,759,873 / 48.7 MB / +1.3 MB INT8`
-> từng ghi ở đây là của bản mô hình cũ và **không còn đúng** — đã sửa tại đây.
+> trực tiếp từ `ConvAML_18Layer_Hybrid`: **1,871,385 tham số = 7.49 MB** ở mặc định
+> `--norm in`, và mỗi task lưu khoảng **7.5 MB** snapshot. Con số
+> `12,759,873 / 48.7 MB / +1.3 MB INT8` từng ghi ở đây là của bản mô hình cũ và
+> **không còn đúng** — đã sửa tại đây. Số tham số phụ thuộc `--norm`; bảng đầy đủ
+> nằm trong README.md.
 
 #### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn (A[i, j]):
 

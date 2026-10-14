@@ -1270,7 +1270,7 @@ The matrix $S_{\text{static}}$ defines a rigid binary mask over depth, width, an
 \end{equation}
 
 \subsection{Implementation in PyTorch}
-The resulting \texttt{ExportedModel} drops all meta-learning scaffolding, skip-connection gating, and weight-slicing logic. We present the core extraction logic in Listing~\ref{lst:export}.
+The resulting \texttt{StaticChildModel} drops all meta-learning scaffolding, dynamic gating, and weight-slicing logic. We present the core extraction logic in Appendix~\ref{sec:appendix_code}.
 
 \begin{algorithm}[H]
 \caption{Static Model Extraction Algorithm}
@@ -2838,477 +2838,84 @@ def project_to_budget(
 
 \end{lstlisting}
 
-\subsection{Static Model Extraction (Hard Pruning)}
-The \texttt{export.py} module is the culmination of the NAS pipeline, statically compiling the dynamic Supernet into an ultra-fast, lightweight \texttt{nn.Sequential} PyTorch model.
-\begin{lstlisting}[language=Python, caption=export.py (v1 listing): superseded by AML_Core_Code/extract_static_model.py, whose StaticLayer now carries both convolutions of residual-mode layers.]
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
+### Static Model Extraction (Hard Pruning)
+The static-extraction step is the culmination of the NAS pipeline: it compiles the dynamic Supernet into an ultra-fast, lightweight \texttt{nn.Sequential} model with no Gumbel--Softmax and no dynamic ops. In the current codebase this lives in \texttt{AML\_Core\_Code/extract\_static\_model.py}.
 
-class ExportedLayer(nn.Module):
-    def __init__(self, i, in_c, out_c, w_conv, b_conv, mode, w_qkv=None, b_qkv=None, w_proj=None, b_proj=None):
-        super().__init__()
-        self.i = i
-        self.mode = mode # 0: Plain, 1: ResNet, 2: ViT
-        
-        self.conv = nn.Conv2d(in_c, out_c, kernel_size=3, padding=1)
-        self.conv.weight.data = w_conv.clone()
-        self.conv.bias.data = b_conv.clone()
-        self.norm = nn.GroupNorm(1, out_c)
-        
-        if self.mode == 2:
-            attn_dim = out_c // 4
-            self.qkv = nn.Conv2d(out_c, 3 * attn_dim, kernel_size=1)
-            self.qkv.weight.data = w_qkv.clone()
-            self.qkv.bias.data = b_qkv.clone()
-            self.proj = nn.Conv2d(attn_dim, out_c, kernel_size=1)
-            self.proj.weight.data = w_proj.clone()
-            self.proj.bias.data = b_proj.clone()
-            self.proj_norm = nn.GroupNorm(1, out_c)
-            self.attn_dim = attn_dim
-            
-    def forward(self, x, h_prev):
-        h_in = x if self.i == 0 else h_prev
-        h_conv = self.conv(h_in)
-        h_norm = self.norm(h_conv)
-        h_plain_raw = F.relu(h_norm)
-        
-        h_expand = h_plain_raw if self.i == 0 else h_prev
-        
-        if self.mode == 0:
-            return h_plain_raw
-        elif self.mode == 1:
-            return F.relu(h_expand + h_norm)
-        elif self.mode == 2:
-            H, W = h_norm.shape[2], h_norm.shape[3]
-            h_attn_in = F.adaptive_avg_pool2d(h_norm, (8, 8)) if H > 8 else h_norm
-            qkv = self.qkv(h_attn_in)
-            batch = qkv.shape[0]
-            qkv = qkv.view(batch, 3, self.attn_dim, -1)
-            Q = qkv[:, 0].transpose(1, 2)
-            K = qkv[:, 1]
-            V = qkv[:, 2].transpose(1, 2)
-            
-            attn = F.softmax(torch.bmm(Q, K) / math.sqrt(self.attn_dim), dim=-1)
-            out_trans = torch.bmm(attn, V).transpose(1, 2).reshape(batch, self.attn_dim, h_attn_in.shape[2], h_attn_in.shape[3])
-            
-            if H > 8:
-                out_trans = F.interpolate(out_trans, size=(H, W), mode='bilinear', align_corners=False)
-                
-            out_proj = self.proj_norm(self.proj(out_trans))
-            return F.relu(h_expand + h_norm + out_proj)
+\paragraph{Version note.} An earlier release of this appendix embedded \texttt{export.py}, which has since been removed from the repository in favour of \texttt{extract\_static\_model.py}. The listing below is taken from the file that actually ships. The substantive change is in \texttt{StaticLayer}: the older \texttt{ExportedLayer} carried a single convolution, whereas the AML block is \emph{two} convolutions, and an extracted residual branch that dropped \texttt{conv2} would not be a faithful replica of the block it was distilled from.
 
-class ExportedModel(nn.Module):
-    def __init__(self, layers, fc_w, fc_b, in_channels=1):
+\begin{lstlisting}[language=Python, caption=AML\_Core\_Code/extract\_static\_model.py (current listing): StaticLayer, the 2-conv static replica of one AML block. The layer gate gate\_c and the channel mask dim\_mask are frozen as buffers, so the compiled network has no dynamic branches left at inference time.]
+class StaticLayer(nn.Module):
+    """Static replica of one 2-conv AML block (plain + residual mix)."""
+
+    def __init__(self, conv_w, conv_b, conv2_w, conv2_b, gate_c, dim_mask,
+                 g_plain, g_resnet, is_first_layer=False):
         super().__init__()
-        self.layers = nn.ModuleList(layers)
-        self.fc = nn.Linear(fc_w.shape[1], fc_w.shape[0])
-        self.fc.weight.data = fc_w.clone()
-        self.fc.bias.data = fc_b.clone()
-        self.in_channels = in_channels
-        self.ln = nn.LayerNorm(fc_w.shape[1])
-        
+        self.is_first_layer = is_first_layer
+        self.conv = nn.Conv2d(conv_w.shape[1], conv_w.shape[0], 3, padding=1)
+        self.conv.weight.data = conv_w
+        self.conv.bias.data = conv_b
+        self.conv2 = nn.Conv2d(conv2_w.shape[1], conv2_w.shape[0], 3, padding=1)
+        self.conv2.weight.data = conv2_w
+        self.conv2.bias.data = conv2_b
+
+        self.norm = nn.GroupNorm(1, conv_w.shape[0])
+        self.norm2 = nn.GroupNorm(1, conv2_w.shape[0])
+
+        self.register_buffer('gate_c', gate_c)
+        self.register_buffer('dim_mask', dim_mask)
+        self.register_buffer('g_plain', g_plain)
+        self.register_buffer('g_resnet', g_resnet)
+
     def forward(self, x):
-        if x.dim() == 2:
-            side = int((x.shape[1] // self.in_channels) ** 0.5)
-            x = x.reshape(-1, self.in_channels, side, side)
-            
-        h_prev = None
-        for layer in self.layers:
-            h_prev = layer(x, h_prev)
-            
-        h_pool = F.adaptive_avg_pool2d(h_prev, (7, 7))
-        h_pool = h_pool.reshape(x.shape[0], -1)
-        h_pool = self.ln(h_pool)
-        return self.fc(h_pool)
+        h_conv = self.conv(x)
+        h_norm = self.norm(h_conv)
+        h_plain = F.relu(h_norm) * self.dim_mask
 
-def export_static_model(model, sample_idx=0, in_channels=1):
-    """
-    Tr ch xu t m  h nh    c sinh ra b i HyperNetwork th nh m t m  h nh PyTorch t nh
-    ch  ch a   ng c u tr c v  tr ng s  th c t  (Hard Pruning).
-    """
-    S = model.structure
-    W = model.weights
-    
-    # L y th ng tin c u tr c c a sample_idx
-    L_max = S.layer_gates.shape[1]
-    gates = S.layer_gates[sample_idx] # [L_max]
-    
-    # T nh L_eff (s  l p th c s  ho t   ng, ch n >= 0.5)
-    L_eff = (gates > 0.5).sum().item()
-    if L_eff == 0: L_eff = 1 #  t nh t 1 l p
-    
-    # T nh D_eff (s  k nh)
-    dim_mask = S.dim_masks[sample_idx] # [L_max, D_max]
-    
-    exported_layers = []
-    
-    for i in range(L_eff):
-        d_mask = dim_mask[i]
-        out_c = (d_mask > 0.5).sum().item()
-        if out_c == 0: out_c = 1
-        
-        in_c = in_channels if i == 0 else exported_layers[-1].conv.out_channels
-        
-        w_conv = W[f"c{i+1}.weight"][sample_idx] # [D_max, in_c_max, 3, 3]
-        b_conv = W[f"c{i+1}.bias"][sample_idx] # [D_max]
-        
-        # C t x n (Slice) tr ng s  theo D_eff
-        w_conv = w_conv[:out_c, :in_c, :, :]
-        b_conv = b_conv[:out_c]
-        
-        # X c   nh Block Mode (0: Plain, 1: ResNet, 2: ViT)
-        mode = S.block_mode[sample_idx, i].argmax().item()
-        
-        w_qkv, b_qkv, w_proj, b_proj = None, None, None, None
-        if mode == 2:
-            attn_dim = out_c // 4
-            if attn_dim == 0: attn_dim = 1
-            w_qkv_full = W[f"attn{i+1}.qkv.weight"][sample_idx] # [3*attn_max, D_max, 1, 1]
-            b_qkv_full = W[f"attn{i+1}.qkv.bias"][sample_idx]
-            
-            w_qkv = w_qkv_full[:3*attn_dim, :out_c, :, :]
-            b_qkv = b_qkv_full[:3*attn_dim]
-            
-            w_proj_full = W[f"attn{i+1}.proj.weight"][sample_idx]
-            b_proj_full = W[f"attn{i+1}.proj.bias"][sample_idx]
-            
-            w_proj = w_proj_full[:out_c, :attn_dim, :, :]
-            b_proj = b_proj_full[:out_c]
-            
-        layer = ExportedLayer(i, in_c, out_c, w_conv, b_conv, mode, w_qkv, b_qkv, w_proj, b_proj)
-        exported_layers.append(layer)
-        
-    # Fully Connected Layer
-    fc_w_full = W["out.weight"][sample_idx] # [out_classes, 49 * D_max]
-    fc_b_full = W["out.bias"][sample_idx]
-    
-    last_out_c = exported_layers[-1].conv.out_channels
-    # fc_w is arranged as [out_c, 49 * D_max]. It is flattened from (D_max, 7, 7).
-    # We must reshape it to (out_classes, D_max, 7, 7), slice it to (out_classes, last_out_c, 7, 7), then flatten again
-    fc_w = fc_w_full.view(fc_w_full.shape[0], -1, 7, 7)
-    fc_w = fc_w[:, :last_out_c, :, :].reshape(fc_w_full.shape[0], -1)
-    
-    exported_model = ExportedModel(exported_layers, fc_w, fc_b_full, in_channels)
-    return exported_model
+        if self.is_first_layer:
+            h_expand = h_plain
+        else:
+            h_expand = x * self.dim_mask
 
+        h_resnet = F.relu(h_expand + self.norm2(self.conv2(h_plain))) * self.dim_mask
+
+        h_active = self.g_plain * h_plain + self.g_resnet * h_resnet
+        return self.gate_c * h_active + (1.0 - self.gate_c) * h_expand
 \end{lstlisting}
 
-\subsection{Experimental Benchmark Script}
-The \texttt{benchmark\_conv\_aml.py} script demonstrates the training loop, showing how we enforce the asymmetric learning rate between the ModelGenerator and TaskNetwork, and how we apply the efficiency metric.
-\begin{lstlisting}[language=Python, caption=benchmark conv aml.py (v1 listing): shows the retired disable\_vit plumbing; the ViT mode no longer exists in the current two-mode vocabulary.]
-"""
-Phase 3 Benchmark: ConvAML (Convolutional Architecture Mode Learning) vs Baselines on Raw Image Datasets
-Directly evaluates ConvAML on spatial image datasets (MNIST, Fashion-MNIST, CIFAR-10) without PCA feature reduction.
-"""
+### Experimental Benchmark Script
+The \texttt{experiments/benchmark\_conv\_aml.py} script demonstrates the training loop: how the ModelGenerator and TaskNetwork are constructed, how the efficiency penalty is weighted against the task objective, and how the model is evaluated on raw spatial images (MNIST, Fashion-MNIST, CIFAR-10) without PCA feature reduction.
 
-import sys, os, json, time, argparse, warnings
-warnings.filterwarnings("ignore")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+\paragraph{Version note.} The listing below is taken from the file that ships. An earlier release of this appendix embedded a v1 copy that still carried a \texttt{disable\_vit} flag; the ViT mode has since been retired and the flag no longer exists anywhere in the source. The inline comments are reproduced as written, since they record where each hyper-parameter default was fixed and by how much.
 
-import torch
-import torch.nn.functional as F
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from scipy import stats
-
-from mgn import ModelGenerator, TaskNetwork, MetaLoss, MetaTrainer, compute_aml_efficiency
-from experiments.benchmark_datasets import get_dataset
-from experiments.benchmark_baselines import SmallCNN, FixedMLP, ResNetBlockBaseline, train_torch
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {DEVICE}")
-
-def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-def make_conv_aml(input_dim, output_dim, in_channels):
-    num_p = 2
+\begin{lstlisting}[language=Python, caption=experiments/benchmark\_conv\_aml.py (current listing): supernet construction and loss weighting. lambda\_eff = 0.2 is the efficiency penalty; lambda\_balance = 0 because the routing-balance entropy term fought the task objective and cost about 3 points in controlled ablation.]
+def make_conv_aml(input_dim, output_dim, in_channels, fused=False):
     lp = 0.0
-    # C u tr c kh ng l : L=4, D=128 => p_allow t ng v t    ch a m ng si u to
+    # Huge architecture: L=4, D=128 => p_allow inflated to accommodate very large nets
     p_allow = 562186.0 if in_channels == 3 else 506762.0
     gen = ModelGenerator(
         input_dim=input_dim, output_dim=output_dim,
         max_layers=4, max_dim=128, dim_choices=(32, 64, 96, 128),
-        latent_dim=64, noise_dim=64, num_prototypes=num_p,
+        latent_dim=64, noise_dim=64, num_prototypes=4,
         use_conv=True, in_channels=in_channels
     )
-    exec_ = TaskNetwork()
+    exec_ = TaskNetwork(fused=fused)
+    # lambda_balance=0: the -entropy(pi_avg) routing-balance term (weight 1.0)
+    # fought the task objective and cost ~3 points in controlled ablations
+    # (probes/probe_gate_collapse.py, round 2); diversity emerges without it.
+    p_allow = 562186.0 if in_channels == 3 else 506762.0
     loss = MetaLoss(lambda_p=lp, lambda_c=1e-9, lambda_m=0,
-                    lambda_balance=1.0, lambda_stability=1e-6, lambda_design=0,
-                    lambda_eff=0.5, p_allowance=p_allow)
+                    lambda_balance=0.0, lambda_stability=1e-6, lambda_design=0,
+                    lambda_eff=0.2, p_allowance=p_allow)
     return gen, exec_, loss
 
-def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, test_y, epochs=100, batch_size=64, device=DEVICE):
+def train_conv_aml(gen, exec_, loss, train_x, train_y, val_x, val_y, test_x, test_y, epochs=100, batch_size=64, device=DEVICE, compile=False, compile_mode="default", gate_floor=0.0, gate_floor_end=0.0, freeze_arch_at=None):
     t0 = time.time()
-    trainer = MetaTrainer(gen, exec_, loss, lr=5e-4, device=device)
-    trainer.train(train_x, train_y, val_x=val_x, val_y=val_y, epochs=epochs, batch_size=batch_size)
-    elapsed = time.time() - t0
-    gen.eval()
-    with torch.no_grad():
-        def eval_conv_acc(x_tensor, y_tensor):
-            correct, total = 0, 0
-            for i in range(0, len(x_tensor), 256):
-                xb = x_tensor[i:i+256].to(device)
-                yb = y_tensor[i:i+256].to(device)
-                m = gen(xb)
-                correct += (exec_(xb, m).argmax(-1) == yb).sum().item()
-                total += len(yb)
-            return correct / total if total > 0 else 0.0
-
-        test_acc = eval_conv_acc(test_x, test_y)
-        train_acc = eval_conv_acc(train_x, train_y)
-        
-        sample_x = test_x[:512].to(device)
-        sample_m = gen(sample_x)
-        P = sample_m.structure.effective_params_formula().mean().item()
-        L = sample_m.structure.num_layers.mean().item()
-        D = sample_m.structure.hidden_dim.mean().item()
-        S = gen(train_x[:10].to(DEVICE), tau=0.1, noise_scale=0.0)
-        pi = F.softmax(gen.prototype_selector(gen.encoder(train_x[:10].view(10, -1).to(DEVICE))), dim=-1)
-        entropy = -(pi.mean(0) * torch.log(pi.mean(0) + 1e-8)).sum().item()
-        n_used = (pi.mean(0) > 0.01).sum().item()
-        
-        # Calculate ResNet block mode probability
-        resnet_pct = 0.0
-        vit_pct = 0.0
-        if getattr(S.structure, "block_mode", None) is not None:
-            resnet_pct = S.structure.block_mode[:, :, 1].mean().item() * 100.0
-            if S.structure.block_mode.shape[-1] > 2:
-                vit_pct = S.structure.block_mode[:, :, 2].mean().item() * 100.0
-        
-    return {
-        "test_acc": test_acc, "train_acc": train_acc, "P": P, "L": L, "D": D,
-        "entropy": entropy, "prototypes_used": n_used, "resnet_pct": resnet_pct, "vit_pct": vit_pct, "time": elapsed
-    }
-
-def run_conv_aml_benchmark(dataset_name="fashion_mnist", seeds=3, quick=False, fast=False, full=False, disable_vit=False, fixed_arch=False, only_baselines=False):
-    print(f"\n{'='*70}")
-    print(f"ConvAML Benchmark: {dataset_name} (seeds={seeds}, full={full}, disable_vit={disable_vit}, fixed_arch={fixed_arch})")
-    print(f"{'='*70}")
-    sys.stdout.flush()
-
-    if full:
-        max_train = None
-        max_test = None
-        epochs = 12
-    else:
-        max_train = 1200 if fast else (3000 if quick else 5000)
-        max_test = 400 if fast else (1000 if quick else 2000)
-        epochs = 25 if fast else (60 if quick else 120)
-
-    import argparse
-    # Check if a custom epochs value was passed globally
-    if hasattr(args, "epochs") and args.epochs is not None:
-        epochs = args.epochs
-
-    data = get_dataset(dataset_name, max_train=max_train, max_test=max_test)
-    in_channels = 3 if dataset_name == "cifar10" else 1
-    print(f"  Dataset: {dataset_name} | Input Dim: {data['input_dim']} ({in_channels} channels) | Output: {data['output_dim']}")
-    print(f"  Train samples: {data['n_train']} | Test samples: {data['n_test']}")
-    sys.stdout.flush()
-
-    results = {"dataset": dataset_name, "seeds": seeds, "methods": {}}
-
-    if not only_baselines:
-        # 1. ConvAML
-        print(f"\n--- ConvAML ({'GPU' if DEVICE=='cuda' else 'CPU'}, {seeds} seeds) ---")
-        sys.stdout.flush()
-        conv_list = []
-        for seed in range(seeds):
-            set_seed(42 + seed)
-            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
-            
-            if disable_vit:
-                gen.disable_vit = True
-                
-            if fixed_arch:
-                for p in gen.prototype_selector.parameters(): p.requires_grad = False
-                for p in gen.structure_delta.parameters(): p.requires_grad = False
-                for p in gen.block_mode_head.parameters(): p.requires_grad = False
-                
-            n_train = len(data["train_x"])
-            n_val = int(n_train * 0.2)
-            indices = torch.randperm(n_train)
-            train_idx = indices[:-n_val]
-            val_idx = indices[-n_val:]
-            
-            trx = data["train_x"][train_idx]
-            try_ = data["train_y"][train_idx]
-            vx = data["train_x"][val_idx]
-            vy = data["train_y"][val_idx]
-                
-            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs)
-            conv_list.append(res)
-            print(f"  [ConvAML Seed {seed}] Test Acc={res['test_acc']:.4f} | P_eff={int(res['P'])} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | ViT={res.get('vit_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={int(res['time'])}s")
-            sys.stdout.flush()
-
-        results["methods"]["ConvAML"] = {
-            "test_acc_mean": float(np.mean([r["test_acc"] for r in conv_list])),
-            "test_acc_std": float(np.std([r["test_acc"] for r in conv_list], ddof=1)) if seeds > 1 else 0.0,
-            "P_mean": float(np.mean([r["P"] for r in conv_list])),
-            "P_std": float(np.std([r["P"] for r in conv_list], ddof=1)) if seeds > 1 else 0.0,
-            "time_mean": float(np.mean([r["time"] for r in conv_list])),
-            "all_test_accs": [r["test_acc"] for r in conv_list],
-            "all_Ps": [r["P"] for r in conv_list],
-            "avg_L": float(np.mean([r.get("L", 0.0) for r in conv_list])),
-            "avg_entropy": float(np.mean([r.get("entropy", 0.0) for r in conv_list])),
-            "avg_prototypes_used": float(np.mean([r.get("prototypes_used", 0) for r in conv_list])),
-        }
-
-        # ConvAML No O
-        print(f"\n--- ConvAML (No O) (CPU, {seeds} seeds) ---")
-        sys.stdout.flush()
-        conv_no_o_list = []
-        for seed in range(seeds):
-            set_seed(42 + seed)
-            gen, exec_, loss = make_conv_aml(data["input_dim"], data["output_dim"], in_channels)
-            loss.lambda_eff = 0.0
-            
-            if disable_vit:
-                gen.disable_vit = True
-                
-            if fixed_arch:
-                for p in gen.prototype_selector.parameters(): p.requires_grad = False
-                for p in gen.structure_delta.parameters(): p.requires_grad = False
-                for p in gen.block_mode_head.parameters(): p.requires_grad = False
-            
-            n_train = len(data["train_x"])
-            n_val = int(n_train * 0.2)
-            indices = torch.randperm(n_train)
-            train_idx = indices[:-n_val]
-            val_idx = indices[-n_val:]
-            trx = data["train_x"][train_idx]
-            try_ = data["train_y"][train_idx]
-            vx = data["train_x"][val_idx]
-            vy = data["train_y"][val_idx]
-                
-            res = train_conv_aml(gen, exec_, loss, trx, try_, vx, vy, data["test_x"], data["test_y"], epochs=epochs)
-            conv_no_o_list.append(res)
-            print(f"  [ConvAML No O Seed {seed}] Test Acc={res['test_acc']:.4f} | P_eff={res['P']:.0f} | L={res['L']:.2f} | D={res['D']:.1f} | ResNet={res.get('resnet_pct', 0.0):.1f}% | H={res.get('entropy', 0.0):.3f} | t={res['time']:.0f}s")
-            sys.stdout.flush()
-
-        results["methods"]["ConvAML_No_O"] = {
-            "test_acc_mean": float(np.mean([r["test_acc"] for r in conv_no_o_list])),
-            "test_acc_std": float(np.std([r["test_acc"] for r in conv_no_o_list], ddof=1)) if seeds > 1 else 0.0,
-            "P_mean": float(np.mean([r["P"] for r in conv_no_o_list])),
-            "P_std": float(np.std([r["P"] for r in conv_no_o_list], ddof=1)) if seeds > 1 else 0.0,
-            "time_mean": float(np.mean([r["time"] for r in conv_no_o_list])),
-        }
-
-    # 2. SmallCNN Baseline
-    print(f"\n--- SmallCNN Baseline (Raw Image CNN, {seeds} seeds) ---")
-    sys.stdout.flush()
-    cnn_list = []
-    for seed in range(seeds):
-        set_seed(42 + seed)
-        cnn = SmallCNN(in_channels, data["input_dim"], data["output_dim"])
-        res = train_torch(cnn, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
-        cnn_list.append(res)
-        print(f"  [SmallCNN Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
-        sys.stdout.flush()
-
-    results["methods"]["SmallCNN"] = {
-        "test_acc_mean": float(np.mean([r["test_acc"] for r in cnn_list])),
-        "test_acc_std": float(np.std([r["test_acc"] for r in cnn_list], ddof=1)) if seeds > 1 else 0.0,
-        "P_mean": float(np.mean([r["P"] for r in cnn_list])),
-        "P_std": float(np.std([r["P"] for r in cnn_list], ddof=1)) if seeds > 1 else 0.0,
-        "time_mean": float(np.mean([r["time"] for r in cnn_list])),
-        "all_test_accs": [r["test_acc"] for r in cnn_list],
-        "all_Ps": [r["P"] for r in cnn_list],
-    }
-
-    # 3. Dense MLP Baseline
-    print(f"\n--- FixedMLP Baseline (L=2, D=64, {seeds} seeds) ---")
-    sys.stdout.flush()
-    mlp_list = []
-    for seed in range(seeds):
-        set_seed(42 + seed)
-        mlp = FixedMLP(data["input_dim"], 64, 2, data["output_dim"])
-        res = train_torch(mlp, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
-        mlp_list.append(res)
-        print(f"  [FixedMLP Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
-        sys.stdout.flush()
-
-    results["methods"]["FixedMLP"] = {
-        "test_acc_mean": float(np.mean([r["test_acc"] for r in mlp_list])),
-        "test_acc_std": float(np.std([r["test_acc"] for r in mlp_list], ddof=1)) if seeds > 1 else 0.0,
-        "P_mean": float(np.mean([r["P"] for r in mlp_list])),
-        "P_std": float(np.std([r["P"] for r in mlp_list], ddof=1)) if seeds > 1 else 0.0,
-        "time_mean": float(np.mean([r["time"] for r in mlp_list])),
-        "all_test_accs": [r["test_acc"] for r in mlp_list],
-        "all_Ps": [r["P"] for r in mlp_list],
-    }
-
-    # 4. ResNet Block Baseline (ResNet-8)
-    print(f"\n--- ResNetBlock Baseline (ResNet-8, {seeds} seeds) ---")
-    sys.stdout.flush()
-    resnet_list = []
-    for seed in range(seeds):
-        set_seed(42 + seed)
-        resnet = ResNetBlockBaseline(in_channels, data["input_dim"], data["output_dim"], base_channels=32)
-        res = train_torch(resnet, data["train_x"], data["train_y"], data["test_x"], data["test_y"], epochs=epochs, device=DEVICE)
-        resnet_list.append(res)
-        print(f"  [ResNetBlock Seed {seed}] Test Acc={res['test_acc']:.4f} | P={res['P']} | t={res['time']:.0f}s")
-        sys.stdout.flush()
-
-    results["methods"]["ResNetBlock"] = {
-        "test_acc_mean": float(np.mean([r["test_acc"] for r in resnet_list])),
-        "test_acc_std": float(np.std([r["test_acc"] for r in resnet_list], ddof=1)) if seeds > 1 else 0.0,
-        "P_mean": float(np.mean([r["P"] for r in resnet_list])),
-        "P_std": float(np.std([r["P"] for r in resnet_list], ddof=1)) if seeds > 1 else 0.0,
-        "time_mean": float(np.mean([r["time"] for r in resnet_list])),
-        "all_test_accs": [r["test_acc"] for r in resnet_list],
-        "all_Ps": [r["P"] for r in resnet_list],
-    }
-
-    return results
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--datasets", type=str, default="fashion_mnist")
-    parser.add_argument("--seeds", type=int, default=2)
-    parser.add_argument("--quick", action="store_true")
-    parser.add_argument("--fast", action="store_true")
-    parser.add_argument("--full", action="store_true")
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--disable-vit", action="store_true")
-    parser.add_argument("--fixed-arch", action="store_true")
-    parser.add_argument("--only-baselines", action="store_true")
-    args = parser.parse_args()
-
-    ds_names = [d.strip() for d in args.datasets.split(",")]
-    all_res = []
-    for ds in ds_names:
-        r = run_conv_aml_benchmark(ds, seeds=args.seeds, quick=args.quick, fast=args.fast, full=args.full, disable_vit=args.disable_vit, fixed_arch=args.fixed_arch, only_baselines=args.only_baselines)
-        all_res.append(r)
-        with open(f"experiments/conv_aml_{ds}.json", "w") as f:
-            json.dump(r, f, indent=2)
-
-    with open("experiments/conv_aml_all.json", "w") as f:
-        json.dump(all_res, f, indent=2)
-
-    print("\n" + "=" * 70)
-    print("ConvAML Benchmark Summary Table")
-    print("=" * 70)
-    for r in all_res:
-        ds = r["dataset"]
-        print(f"\nDataset: {ds}")
-        print(f"  {'Method':<14} {'Test Acc (mean std)':<24} {'Params (P_eff)':<16} {'Efficiency*':<14}")
-        print(f"  {'-'*14} {'-'*24} {'-'*16} {'-'*14}")
-        for method, m in r["methods"].items():
-            ta = m["test_acc_mean"]
-            ts = m.get("test_acc_std", 0.0)
-            pm = m["P_mean"]
-            p_allow = 110986.0 if ds in ("mnist", "fashion_mnist") else 148426.0
-            eff = compute_aml_efficiency(ta, p_allow, pm)
-            print(f"  {method:<14} {ta:.4f} {ts:.4f}          {pm:>8.0f}        {eff:.5f}")
-    print("\n* Balanced Efficiency = [a / log10(p^2/q)] * (p/q)^(a * |a log10 a|) (where p is baseline parameter allowance)")
-
+    # lr=1e-3: matches the plain baselines' optimizer scale; +2 points over
+    # the old 5e-4 in controlled ablation (probes/probe_gate_collapse.py,
+    # rounds 4-5). lambda_balance=0 likewise per round 2 (+3.1).
+    # weight_decay=0.01: non-monotonic sweep found 0.05 too strong and 0
+    # too weak (+0.9 vs both, round 6).
+    trainer = MetaTrainer(gen, exec_, loss, lr=1e-3, device=device,
 \end{lstlisting}
 
 \section{Extended Mathematical Proofs}
@@ -3326,208 +2933,31 @@ where $\delta_{ik}$ is the Kronecker delta. Since $g_i \in (0, 1)$, we have:
 During the late stages of meta-training, we anneal $\tau \to \tau_{\min} = 0.3$. Therefore, the gradient scaling factor introduced by the Gumbel-Softmax relaxation is bounded by $1/0.3 \approx 3.33$. Because our downstream penalty $F_{\text{norm}}'$ is strictly bounded by $\lambda=2$, the overall meta-gradient with respect to the routing logits is unconditionally bounded, eliminating the possibility of gradient explosion regardless of the optimization trajectory.
 
 
-\subsection{Unit Testing and Export Verification}
-To ensure the correctness of the Hard Pruning extraction logic, we implemented comprehensive unit tests. The \texttt{test\_export.py} script acts as an integration test, verifying that the \texttt{ExportedModel} correctly initializes and runs forward passes without the heavy meta-generator overhead.
-\begin{lstlisting}[language=Python, caption=test export.py (v1 listing): the extraction test now lives in tests/test\_mgn\_semantics.py and tests/test\_train\_smoke.py in CI.]
-import torch
-from experiments.benchmark_conv_aml import make_conv_aml
-from mgn.export import export_static_model
-from mgn.generator import GeneratedModel
+### Unit Testing and Export Verification
+Extraction correctness is covered by the CI suite rather than by a standalone
+integration script. The earlier \texttt{test\_export.py} and
+\texttt{test\_conv\_aml.py} scripts were removed once their assertions were
+folded into the pytest suite, which now runs 134 tests on every push.
 
-def test():
-    print("Initializing Meta-Generator...")
-    gen, exec_, loss = make_conv_aml(784, 10, 1)
-    
-    print("Running a forward pass to generate weights for a batch of 2...")
-    x_in = torch.randn(2, 784)
-    model = gen(x_in, tau=1.0, noise_scale=0.1)
-    S = model.structure
-    W = model.weights
-    
-    # Force some gates and masks to simulate pruning
-    S.layer_gates[0, 2:] = 0.0 # Force layer 3 and 4 to 0
-    S.dim_masks[0, :, 64:] = 0.0 # Force channels to 64
-    S.block_mode[0, 0, 0] = 1.0 # Force PlainConv for layer 1
-    S.block_mode[0, 1, 1] = 1.0 # Force ResNet for layer 2
-    
-    print("\nExporting model for sample 0 (Hard Pruning)...")
-    static_model = export_static_model(model, sample_idx=0, in_channels=1)
-    
-    print("\n[Exported Architecture]")
-    print(static_model)
-    
-    print("\nTesting static model forward pass...")
-    # Static model can take batch size >= 1
-    x_test = torch.randn(16, 1, 28, 28)
-    out = static_model(x_test)
-    print(f"Output shape (expected 16, 10): {out.shape}")
-    
-    params = sum(p.numel() for p in static_model.parameters())
-    print(f"\nTotal parameters in exported model: {params}")
-    print("Compare this to the 500,000+ parameters generated by the HyperNetwork!")
+\paragraph{What replaced them.}
+\begin{itemize}
+\item \texttt{tests/test\_mgn\_semantics.py} -- generator/executor semantics,
+      including the two-convolution residual block.
+\item \texttt{tests/test\_train\_smoke.py} -- end-to-end forward/backward,
+      determinism of the eval path, and that frozen prototype rows neither
+      receive gradients nor drift across an optimisation run.
+\item \texttt{tests/test\_dynamic\_depth\_routing.py} -- layer-gate behaviour,
+      depth short-circuiting, and the open-set fallback protocol.
+\item \texttt{tests/test\_domain\_router.py} -- the domain router, including a
+      regression test that two distinct encoders must stay distinguishable under
+      bf16 autocast.
+\end{itemize}
 
-if __name__ == '__main__':
-    test()
-
-\end{lstlisting}
-
-
-\subsection{Testing the Complete AML Pipeline}
-The \texttt{test\_conv\_aml.py} script executes end-to-end unit tests on the AML components, verifying the forward pass of the TaskNetwork, the parameter counting logic, and the penalty computation across different tensor shapes and batch sizes.
-\begin{lstlisting}[language=Python, caption=test conv aml.py (v1 listing): superseded; end-to-end coverage now runs via tests/test\_train\_smoke.py (\texttt{python -m pytest tests}).]
-"""
-Verification and Test Suite for ConvAML (Convolutional Architecture Mode Learning)
-"""
-import torch
-import numpy as np
-import time
-
-from mgn import (
-    ModelGenerator,
-    TaskNetwork,
-    MetaLoss,
-    MetaTrainer,
-    ModelEvaluator,
-    ResourceBudget,
-    phi_cost,
-    arch_distance,
-)
-
-print("=" * 70)
-print("ConvAML -- Convolutional Architecture Mode Learning Verification Suite")
-print("=" * 70)
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {device}")
-
-# Test 1: ConvAML on 1-channel image inputs (e.g., MNIST 28x28 = 784)
-print("\n[Test 1] ConvAML Generator Initialization & Forward (1-channel 28x28)")
-B = 16
-x_img1 = torch.randn(B, 1, 28, 28, device=device)
-y_img1 = torch.randint(0, 10, (B,), device=device)
-
-gen_conv1 = ModelGenerator(
-    input_dim=784,
-    output_dim=10,
-    max_layers=3,
-    max_dim=64,
-    dim_choices=(16, 32, 64),
-    latent_dim=64,
-    noise_dim=8,
-    num_prototypes=8,
-    use_conv=True,
-    in_channels=1,
-).to(device)
-
-exec_conv = TaskNetwork().to(device)
-
-with torch.no_grad():
-    model1 = gen_conv1(x_img1)
-    logits1 = exec_conv(x_img1, model1)
-    acc1 = (logits1.argmax(dim=-1) == y_img1).float().mean().item()
-    P_eff1 = model1.structure.effective_params_formula().mean().item()
-    flops1 = model1.structure.flops_per_sample().mean().item()
-    print(f"  Logits shape:      {logits1.shape}")
-    print(f"  Initial Accuracy:  {acc1:.4f}")
-    print(f"  Average P_eff:     {P_eff1:.0f} parameters")
-    print(f"  Average FLOPs:     {flops1:.0f} FLOPs per sample")
-    assert logits1.shape == (B, 10), f"Expected shape ({B}, 10), got {logits1.shape}"
-    assert "c1.weight" in model1.weights, "c1.weight not generated!"
-    assert "c1.weight" in model1.weights, "c1.weight not generated for 3-channel!"
-
-print("  => Test 1 PASSED: ConvAML correctly generates & executes 1-channel spatial convolutions.")
-
-# Test 2: ConvAML on 3-channel image inputs (e.g., CIFAR-10 3x32x32 = 3072)
-print("\n[Test 2] ConvAML Generator Initialization & Forward (3-channel 32x32)")
-x_img3 = torch.randn(B, 3, 32, 32, device=device)
-y_img3 = torch.randint(0, 10, (B,), device=device)
-
-gen_conv3 = ModelGenerator(
-    input_dim=3072,
-    output_dim=10,
-    max_layers=3,
-    max_dim=64,
-    dim_choices=(16, 32, 64),
-    latent_dim=64,
-    noise_dim=8,
-    num_prototypes=8,
-    use_conv=True,
-    in_channels=3,
-).to(device)
-
-with torch.no_grad():
-    model3 = gen_conv3(x_img3)
-    logits3 = exec_conv(x_img3, model3)
-    P_eff3 = model3.structure.effective_params_formula().mean().item()
-    print(f"  Logits shape:      {logits3.shape}")
-    print(f"  Average P_eff:     {P_eff3:.0f} parameters")
-    assert logits3.shape == (B, 10), f"Expected shape ({B}, 10), got {logits3.shape}"
-    assert model3.weights["conv1.weight"].shape[2] == 3, f"Expected 3 channels, got {model3.weights['conv1.weight'].shape[2]}"
-
-print("  => Test 2 PASSED: ConvAML correctly generates & executes 3-channel spatial convolutions.")
-
-# Test 3: ConvAML Meta-Training & Prototype Diversity
-print("\n[Test 3] ConvAML Meta-Training on Synthetic Spatial Patterns")
-# Generate synthetic spatial dataset where class 0 has horizontal bars and class 1 has vertical bars
-x_train = torch.randn(128, 1, 28, 28, device=device) * 0.1
-y_train = torch.zeros(128, dtype=torch.long, device=device)
-for i in range(128):
-    if i % 2 == 0:
-        x_train[i, 0, 12:16, :] += 1.5  # Horizontal bar -> class 0
-        y_train[i] = 0
-    else:
-        x_train[i, 0, :, 12:16] += 1.5  # Vertical bar -> class 1
-        y_train[i] = 1
-
-meta_loss = MetaLoss(
-    lambda_p=1e-5,
-    lambda_c=1e-7,
-    lambda_m=1e-8,
-    lambda_balance=0.05,
-    lambda_stability=0.01,
-)
-
-trainer = MetaTrainer(
-    generator=gen_conv1,
-    executor=exec_conv,
-    meta_loss=meta_loss,
-    lr=2e-3,
-    device=device,
-)
-
-t0 = time.time()
-trainer.train(x_train, y_train, epochs=40, batch_size=32)
-elapsed = time.time() - t0
-
-with torch.no_grad():
-    model_eval = gen_conv1(x_train)
-    logits_eval = exec_conv(x_train, model_eval)
-    train_acc = (logits_eval.argmax(dim=-1) == y_train).float().mean().item()
-    usage = trainer.prototype_usage(x_train)
-
-print(f"  Training time:     {elapsed:.2f}s")
-print(f"  Trained Accuracy:  {train_acc:.4f}")
-print(f"  Prototypes used:   {usage['num_prototypes_used']}/8")
-print(f"  Prototype entropy: {usage['entropy']:.4f}")
-assert train_acc > 0.85, f"Expected >85% accuracy on synthetic bars, got {train_acc:.4f}"
-
-print("  => Test 3 PASSED: ConvAML successfully meta-trains on spatial features.")
-
-# Test 4: Resource-Constrained Projection & Cost
-print("\n[Test 4] Resource Cost & Architecture Mode Distances in ConvAML")
-with torch.no_grad():
-    cost_conv = phi_cost(model_eval.structure, lambda_p=1e-5, lambda_c=1e-7, lambda_m=1e-8)
-    d_arch = arch_distance(model_eval, model_eval)
-    print(f"  Mean resource cost phi(A): {cost_conv.mean().item():.6f}")
-    print(f"  Self distance d(A, A):     {d_arch.item():.6f}")
-    assert d_arch.item() < 1e-5, "Self distance should be ~0"
-
-print("  => Test 4 PASSED: ConvAML cost functions verified.")
-
-print("\n" + "=" * 70)
-print("All 4 ConvAML verification tests pass cleanly!")
-print("=" * 70)
-
-\end{lstlisting}
+\paragraph{A note on how these tests were written.} The extraction and routing
+suites were each added in response to a defect that unit tests written alongside
+the original code had not caught. In particular, the bf16 regression arose
+because every offline measurement had been taken in fp32 on CPU while the
+trainer runs bf16 on GPU: the code was correct in isolation and wrong in situ.
+The test now asserts against the precision the trainer actually uses.
 
 \end{document}

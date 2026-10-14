@@ -768,6 +768,56 @@ checking a hypothesis, never for confirming one. And `route_acc` now exists so
 that "is this the router or something downstream" is answered by the log rather
 than by a script written after the fact.
 
+### B28 — the static extractor could not accept the model it was written for
+
+`AML_Core_Code/extract_static_model.py` only handled the legacy
+`ConvAML_CIFAR_TrueDynamic`. Handing it a `ConvAML_18Layer_Hybrid` produced
+
+```
+AttributeError: 'ConvAML_18Layer_Hybrid' object has no attribute 'ood_router'
+```
+
+Worse, the guard was the reason it was not caught earlier: it checked only for
+`structure_prototypes` and `proto_weights`, and the hybrid has both. So a
+completely unsupported model passed validation and failed deep inside the
+extraction path. `extract_child` now dispatches on the actual class.
+
+The two supernets are structurally different, not just differently named:
+
+| | legacy TrueDynamic | 18-layer hybrid |
+|---|---|---|
+| routing | `ood_router` | `prototype_selector` |
+| conv weights | inside `proto_weights` | real submodules (`block.plain/.resnet/.vit`) |
+| block modes | 2 | 3 (Plain / ResNet / ViT) |
+| trunk prefix | none | conv stem 3 -> max_dim |
+| head norm | implicit | affine `LayerNorm` |
+| prototype layout | `get_prototype_layout` | `[K, wo_size + num_classes]` |
+
+Because there is no weighted sum to fold, the 2-conv `StaticLayer` does not
+generalise; a new `StaticHybridBlock` keeps the `argmax` branch per layer, which
+is what `HybridBlock.forward` already collapses to once the weights are one-hot.
+Offsets are read off the model rather than from `get_prototype_layout` — the two
+layouts describe different tensors, and that mismatch is how the drift happened.
+
+Measured on the default config: **624,346 parameters / 2.50 MB**, against
+1,874,073 / 7.50 MB for the supernet. Ten tests in
+`tests/test_extract_static_model.py`.
+
+### B29 — the paper embedded source that no longer exists
+
+The appendix carried ~780 lines of `lstlisting` copied from v1 files that had
+since been deleted (`export.py`, `test_export.py`, `test_conv_aml.py`), plus a
+benchmark listing that still showed a retired `disable_vit` flag. The
+`ExportedModel` name in the body text was also stale.
+
+Replaced with listings taken from the files that ship, each with a version note
+stating what changed and why it mattered — notably that the old `ExportedLayer`
+carried one convolution where the AML block has two, so an extracted residual
+branch would not have been a faithful replica. The two test sections now
+describe the 134-test CI suite that replaced the standalone scripts. Also fixed
+a dangling `Listing~\ref{lst:export}` and two `eq:block` references that point
+at labels which do not exist; every `\ref` in the file now resolves.
+
 ### B20 — the autonomous router is now the binding constraint
 
 With BatchNorm removed and a strong backbone, the remaining error concentrates in
