@@ -536,6 +536,56 @@ A_live:  A[1,1] 98.05%  →  A[2,1] 3.52%  →  A[3,1] 28.99%
 | B8 | Stale `mgn` in site-packages shadowed the repo | Scripts run from subdirectories imported a copy with **no `mgn/blocks/` at all** |
 | B9 | P2 thresholded the gate at `0.5` | Only `gate <= 0` is an exact identity. Domain routing supplies **soft** slot means in (0,1); a slot gate of `0.2` must blend as `0.2·h_cand + 0.8·h`, and short-circuiting it would silently change the routed model's output. Threshold lowered to `gate_skip_eps = 1e-6`. |
 
+### B19 — EWC does not work at production scale
+
+The full run `--epochs 5,28,16 --ewc-lambda 100` refutes the short-schedule result:
+
+| protocol | BWT | forgetting | §2d short-schedule claim |
+|---|---|---|---|
+| `A_live` | **−59.23 %** | **59.23 %** | was 23.05 % |
+| `A_auto` | −48.07 % | 48.07 % | was 9.84 % |
+| `A_oracle` | +0.00 % | 0.00 % | unchanged |
+
+Every EWC figure in this document — §2c, §2d, and the shared-backbone A/B in
+§"3A" — came from `--steps 50`, where CIFAR-10 saw a quarter of one epoch. At
+5 460 steps the diagonal-Fisher anchor with λ=100 is simply too weak: the shared
+trunk drifts regardless. The `--steps 50` numbers are marked superseded in
+README rather than deleted, so the discrepancy stays visible.
+
+**Conclusion:** EWC as implemented is not a working anti-forgetting mechanism
+here. The earlier "halves live forgetting" claim does not survive scale.
+
+### B20 — the autonomous router is now the binding constraint
+
+With BatchNorm removed and a strong backbone, the remaining error concentrates in
+one place:
+
+```
+A[2,1]  MNIST after CIFAR-10   auto  8.01 %   |  oracle 97.94 %
+A[3,1]  MNIST after Fashion    auto 26.33 %   |  oracle 97.94 %
+A[3,2]  CIFAR after Fashion     auto 43.19 %   |  oracle 67.91 %
+```
+
+`A_oracle` holds 97.94 % on MNIST through both later tasks, so **the stored
+snapshot is fine**. The failure is entirely `dom_head` selecting the wrong
+domain, after which the model is evaluated under a snapshot whose prototype rows
+for the true domain were never trained. This is not a storage problem and not a
+normalization problem — it is a routing-accuracy problem, and it is now the
+single largest source of error in the system.
+
+### Full-scale run summary (InstanceNorm, `--epochs 5,28,16`, seed 42)
+
+| | MNIST | CIFAR-10 | Fashion |
+|---|---|---|---|
+| `A_oracle` | 97.94 % (stable) | 67.91 % | 92.11 % |
+| `A_auto` | 97.94 % → 8.01 % → 26.33 % | 67.72 % → 43.19 % | 74.63 % |
+| `A_live` | 98.09 % → 28.00 % → 16.23 % | 68.03 % → 31.43 % | 92.09 % |
+
+InstanceNorm is confirmed at scale — three tasks, monotonic curves, and the three
+eval protocols agree to within 0.3 pt on the diagonal (67.72 / 67.91 / 68.03),
+where BatchNorm had them 29 pt apart. The normalization finding (B16) holds; the
+EWC and 3A findings do not.
+
 ### B16 — BatchNorm running statistics were the real accuracy ceiling
 
 Not an external review finding: this came out of the full production run, and it

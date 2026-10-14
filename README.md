@@ -90,15 +90,55 @@ python train_continual_aml.py --model-type hybrid18 \
 
 Measured on **NVIDIA GeForce RTX 3050 Laptop GPU**, `bfloat16`, `--replay-per-class 0`.
 
-Three protocols are reported side by side:
+### 3.1a Full production run (2026-10-14)
 
-| Protocol | Task identity at test time | What it measures |
-| :-- | :-- | :-- |
-| `A_oracle` | given | Task-IL upper bound — snapshot retrieval with the true task id |
-| `A_auto` | **not** given | Domain-IL / Class-IL via the autonomous centroid router |
-| `A_live` | n/a | Standard CL baseline — current mutable weights |
+`--epochs 5,28,16 --ewc-lambda 100`, seed 42, InstanceNorm.
 
-#### `A_oracle` — task-oracle snapshot retrieval
+**`A_oracle` — task-oracle snapshot retrieval**
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+| :-- | --: | --: | --: |
+| after MNIST | **97.94 %** | — | — |
+| after CIFAR-10 | **97.94 %** | **67.91 %** | — |
+| after Fashion | **97.94 %** | **67.91 %** | **92.11 %** |
+
+**BWT = +0.00 % · Forgetting = 0.00 %** — MNIST is bit-stable at 97.94 % through
+both later tasks.
+
+**`A_live` — standard mutable weights**
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+| :-- | --: | --: | --: |
+| after MNIST | 98.09 % | — | — |
+| after CIFAR-10 | 28.00 % | 68.03 % | — |
+| after Fashion | 16.23 % | 31.43 % | 92.09 % |
+
+**BWT = −59.23 % · Forgetting = 59.23 %**
+
+**`A_auto` — autonomous centroid router, no task identity**
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+| :-- | --: | --: | --: |
+| after MNIST | 97.94 % | — | — |
+| after CIFAR-10 | **8.01 %** | 67.72 % | — |
+| after Fashion | 26.33 % | 43.19 % | 74.63 % |
+
+**BWT = −48.07 % · Forgetting = 48.07 %**
+
+> **Two negative results from this run, stated plainly.**
+>
+> **1. EWC did not help.** `--ewc-lambda 100` gives `A_live` forgetting 59.23 %,
+> *worse* than the recorded 46.50 % baseline. Earlier EWC and shared-backbone
+> numbers in this README came from `--steps 50` runs and **do not hold at full
+> scale** — they are kept below but are no longer evidence of anything. The
+> Fisher anchor is evidently too weak against a 5 460-step CIFAR schedule.
+>
+> **2. The router is the binding constraint.** `A_auto` collapses to 8.01 % on
+> MNIST after CIFAR-10 while `A_oracle` holds 97.94 % — the snapshot is fine, the
+> router simply picks the wrong domain. This is now the single largest source of
+> error in the system, and it is a routing-accuracy problem, not a storage one.
+
+#### Historical `A_oracle` (pre-2026-10-14, `--norm bn`, `--epochs 3,10,6`)
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
@@ -113,7 +153,7 @@ Three protocols are reported side by side:
 > catastrophic forgetting entirely (**zero-forgetting**, BWT = 0.00 %) without
 > storing a single replay exemplar image.
 
-#### `A_live` — standard mutable weights
+#### Historical `A_live` (same older configuration)
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
@@ -226,7 +266,14 @@ Reported per-stage block-mode probabilities:
 Full investigation log with every measurement:
 [`experiments/dynamic_depth_routing_2026-10-14.md`](experiments/dynamic_depth_routing_2026-10-14.md)
 
-#### Shared backbone (P4-3A) — a trade, not a free win
+#### Shared backbone (P4-3A) — short-schedule result, not confirmed
+
+> **Superseded.** The figures below come from a `--steps 50` schedule (CIFAR-10
+> saw a quarter of one epoch). The full run above shows EWC failing at scale, so
+> these numbers should not be cited. Kept only to document what was tried.
+
+`--shared-backbone 1` stores no per-task copy of the trunk and leaves EWC solely
+responsible for retention. Same schedule, same seed, only that flag differs:
 
 `--shared-backbone 1` stores no per-task copy of the trunk and leaves EWC solely
 responsible for retention. Same schedule, same seed, only that flag differs:
