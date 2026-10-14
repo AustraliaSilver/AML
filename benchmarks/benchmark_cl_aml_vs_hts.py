@@ -118,6 +118,10 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
             {"params": [aml_model.proto_weights, aml_model.structure_prototypes, aml_model.block_mode_prototypes], "lr": 1.5e-3, "weight_decay": 1e-5},
         ]
         opt = torch.optim.AdamW(params)
+        # The routing head (whether it is a learned linear or a centroid
+        # prototype) must also be optimised, otherwise autonomous routing
+        # never trains on this benchmark.
+        opt_dom = torch.optim.AdamW(dom_head.parameters(), lr=1e-3, weight_decay=0.0)
 
         t_task_start = time.time()
         for ep in range(1, epochs_aml[i] + 1):
@@ -126,6 +130,7 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
             for x, y in loaders[t_name]:
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 opt.zero_grad(set_to_none=True)
+                opt_dom.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast("cuda", enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
                     out, _, pi, diag = aml_model(x, tau=0.8, pi_mask=pi_mask)
@@ -138,10 +143,18 @@ def run_benchmark(epochs_aml=(2, 2, 2), epochs_hts=(2, 2, 2), batch_size=128, st
                         eye = torch.eye(sim.shape[0], device=device)
                         loss = loss + 0.05 * ((sim - eye) ** 2).mean()
 
+                    if diag is not None and "z" in diag:
+                        z_norm = F.normalize(diag["z"].float(), dim=1)
+                        dom_logits = dom_head(z_norm)
+                        valid = i + 1
+                        loss = loss + 0.3 * F.cross_entropy(dom_logits[:, :valid], torch.full((x.shape[0],), i, device=device, dtype=torch.long))
+
                 loss.backward()
                 aml_isolator.mask_grad()
                 torch.nn.utils.clip_grad_norm_(aml_model.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(dom_head.parameters(), 5.0)
                 opt.step()
+                opt_dom.step()
                 aml_isolator.restore()
 
                 batch_count += 1

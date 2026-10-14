@@ -244,6 +244,12 @@ def train_aml_continual(tasks, data_root, epochs_per_task=1, batch_cap=40, eval_
         # Evaluate on all seen tasks
         for prev_idx in range(task_idx + 1):
             _, te_prev = get_task_data(tasks[prev_idx], data_root, workers=0)
+            # Prototype-row mask for the task this snapshot/eval targets: each
+            # sample may only use the rows that its task owns.
+            pi_mask_prev = torch.zeros(model.K, device=device, dtype=torch.bool)
+            _s = round(prev_idx * model.K / T)
+            _e = round((prev_idx + 1) * model.K / T)
+            pi_mask_prev[_s:_e] = True
             
             # 1. Live mutable evaluation (no snapshot)
             correct_l, total_l = 0, 0
@@ -253,21 +259,32 @@ def train_aml_continual(tasks, data_root, epochs_per_task=1, batch_cap=40, eval_
                     if step >= eval_cap:
                         break
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    out, _, _, _ = model(x, tau=0.1)
+                    out, _, _, _ = model(x, tau=0.1, pi_mask=pi_mask_prev)
                     correct_l += (out.argmax(-1) == y).sum().item()
                     total_l += y.numel()
             A_live[task_idx][prev_idx] = (correct_l / total_l) * 100.0
 
             # 2. Snapshot Retrieval (Task-IL Oracle)
-            # Temporarily restore snapshot for prev_idx
+            # Temporarily restore FULL snapshot for prev_idx: every functional
+            # block that was snapshotted (enc, sel, protos, stem, layers, ln,
+            # structure heads) must be swapped, otherwise the snapshot degenerates
+            # into a partial swap and the numbers are meaningless.
+            cur_enc = {k: v.detach().clone() for k, v in model.vision_encoder.state_dict().items()}
+            cur_sel = {k: v.detach().clone() for k, v in model.prototype_selector.state_dict().items()}
             cur_stem = {k: v.detach().clone() for k, v in model.stem.state_dict().items()}
             cur_layers = {k: v.detach().clone() for k, v in model.layers.state_dict().items()}
+            cur_ln = ( {k: v.detach().clone() for k, v in model.ln.state_dict().items()}
+                      if hasattr(model, "ln") else None)
             cur_protos = model.proto_weights.detach().clone()
             cur_sprotos = model.structure_prototypes.detach().clone()
             cur_bmprotos = model.block_mode_prototypes.detach().clone()
 
+            model.vision_encoder.load_state_dict(dom_snaps[prev_idx]["enc"])
+            model.prototype_selector.load_state_dict(dom_snaps[prev_idx]["sel"])
             model.stem.load_state_dict(dom_snaps[prev_idx]["stem"])
             model.layers.load_state_dict(dom_snaps[prev_idx]["layers"])
+            if cur_ln is not None and "ln" in dom_snaps[prev_idx]:
+                model.ln.load_state_dict(dom_snaps[prev_idx]["ln"])
             model.proto_weights.data.copy_(dom_snaps[prev_idx]["protos"])
             model.structure_prototypes.data.copy_(dom_snaps[prev_idx]["struct_heads"]["sprotos"])
             model.block_mode_prototypes.data.copy_(dom_snaps[prev_idx]["struct_heads"]["bmprotos"])
@@ -278,14 +295,18 @@ def train_aml_continual(tasks, data_root, epochs_per_task=1, batch_cap=40, eval_
                     if step >= eval_cap:
                         break
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    out, _, _, _ = model(x, tau=0.1)
+                    out, _, _, _ = model(x, tau=0.1, pi_mask=pi_mask_prev)
                     correct_s += (out.argmax(-1) == y).sum().item()
                     total_s += y.numel()
             A_snap[task_idx][prev_idx] = (correct_s / total_s) * 100.0
 
             # Restore current weights
+            model.vision_encoder.load_state_dict(cur_enc)
+            model.prototype_selector.load_state_dict(cur_sel)
             model.stem.load_state_dict(cur_stem)
             model.layers.load_state_dict(cur_layers)
+            if cur_ln is not None:
+                model.ln.load_state_dict(cur_ln)
             model.proto_weights.data.copy_(cur_protos)
             model.structure_prototypes.data.copy_(cur_sprotos)
             model.block_mode_prototypes.data.copy_(cur_bmprotos)
