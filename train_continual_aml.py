@@ -1053,8 +1053,24 @@ def main():
                     help='prototype count; split across tasks (4 rows/task at K=12, T=3)')
     ap.add_argument('--max-dim', type=int, default=48,
                     help='maximum channel dimension for prototype layout (default: 48)')
-    ap.add_argument('--norm', type=str, default='bn', choices=['bn', 'gn1', 'in'],
-                    help='post-conv normalization: bn (fused cuDNN BatchNorm), gn1, or in')
+    ap.add_argument('--norm', type=str, default='in', choices=['bn', 'gn1', 'in'],
+                    help="post-conv normalization. DEFAULT CHANGED bn -> in. "
+                         "'bn' is the only option carrying running statistics, "
+                         "and in this supernet each of the three candidate "
+                         "branches keeps its own BN whose stats update only "
+                         "when that branch is routed to; as the architecture "
+                         "parameters move, those stats go stale and inference "
+                         "collapses. bn also failed to reproduce - two runs of "
+                         "the SAME config differed by 14.3 points. "
+                         "MNIST, 5 epochs, seed 42, --arch-lr 3e-3 "
+                         "--depth-cost 0.02, per-epoch acc then A[1,1]: "
+                         "bn 88.86/84.40/84.75/83.93/87.09 -> 84.75 (100s/ep); "
+                         "gn1 85.28/93.06/94.57/95.87/96.38 -> 96.26 (116s/ep); "
+                         "in 92.09/95.85/97.21/97.77/97.91 -> 98.03 (108s/ep). "
+                         "InstanceNorm wins on accuracy, monotonicity AND speed; "
+                         "bn is kept only for comparison. Single-task "
+                         "measurement - re-check on the full 3-task schedule "
+                         "before quoting as final.")
     ap.add_argument('--workers', type=int, default=2, help='DataLoader workers')
     ap.add_argument('--freeze', type=int, default=2)
     ap.add_argument('--replay-per-class', type=int, default=400,
@@ -1079,8 +1095,8 @@ def main():
                     help='block_mode_prototypes init. staged (default) = the '
                          'CoAtNet-style 3-stage prior. neutral = small symmetric '
                          'noise, no hand-set hierarchy. Measured on MNIST at a '
-                         '4x60-step budget: staged reaches 89.9%, neutral stalls '
-                         'at 11.4%. Reason: with near-zero logits, '
+                         '4x60-step budget: staged reaches 89.9 pct, neutral stalls '
+                         'at 11.4 pct. Reason: with near-zero logits, '
                          'gumbel_softmax(tau=0.8) is noise-dominated, so every '
                          'layer switches branch almost every step and the trunk '
                          'never co-adapts. Exact zeros are worse still - argmax '
@@ -1147,7 +1163,7 @@ def main():
         print("[*] Initializing 18-Layer Hybrid AML Supernet (Plain CNN + ResNet + ViT)...")
         model = ConvAML_18Layer_Hybrid(
             K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=10,
-            norm_type=('bn' if args.norm == 'bn' else 'gn'),
+            norm_type=args.norm,
             arch_prior=args.arch_prior
         ).to(device)
     else:

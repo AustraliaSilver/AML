@@ -192,8 +192,49 @@ shared trunk there is no second trunk to retrieve. Enable it when deployment doe
 not supply a task id. These are single-seed numbers at a short schedule; a
 multi-seed comparison is needed before treating the gain as real.
 
-Three corrections to the original proposals are recorded in full, with
-measurements, in the investigation log:
+#### Normalization: the default was BatchNorm, and that was the accuracy ceiling
+
+`--norm` now defaults to **`in` (InstanceNorm)** instead of `bn`. Measured on
+MNIST, 5 epochs, seed 42, `--arch-lr 3e-3 --depth-cost 0.02` — identical
+configuration, only the normalization differs:
+
+| `--norm` | per-epoch accuracy | $A_{[1,1]}$ | s/epoch | curve |
+| :--- | :--- | :---: | :---: | :--- |
+| `bn` | 88.86 → 84.40 → 84.75 → 83.93 → 87.09 | **84.75 %** | 100 | peaks then *decays* |
+| `gn1` | 85.28 → 93.06 → 94.57 → 95.87 → 96.38 | **96.26 %** | 116 | monotonic |
+| `in` | 92.09 → 95.85 → 97.21 → 97.77 → 97.91 | **98.03 %** | 108 | monotonic |
+
+InstanceNorm wins on accuracy, stability **and** wall-clock.
+
+**Why BatchNorm fails here specifically.** This supernet holds three candidate
+branches per layer, each with its own BN, and training is batch-consistent: one
+branch per layer per batch. A branch's `running_mean`/`running_var` is therefore
+updated *only while that branch is routed to*. Raising `--arch-lr` from `2e-4` to
+`3e-3` was necessary to unblock architecture search, but it also makes weights
+drift fast enough that the stored statistics stop describing them. Decisive test
+on the shipped MNIST checkpoint:
+
+```
+eval()  — BN uses RUNNING stats :  73.81 %
+train() — BN uses BATCH stats   :  97.04 %
+```
+
+A 23-point gap on identical weights. The network was never the problem; the
+inference-time statistics were.
+
+**`bn` also failed to reproduce.** Two runs of the *same* config with the *same*
+seed gave live accuracy 72.75 % and 87.09 % — a 14.3-point spread, with live and
+routed accuracy swapping order between them. That irreproducibility, more than
+the lower mean, is why the default changed.
+
+**`--norm in` was also broken until now.** `cnn_block.py` branched on
+`if norm_type == "bn": ... else: GroupNorm` and the trainer mapped
+`args.norm != "bn"` to `"gn"`, so `--norm in` silently built GroupNorm while
+`choices=['bn','gn1','in']` advertised three options. Norm construction is now a
+`make_norm()` factory that rejects unknown values.
+
+Caveat: **single-task** measurement. Re-check on the full 3-task schedule before
+quoting 98.03 % as a headline number.
 
 Three corrections to the original proposals are recorded in full, with
 measurements, in the investigation log:

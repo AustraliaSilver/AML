@@ -472,5 +472,62 @@ class TestAmbiguousRetryBudget(unittest.TestCase):
                          [True, True, True])
 
 
+class TestNormalizationChoices(unittest.TestCase):
+    """--norm previously advertised bn/gn1/in but only ever built two of them."""
+
+    def test_in_builds_instance_norm_not_group_norm(self):
+        """Regression: the binary `if bn: BatchNorm else: GroupNorm` branch plus
+        the trainer's `args.norm != 'bn' -> 'gn'` mapping meant `--norm in`
+        silently produced GroupNorm."""
+        import torch.nn as nn
+        from mgn.blocks.cnn_block import PlainConvBlock, ResNetBlock, make_norm
+        self.assertIsInstance(make_norm("in", 8), nn.InstanceNorm2d)
+        self.assertIsInstance(make_norm("gn1", 8), nn.GroupNorm)
+        self.assertIsInstance(make_norm("bn", 8), nn.BatchNorm2d)
+        self.assertIsInstance(PlainConvBlock(8, 8, norm_type="in").norm,
+                              nn.InstanceNorm2d)
+        self.assertIsInstance(ResNetBlock(8, 8, norm_type="in").norm1,
+                              nn.InstanceNorm2d)
+
+    def test_every_norm_type_is_distinct_and_supported(self):
+        from mgn.blocks.cnn_block import make_norm
+        for t in ("bn", "gn1", "in"):
+            self.assertIsNotNone(make_norm(t, 8))
+        with self.assertRaises(ValueError):
+            make_norm("bogus", 8)
+
+    def test_norm_types_forward_at_every_stage_resolution(self):
+        import torch
+        from mgn.blocks.cnn_block import ResNetBlock
+        for t in ("bn", "gn1", "in"):
+            for hw in (32, 16, 8):
+                blk = ResNetBlock(16, 16, norm_type=t)
+                out = blk(torch.randn(2, 16, hw, hw))
+                self.assertEqual(tuple(out.shape), (2, 16, hw, hw), f"{t}@{hw}")
+
+    def test_cli_help_is_runnable(self):
+        """Regression: argparse help strings containing a literal `%` (e.g.
+        '89.9%') are treated as format strings, so `--help` crashed with
+        ValueError: unsupported format character."""
+        import subprocess
+        import sys
+        r = subprocess.run([sys.executable, "train_continual_aml.py", "--help"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertIn("--norm", r.stdout)
+
+    def test_default_norm_is_instance(self):
+        """bn carries running statistics that go stale per candidate branch;
+        measured A[1,1] 84.75 vs 98.03 for InstanceNorm."""
+        import subprocess
+        import sys
+        r = subprocess.run([sys.executable, "train_continual_aml.py", "--help"],
+                           capture_output=True, text=True)
+        i = r.stdout.rindex("--norm")   # the detailed entry, not the usage line
+        # the help text is wrapped, so match the marker rather than the
+        # "(default: ...)" suffix which argparse may push onto a later line
+        self.assertIn("DEFAULT CHANGED bn -> in", r.stdout[i:i + 900])
+
+
 if __name__ == "__main__":
     unittest.main()

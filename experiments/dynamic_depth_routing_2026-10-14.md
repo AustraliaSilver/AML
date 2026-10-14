@@ -536,6 +536,60 @@ A_live:  A[1,1] 98.05%  →  A[2,1] 3.52%  →  A[3,1] 28.99%
 | B8 | Stale `mgn` in site-packages shadowed the repo | Scripts run from subdirectories imported a copy with **no `mgn/blocks/` at all** |
 | B9 | P2 thresholded the gate at `0.5` | Only `gate <= 0` is an exact identity. Domain routing supplies **soft** slot means in (0,1); a slot gate of `0.2` must blend as `0.2·h_cand + 0.8·h`, and short-circuiting it would silently change the routed model's output. Threshold lowered to `gate_skip_eps = 1e-6`. |
 
+### B16 — BatchNorm running statistics were the real accuracy ceiling
+
+Not an external review finding: this came out of the full production run, and it
+invalidates most of the numbers above.
+
+The run showed MNIST peaking at 40 % on CIFAR-10 and then sliding to ~21 % while
+training loss kept falling — loss ↓ with test accuracy ↓ is a train/eval mismatch,
+not overfitting. Evaluating the shipped MNIST checkpoint in both modes settled it:
+
+```
+eval()  — BN uses RUNNING stats :  73.81 %
+train() — BN uses BATCH stats   :  97.04 %
+```
+
+**23.2 points on identical weights.** The network learned MNIST to 97 %; the
+inference-time statistics destroyed it.
+
+The mechanism is structural to this supernet. `HybridBlock` holds three candidate
+branches, each with its own BN, and training routes batch-consistently — one branch
+per layer per batch. A branch's running statistics are therefore updated *only
+while that branch is routed to*. Raising `--arch-lr` to `3e-3` (needed to unblock
+architecture search, §2.3) makes weights drift fast enough that stored statistics
+stop describing them. The old default `2e-4` kept weights nearly frozen, which is
+why the historic 92.83 % was reproducible — by being slow.
+
+**And `bn` does not reproduce.** Two runs of the same config with the same seed 42
+gave live accuracy **72.75 %** and **87.09 %**, a 14.3-point spread, with live and
+routed accuracy *swapping order*. That irreproducibility matters more than the
+lower mean.
+
+Controlled A/B — MNIST, 5 epochs, seed 42, `--arch-lr 3e-3 --depth-cost 0.02`:
+
+| `--norm` | per-epoch accuracy | A[1,1] | s/epoch | shape |
+|---|---|---|---|---|
+| `bn` | 88.86 → 84.40 → 84.75 → 83.93 → 87.09 | **84.75 %** | 100 | peaks, then decays |
+| `gn1` | 85.28 → 93.06 → 94.57 → 95.87 → 96.38 | **96.26 %** | 116 | monotonic |
+| `in` | 92.09 → 95.85 → 97.21 → 97.77 → 97.91 | **98.03 %** | 108 | monotonic |
+
+InstanceNorm wins on accuracy, stability *and* wall-clock; the default changed from
+`bn` to `in`. GroupNorm is second. Single-task measurement — the full 3-task
+schedule has not been re-run, so 98.03 % is not yet a headline number.
+
+**B17 — `--norm in` never worked.** `cnn_block.py` branched on
+`if norm_type == "bn": BatchNorm else: GroupNorm`, and the trainer mapped
+`args.norm != "bn"` to `"gn"`, so `--norm in` silently produced GroupNorm while
+`choices=['bn','gn1','in']` advertised three options. Replaced with a
+`make_norm()` factory that also rejects unknown values.
+
+**B18 — `--help` was broken.** An argparse help string containing a literal `%`
+(`"staged reaches 89.9%, neutral stalls at 11.4%"`) is treated as a format string;
+`--help` died with `ValueError: unsupported format character '('`. Introduced by
+this branch's own `--arch-prior` help text and unnoticed until the `--norm` help
+was written. Both regression-tested now.
+
 ### B13–B15 — found in external review, all confirmed by measurement
 
 **B13 (high) — the expected-FLOPs loop dropped mode 0's routing weight.**

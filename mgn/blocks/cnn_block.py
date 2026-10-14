@@ -4,19 +4,47 @@ from typing import Optional, Tuple
 from .base import BaseDynamicBlock
 
 
+def make_norm(norm_type: str, channels: int, norm_groups: int = 1) -> nn.Module:
+    """Build the post-conv normalisation module for a block.
+
+    A factory rather than an `if bn: ... else: GroupNorm` branch, because that
+    binary branch silently swallowed every other value of `norm_type`:
+    `--norm in` advertised InstanceNorm but produced GroupNorm, since the
+    trainer maps `args.norm != 'bn'` to 'gn' before it ever reached here.
+
+    'bn' is the only option with running statistics, which is why it is the only
+    one that can go stale: see the note in train_continual_aml.py --arch-lr.
+    """
+    t = norm_type.lower()
+    if t == "bn":
+        return nn.BatchNorm2d(channels)
+    if t in ("gn", "gn1", "group"):
+        return nn.GroupNorm(norm_groups, channels)
+    if t in ("in", "instance"):
+        # affine=False: the conv already carries a bias for every non-'bn' norm,
+        # so a second affine pair would be redundant parameters.
+        return nn.InstanceNorm2d(channels, affine=False)
+    raise ValueError(
+        f"unknown norm_type {norm_type!r}; expected one of bn, gn1, in")
+
+
+def conv_has_bias(norm_type: str) -> bool:
+    """BatchNorm supplies its own shift, so the conv must not also have a bias."""
+    return norm_type.lower() != "bn"
+
+
 class PlainConvBlock(BaseDynamicBlock):
     """Plain CNN block: Conv3x3 -> Norm -> ReLU with dynamic channel masking.
     
     Standard feedforward convolutional block without residual skip connections.
-    Supports norm_type='bn' (cuDNN fused BatchNorm) or 'gn' (GroupNorm).
+    Supports norm_type 'bn' (cuDNN fused BatchNorm), 'gn1' (GroupNorm) and
+    'in' (InstanceNorm).
     """
     def __init__(self, in_channels: int, out_channels: int, norm_type: str = "bn", norm_groups: int = 1):
         super().__init__(in_channels, out_channels)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=norm_type != "bn")
-        if norm_type == "bn":
-            self.norm = nn.BatchNorm2d(out_channels)
-        else:
-            self.norm = nn.GroupNorm(norm_groups, out_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1,
+                              bias=conv_has_bias(norm_type))
+        self.norm = make_norm(norm_type, out_channels, norm_groups)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor, dim_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -42,31 +70,24 @@ class PlainConvBlock(BaseDynamicBlock):
 class ResNetBlock(BaseDynamicBlock):
     """Residual CNN block: 2x (Conv3x3 -> Norm -> ReLU) with identity skip connection.
     
-    Supports norm_type='bn' (cuDNN fused BatchNorm) or 'gn' (GroupNorm).
+    Supports norm_type 'bn' (cuDNN fused BatchNorm), 'gn1' (GroupNorm) and 'in'
+    (InstanceNorm).
     """
     def __init__(self, in_channels: int, out_channels: int, norm_type: str = "bn", norm_groups: int = 1):
         super().__init__(in_channels, out_channels)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=norm_type != "bn")
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=norm_type != "bn")
-        if norm_type == "bn":
-            self.norm1 = nn.BatchNorm2d(out_channels)
-            self.norm2 = nn.BatchNorm2d(out_channels)
-        else:
-            self.norm1 = nn.GroupNorm(norm_groups, out_channels)
-            self.norm2 = nn.GroupNorm(norm_groups, out_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1,
+                               bias=conv_has_bias(norm_type))
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1,
+                               bias=conv_has_bias(norm_type))
+        self.norm1 = make_norm(norm_type, out_channels, norm_groups)
+        self.norm2 = make_norm(norm_type, out_channels, norm_groups)
         self.act = nn.ReLU(inplace=True)
-        
+
         if in_channels != out_channels:
-            if norm_type == "bn":
-                self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(out_channels)
-                )
-            else:
-                self.shortcut = nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                    nn.GroupNorm(norm_groups, out_channels)
-                )
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                make_norm(norm_type, out_channels, norm_groups)
+            )
         else:
             self.shortcut = nn.Identity()
 
