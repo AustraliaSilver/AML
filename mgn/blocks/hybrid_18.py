@@ -53,7 +53,7 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         max_dim: int = 48,
         num_classes: int = 10,
         num_heads: int = 4,
-        norm_type: str = "bn",
+        norm_type: str = "in",
         arch_prior: str = "staged",
         compute_cost: bool = False,
         encoder_tail_act: str = "none"

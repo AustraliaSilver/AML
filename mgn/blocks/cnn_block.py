@@ -40,7 +40,7 @@ class PlainConvBlock(BaseDynamicBlock):
     Supports norm_type 'bn' (cuDNN fused BatchNorm), 'gn1' (GroupNorm) and
     'in' (InstanceNorm).
     """
-    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "bn", norm_groups: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "in", norm_groups: int = 1):
         super().__init__(in_channels, out_channels)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1,
                               bias=conv_has_bias(norm_type))
@@ -73,7 +73,7 @@ class ResNetBlock(BaseDynamicBlock):
     Supports norm_type 'bn' (cuDNN fused BatchNorm), 'gn1' (GroupNorm) and 'in'
     (InstanceNorm).
     """
-    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "bn", norm_groups: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, norm_type: str = "in", norm_groups: int = 1):
         super().__init__(in_channels, out_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1,
                                bias=conv_has_bias(norm_type))
