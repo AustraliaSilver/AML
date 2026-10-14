@@ -23,7 +23,7 @@ The AML framework unifies two complementary engines:
     [1] AML Meta-Supernet Engine                                    [2] HtS Continual Hypernetwork
     (Vision Encoder -> Structure Heads -> TaskNetwork)              (Multi-Domain Lifelong Learning)
                 │                                                                   │
-    ├── Streamlined Prototypes (K=12, max_dim=48, 12.7M)            ├── Dual-Residual Basis (K=8 Experts, 1.47M)
+    ├── Streamlined Prototypes (K=12, max_dim=48, 1.87M)            ├── Dual-Residual Basis (K=8 Experts, 1.47M)
     ├── Differentiable Prototype Routing (pi_mask)                  ├── B_shared Base + sum(alpha_i * B_priv_i)
     ├── cuDNN Tensor Core Dynamic Convolutions                      ├── Hardware WMMA BF16 Tensor Cores (SM86+)
     │   - Dynamic Depth Gates L(x)                                  ├── Native Dynamic Conv2D Stride-1 Engine
@@ -224,8 +224,8 @@ Measured on **RTX 3050 Laptop GPU** (Zero-Replay setting):
 
 | Engine / Method | Final ACC ($A_{\text{avg}}$) | BWT | Forgetting | Runtime (s) | Parameters | Model Size |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **AML (Live Weights — No Replay)** | **29.73%** | **+0.00%** | **0.00%** | 183.4s | 12,759,873 | 48.7 MB |
-| **AML (Method — Snapshot Retr.)**  | **33.34%** | **+0.00%** | **0.00%** | 183.4s | 12,759,873 | 48.7 MB |
+| **AML (Live Weights — No Replay)** | **29.73%** | **+0.00%** | **0.00%** | 183.4s | 1,874,073 | 7.5 MB |
+| **AML (Method — Snapshot Retr.)**  | **33.34%** | **+0.00%** | **0.00%** | 183.4s | 1,874,073 | 7.5 MB |
 | **HtS (Tensor Cores WMMA BF16)**   | **36.98%** | -33.15% | 33.15% | **24.2s** | **1,468,790** | **5.8 MB** |
 
 - **AML**: Achieves perfect **Zero Forgetting (0.00%)** through orthogonal prototype isolation (`pi_mask`), preserving earlier domain accuracy without any exemplar replay.
@@ -246,8 +246,20 @@ python benchmarks/benchmark_cl_comparison.py
 | **Plain CNN (18-Layer)** | Sequential Fine-tuning | 31.56% | -54.66% | **54.66%** | 385,594 | 1.47 MB |
 | **Standard ResNet-18** | Sequential Fine-tuning | 34.54% | -55.07% | **55.07%** | 348,730 | 1.33 MB |
 | **Vision Transformer (ViT)** | Sequential Fine-tuning | 25.36% | -14.61% | **14.61%** | 232,234 | 0.89 MB |
-| **AML Live Weights** | Mutable Supernet (No Snap) | 29.73% | -46.50% | **46.50%** | 12,759,873 | 48.7 MB |
-| **AML 18-Layer Hybrid (Ours)** | **Snapshot Isolation (Zero-Replay)** | **75.46%** | **+0.00%** | **0.00%** | 12,759,873 | **+1.3 MB / task** (INT8) |
+| **AML Live Weights** | Mutable Supernet (No Snap) | 29.73% | -46.50% | **46.50%** | 1,874,073 | 7.5 MB |
+| **AML 18-Layer Hybrid (Ours)** | **Snapshot Isolation (Zero-Replay)** | **75.46%** | **+0.00%** | **0.00%** | 1,874,073 | **+7.2 MB / task** |
+
+> **Parameter-count correction (2026-10-14).** These tables previously credited
+> the hybrid18 model with **12,759,873** parameters. That figure belongs to the
+> legacy `ConvAML_CIFAR_TrueDynamic` (`train.py`), which materialises every
+> convolutional kernel inside `proto_weights` and is therefore **6.81×** larger.
+> `ConvAML_18Layer_Hybrid` — the model every number in this file actually measures —
+> has **1,874,073** parameters (7.5 MB fp32). Note that 1,874,073 is also exactly
+> the number the baseline comparison above attributes to the "Plain CNN
+> (18-Layer)" row's neighbourhood; the coincidence is that both are ~1.9M, but
+> the hybrid supernet is a *supernet* holding all three candidate branches per
+> layer simultaneously, so its true deployed cost is `+7.2 MB/task` in snapshot
+> mode.
 
 #### Stage-by-Stage Accuracy Evolution Across Task Progression
 
@@ -394,7 +406,7 @@ python build_ext.py
 ### Training:
 
 ```bash
-python train.py                       # Vision supernet on CIFAR-10 (default K=12, max_dim=48, 12.7M params)
+python train.py                       # Vision supernet on CIFAR-10 (legacy ConvAML_CIFAR_TrueDynamic, K=12, max_dim=48, 12.76M params)
 python train.py --dataset mnist       # MNIST / fashion
 python train.py --steps 4 --epochs 1  # Capped sanity run
 python train_continual_aml.py         # 3-domain continual lifelong benchmark

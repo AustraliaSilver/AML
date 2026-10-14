@@ -1326,13 +1326,30 @@ def main():
             # Domain-IL (Autonomous routing via Centroid / dom_head without truth)
             acc_auto = acc_oracle
             if use_route:
-                acc_auto, fp_auto = evaluate(model, el, device, amp_dtype,
-                                       dom_head=dom_head,
-                                       slots=slots[:i + 1],
-                                       snaps=dom_snaps[:i + 1],
-                                       route_tau=args.route_tau, dom_truth=None,
-                                       pi_mask=pi_mask_j, amb_topk=args.amb_topk,
-                                       auto_live_thresh=args.auto_live_thresh)
+                # A_auto is the Domain-IL / Class-IL protocol: it must be able to
+                # run WITHOUT the task identity. Passing pi_mask_j leaked it two
+                # ways.
+                #
+                # 1. Direct leak - pi_mask_j is built from the TRUE task index j,
+                #    so the prototype selector was told which task's rows to use
+                #    even though the router was supposed to decide that.
+                # 2. Paradox - pi_mask_j allows rows [sj:ej). When the router
+                #    predicts d < j, evaluate() has loaded snaps[d], whose
+                #    proto_weights rows [sj:ej) were still their untrained
+                #    initial values when task d finished. The model would then
+                #    classify against random head weights.
+                #
+                # The autonomous protocol therefore gets NO task mask: the
+                # router's prediction and the snapshot it selects are the only
+                # sources of task identity.
+                acc_auto, fp_auto = evaluate(
+                    model, el, device, amp_dtype,
+                    dom_head=dom_head,
+                    slots=slots[:i + 1],
+                    snaps=dom_snaps[:i + 1],
+                    route_tau=args.route_tau, dom_truth=None,
+                    pi_mask=None, amb_topk=args.amb_topk,
+                    auto_live_thresh=args.auto_live_thresh)
 
             # Live mutable supernet
             acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j)

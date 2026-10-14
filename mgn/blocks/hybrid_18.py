@@ -262,10 +262,22 @@ class ConvAML_18Layer_Hybrid(nn.Module):
             for _i in range(self.max_layers):
                 _sp = self._stage_spatial[_i]
                 _blk = self.layers[_i]
-                _c = None
+                # Weighted sum over ALL three modes.
+                #
+                # This must start from a zero tensor rather than from the first
+                # mode's raw cost: seeding _c with the mode-0 cost entered PlainConv
+                # with coefficient 1.0 instead of block_mode[:, _i, 0], so every
+                # non-Plain route reported its cost PLUS the full PlainConv cost.
+                # Measured over-report at one-hot routing: ResNet +53.1%,
+                # ViT +1203.7%. The cost term therefore penalised the cheap modes
+                # hardest, inverting the ranking it is meant to express.
+                _c = torch.zeros_like(d_lengths[:, _i])
                 for _m in range(3):
                     _f = _blk.compute_flops(_sp, mode_idx=_m, active_dim=d_lengths[:, _i])
-                    _c = _f if _c is None else _c + block_mode[:, _i, _m] * _f
+                    _c = _c + block_mode[:, _i, _m] * _f
+                # The depth gate is a genuine multiplier on runtime cost, so it
+                # belongs here: a closed gate means the block is never executed.
+                _c = _c * layer_gates[:, _i]
                 flops_per_layer.append(_c)
             expected_flops = torch.stack(flops_per_layer, dim=1)   # [B, L]
             total_mflops = expected_flops.sum(dim=1).mean() / 1e6  # scalar

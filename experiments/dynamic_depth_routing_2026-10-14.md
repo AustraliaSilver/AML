@@ -536,6 +536,50 @@ A_live:  A[1,1] 98.05%  →  A[2,1] 3.52%  →  A[3,1] 28.99%
 | B8 | Stale `mgn` in site-packages shadowed the repo | Scripts run from subdirectories imported a copy with **no `mgn/blocks/` at all** |
 | B9 | P2 thresholded the gate at `0.5` | Only `gate <= 0` is an exact identity. Domain routing supplies **soft** slot means in (0,1); a slot gate of `0.2` must blend as `0.2·h_cand + 0.8·h`, and short-circuiting it would silently change the routed model's output. Threshold lowered to `gate_skip_eps = 1e-6`. |
 
+### B13–B15 — found in external review, all confirmed by measurement
+
+**B13 (high) — the expected-FLOPs loop dropped mode 0's routing weight.**
+`_c = _f if _c is None else _c + block_mode[:, _i, _m] * _f` seeds the
+accumulator with mode 0's **raw** cost, so PlainConv entered with coefficient
+`1.0` instead of `block_mode[:, _i, 0]`. Measured over-report at one-hot routing:
+
+| routing → | reported | true | error |
+|---|---|---|---|
+| Plain | 16,739,935 | 16,739,935 | 0.0 % |
+| ResNet | 48,238,116 | 31,498,182 | **+53.1 %** |
+| ViT | 18,130,664 | 1,390,728 | **+1203.7 %** |
+
+The cost term therefore penalised the *cheapest* modes hardest, inverting the
+ranking it exists to express. Two corrections: the accumulator now starts from
+zeros, and `layer_gates[:, _i]` is applied as a multiplier (B13b) — closing a
+gate previously left the reported cost unchanged, so the complexity term could
+not reward pruning.
+
+*One correction to the review:* it claimed `∂expected_gflops/∂w_plain = 0`.
+That is **false** — the unweighted term is a constant offset, so the gradient
+w.r.t. the mode *logits* is shifted by a constant rather than annihilated
+(measured `d/d logits = [-0.61, 0.00, -1.24]`). The ResNet-vs-ViT preference is
+still learned correctly. The damage is the over-reporting above, not a dead
+gradient path.
+
+The bug was latent: `--flops-cost` defaults to `0`, so no shipped default
+configuration exercised it.
+
+**B14 (high) — task-identity leak into the autonomous protocol.**
+The `A_auto` evaluation passed `pi_mask=pi_mask_j`, built from the *true* task
+index `j`. Two consequences: the prototype selector was told which task's rows to
+use (so the router's decision was pre-empted), and when the router predicted an
+older domain `d < j`, `evaluate` had loaded `snaps[d]`, whose `proto_weights` rows
+`[sj:ej)` were still untrained at the moment task `d` finished — so the model
+classified against random head weights. This is a direct cause of the depressed
+`A_auto` off-diagonals. `A_auto` now receives `pi_mask=None`; the oracle and live
+protocols keep their task mask.
+
+**B15 (medium) — README credited the wrong model with 12,759,873 parameters.**
+That is the legacy `ConvAML_CIFAR_TrueDynamic` (`train.py`), which stores every
+conv kernel inside `proto_weights`. `ConvAML_18Layer_Hybrid` has **1,874,073**
+(7.5 MB fp32) — the legacy model is **6.81× larger**. All four tables corrected.
+
 B5 and B6 were both written by the fix for this task and caught by the tests
 written alongside it — which is the argument for keeping
 `tests/test_dynamic_depth_routing.py` in CI. B9 was found by re-reading the two
