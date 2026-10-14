@@ -56,3 +56,4 @@ select = ["F", "E9"]
 
 [tool.pytest.ini_options]
 pythonpath = [".", "AML_Core_Code"]
+testpaths = ["tests"]
