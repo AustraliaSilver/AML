@@ -74,7 +74,7 @@ Các thí nghiệm trong thư mục này được tổ chức theo 4 giai đoạ
 | [`experiments/benchmark_conv_aml.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/benchmark_conv_aml.py) | **Phase 2** | **BENCHMARK (Static)** | Benchmark so sánh ConvAML 4-layer với các baseline tĩnh (SmallCNN, ResNetBlock) trên ảnh thô. |
 | [`experiments/benchmark.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/benchmark.py) | **Phase 1** | **HISTORICAL** | Benchmark MGN nguyên bản trên tập dữ liệu bảng và PCA feature reduction. |
 | [`experiments/benchmark_hts_baselines.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/benchmark_hts_baselines.py) | **Phase 2/3** | **BASELINE** | Mã so sánh đối chiếu với phương pháp Hypernetwork-to-Structure (HtS). |
-| [`experiments/test_fashion_mnist.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/test_fashion_mnist.py) | **Phase 2** | **TEST** | Đánh giá độ co giãn tham số ($P_{\text{eff}}, L_{\text{eff}}, D_{\text{eff}}$) trên Fashion-MNIST. |
+| [`experiments/test_fashion_mnist.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/test_fashion_mnist.py) | **Phase 2** | **TEST** | Đánh giá độ co giãn tham số (`P_eff`, `L_eff`, `D_eff`) trên Fashion-MNIST. |
 | [`benchmarks/benchmark_cl_comparison.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/benchmarks/benchmark_cl_comparison.py) | **Phase 4** | **ACTIVE (Benchmark)** | So sánh Continual Learning Zero-Replay: Plain CNN vs ResNet-18 vs ViT vs AML 18-Layer Hybrid. |
 
 ---
@@ -82,27 +82,27 @@ Các thí nghiệm trong thư mục này được tổ chức theo 4 giai đoạ
 ## 3. Ý Nghĩa & Dữ Liệu Trong Các Tệp JSON / Logs
 
 ### 3.1. Dữ liệu No-Replay Pilot (`results_noreplay_full_pilot*.json`)
-Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual Learning (**MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST**):
+Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual Learning (**MNIST → CIFAR-10 → Fashion-MNIST**):
 
 - **Cấu hình (`config`)**: `K=48`, `max_layers=18`, `max_dim=64`, huấn luyện không replay exemplar (`replay=0`).
-- **Ma trận $A_{\text{live}}$ (Live Weights)**:
-  - Cho thấy hiện tượng quên lãng thảm khốc (catastrophic forgetting) của trọng số chia sẻ khi học task mới: Task 0 (MNIST) tụt từ $98.05\%$ xuống còn $28.99\%$ sau khi học Fashion-MNIST.
-  - $\text{Forgetting} = 43.70\%$, $\text{BWT} = -0.4370$.
-- **Ma trận $A_{\text{method}}$ (Snapshot Prototype Retained)**:
-  - Giữ vững độ chính xác của Task 0 ở mức **$97.63\%$**, chứng minh tính vượt trội của việc lưu trữ snapshot cấu trúc/prototype thay vì chỉ dùng phạt EWC weight-space.
-- **`route_acc`**: Độ chính xác phân loại task của Router đại diện miền không gian $z$.
+- **Ma trận `A_live` (Live Weights)**:
+  - Cho thấy hiện tượng quên lãng thảm khốc (catastrophic forgetting) của trọng số chia sẻ khi học task mới: Task 0 (MNIST) tụt từ 98.05 % xuống còn 28.99 % sau khi học Fashion-MNIST.
+  - Forgetting = 43.70 %, BWT = −0.4370.
+- **Ma trận `A_method` (Snapshot Prototype Retained)**:
+  - Giữ vững độ chính xác của Task 0 ở mức **97.63 %**, chứng minh tính vượt trội của việc lưu trữ snapshot cấu trúc/prototype thay vì chỉ dùng phạt EWC weight-space.
+- **`route_acc`**: Độ chính xác phân loại task của Router đại diện miền không gian z.
 
 ### 3.2. Dữ liệu ConvAML Phase 2 (`conv_aml_*.json`)
 - Lưu trữ kết quả so khớp giữa ConvAML và các baseline:
-  - `conv_aml_mnist.json`: MNIST đạt $98.8\% - 99.1\%$.
-  - `conv_aml_fashion_mnist.json`: Fashion-MNIST đạt $91.2\% - 92.4\%$.
-  - `conv_aml_cifar10.json`: CIFAR-10 đạt $74.5\% - 78.2\%$ (chế độ 4-layer đơn lẻ).
-- `conv_aml_all.json`: Bảng tổng hợp hợp nhất các độ đo hiệu năng $E_{\text{AML}}$, số lượng tham số thực tế $P_{\text{eff}}$, và số tầng hoạt động $L_{\text{eff}}$.
+  - `conv_aml_mnist.json`: MNIST đạt 98.8 % - 99.1%.
+  - `conv_aml_fashion_mnist.json`: Fashion-MNIST đạt 91.2 % - 92.4%.
+  - `conv_aml_cifar10.json`: CIFAR-10 đạt 74.5 % - 78.2% (chế độ 4-layer đơn lẻ).
+- `conv_aml_all.json`: Bảng tổng hợp hợp nhất các độ đo hiệu năng `E_AML`, số lượng tham số thực tế `P_eff`, và số tầng hoạt động `L_eff`.
 
 ### 3.3. Đối Chiếu Thực Nghiệm Continual Learning (Zero-Replay): AML vs CNN vs ResNet vs ViT
-Được đo đạc tự động từ kịch bản [`benchmarks/benchmark_cl_comparison.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/benchmarks/benchmark_cl_comparison.py) qua chuỗi 3 tác vụ (**MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST**):
+Được đo đạc tự động từ kịch bản [`benchmarks/benchmark_cl_comparison.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/benchmarks/benchmark_cl_comparison.py) qua chuỗi 3 tác vụ (**MNIST → CIFAR-10 → Fashion-MNIST**):
 
-| Architecture / Model | Giao Thức | Độ Chính Xác Cuối ($A_{\text{avg}}$) | BWT | Quên Lãng (Forgetting) | Tổng Tham Số | Bộ Nhớ Model |
+| Architecture / Model | Giao Thức | Độ Chính Xác Cuối (`A_avg`) | BWT | Quên Lãng (Forgetting) | Tổng Tham Số | Bộ Nhớ Model |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Plain CNN (18-Layer)** | Không Replay | 31.56% | -54.66% | **54.66%** | 385,594 | 1.47 MB |
 | **Standard ResNet-18** | Không Replay | 34.54% | -55.07% | **55.07%** | 348,730 | 1.33 MB |
@@ -110,9 +110,9 @@ Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual L
 | **AML Live Weights** | Không Snapshot | 29.73% | -46.50% | **46.50%** | 12,759,873 | 48.7 MB |
 | **AML 18-Layer Hybrid (Ours)** | **Snapshot Cô Lập** | **75.46%** | **+0.00%** | **0.00%** | 12,759,873 | **+1.3 MB / task** (INT8) |
 
-#### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn ($A[i, j]$):
+#### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn (A[i, j]):
 
-| Kiến Trúc / Mô Hình | Sau Stage 1 (MNIST) | Sau Stage 2 (CIFAR-10) | Sau Stage 3 (Fashion-MNIST) | $A_{\text{avg}}$ Cuối | Quên Lãng |
+| Kiến Trúc / Mô Hình | Sau Stage 1 (MNIST) | Sau Stage 2 (CIFAR-10) | Sau Stage 3 (Fashion-MNIST) | `A_avg` Cuối | Quên Lãng |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | | **Eval: MNIST** | **Eval: MNIST \| CIFAR-10** | **Eval: MNIST \| CIFAR-10 \| Fashion** | | |
 | **Plain CNN (18-Layer)** | 94.65% | 7.69% \| 31.51% | 8.51% \| 8.32% \| 77.85% | 31.56% | 54.66% |
@@ -121,7 +121,7 @@ Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual L
 | **AML Live Weights** | 72.54% | 41.41% \| 42.44% | 8.89% \| 13.10% \| 75.93% | 32.64% | 46.50% |
 | **AML 18-Layer Hybrid (Ours)** | **92.83%** | **92.83% \| 45.96%** | **92.83% \| 45.96% \| 87.58%** | **75.46%** | **0.00%** |
 
-- **Kết luận**: Các mạng tĩnh truyền thống bị xóa sạch trí nhớ (Forgetting lên tới $\sim 55\%$). AML 18-Layer Hybrid ngăn chặn hoàn toàn hiện tượng suy thoái này nhờ cơ chế Snapshot Retrieval và Proto-Isolation.
+- **Kết luận**: Các mạng tĩnh truyền thống bị xóa sạch trí nhớ (Forgetting lên tới ≈ 55 %). AML 18-Layer Hybrid ngăn chặn hoàn toàn hiện tượng suy thoái này nhờ cơ chế Snapshot Retrieval và Proto-Isolation.
 
 ---
 

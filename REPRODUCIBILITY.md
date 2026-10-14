@@ -1,12 +1,12 @@
 # Reproducibility Guide: Zero-Replay Continual Learning on 18-Layer Hybrid AML Supernet
 
-This document provides exact, verified reproduction steps for the **18-Layer Hybrid Supernet (CNN + ResNet + ViT)** and its **Zero-Replay Continual Learning Benchmark** on MNIST $\rightarrow$ CIFAR-10 $\rightarrow$ Fashion-MNIST.
+This document provides exact, verified reproduction steps for the **18-Layer Hybrid Supernet (CNN + ResNet + ViT)** and its **Zero-Replay Continual Learning Benchmark** on MNIST → CIFAR-10 → Fashion-MNIST.
 
 ---
 
 ## 1. System Requirements & Hardware
 
-- **GPU**: NVIDIA GPU with $\ge$ 4 GB VRAM (Tested on NVIDIA GeForce RTX 3050 Laptop GPU, 6GB VRAM, compute capability 8.6).
+- **GPU**: NVIDIA GPU with ≥ 4 GB VRAM (Tested on NVIDIA GeForce RTX 3050 Laptop GPU, 6GB VRAM, compute capability 8.6).
 - **OS**: Windows 10/11 or Ubuntu 20.04/22.04.
 - **Python**: 3.10 to 3.12.
 - **PyTorch**: 2.0+ with CUDA and native `bfloat16` or `float16` AMP support.
@@ -34,7 +34,7 @@ Expected result: All unit tests pass cleanly (`Ran 50 tests in ~9s -> OK`, `5 pa
 
 ### Option A: Fast Verification Schedule (~20 - 25 minutes)
 
-Verifies the mathematical Zero-Forgetting property ($BWT = 0.00\%$) across all 3 tasks with the 18-layer hybrid architecture:
+Verifies the mathematical Zero-Forgetting property (BWT = 0.00 %) across all 3 tasks with the 18-layer hybrid architecture:
 
 ```bash
 python train_continual_aml.py \
@@ -47,7 +47,7 @@ python train_continual_aml.py \
 
 #### Expected Benchmark Outputs:
 
-- **Accuracy Matrix $A_{\text{oracle}}$ (Task-IL Snapshot Retrieval)**:
+- **Accuracy Matrix `A_oracle` (Task-IL Snapshot Retrieval)**:
   ```text
   after \ eval on |    mnist |  cifar10 |  fashion
               mnist |    92.83 |        — |        —
@@ -57,7 +57,7 @@ python train_continual_aml.py \
   [oracle]     BWT: +0.00% | Forgetting: 0.00%
   ```
 
-- **Accuracy Matrix $A_{\text{live}}$ (Standard Mutable Weights)**:
+- **Accuracy Matrix `A_live` (Standard Mutable Weights)**:
   ```text
   [live]       BWT: -46.50% | Forgetting: 46.50%
   ```
@@ -149,7 +149,7 @@ python benchmarks/benchmark_cl_comparison.py
 
 Expected output confirms severe memory erasure in standard static networks vs AML preservation:
 
-| Architecture / Model | After Stage 1 (MNIST) | After Stage 2 (CIFAR-10) | After Stage 3 (Fashion-MNIST) | Final ($A_{\text{avg}}$) | Forgetting |
+| Architecture / Model | After Stage 1 (MNIST) | After Stage 2 (CIFAR-10) | After Stage 3 (Fashion-MNIST) | Final (`A_avg`) | Forgetting |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | | **Eval: MNIST** | **Eval: MNIST \| CIFAR-10** | **Eval: MNIST \| CIFAR-10 \| Fashion** | | |
 | **Plain CNN (18-Layer)** | 94.65% | 7.69% \| 31.51% | 8.51% \| 8.32% \| 77.85% | 31.56% | 54.66% |
@@ -171,8 +171,8 @@ Expected output confirms severe memory erasure in standard static networks vs AM
   - **Stage 1 (Layers 0–5 @ 32x32)**: ResNet (81%) + Plain CNN (13%), ViT suppressed to eliminate downsampling blur.
   - **Stage 2 (Layers 6–11 @ 16x16)**: ResNet (80%) + Plain CNN (15%).
   - **Stage 3 (Layers 12–17 @ 8x8)**: Vision Transformer (72%) + ResNet (18%).
-- **Classifier Head**: Spatial $4 \times 4$ adaptive pooling (768-d) $\rightarrow$ `LayerNorm(768)` $\rightarrow$ `Dropout(0.1)` $\rightarrow$ Prototype Linear Classifier.
-- **Continual Learning Memory**: Full-state functional supernet snapshot ($\mathbf{W}_{\text{stem}}, \mathbf{W}_{\text{layers}}^{1..18}, \mathbf{W}_{\text{protos}}$) + `TaskCentroidRouter` unit hypersphere vector centroids $\mu_t \in \mathbb{R}^{512}$.
+- **Classifier Head**: Spatial 4 × 4 adaptive pooling (768-d) → `LayerNorm(768)` → `Dropout(0.1)` → Prototype Linear Classifier.
+- **Continual Learning Memory**: Full-state functional supernet snapshot (`W_stem`, `W_layers[1..18]`, `W_protos`) + `TaskCentroidRouter` unit hypersphere vector centroids μₜ ∈ ℝ⁵¹².
 
 ---
 
