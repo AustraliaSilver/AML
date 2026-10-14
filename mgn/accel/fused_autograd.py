@@ -153,8 +153,13 @@ def pipeline_backward(ctx, grad_output, maxpool_bwd, norm_mode):
         lgv = lg[:, i].view(B, 1, 1, 1)
 
         C_out_i = C_out
+        # Must match the C++ guard in mgn/csrc/bindings.cpp. The v2 kernel
+        # walks channels sequentially and parallelises over spatial, so all it
+        # needs is C <= MB_MAX_C. The old `256 % C == 0` test was a v1
+        # leftover: at the default max_dim = 48 it is false (256 % 48 == 16), so
+        # the fused backward was never taken on any default run.
         use_mix = (_CMIX_A is not None and _CMIX_B is not None
-                   and C_out_i <= 256 and 256 % C_out_i == 0)
+                   and C_out_i <= 1024)
 
         # --- native norms (always): fused forward + the exact per-group
         # stats the fused backward kernels below consume ---

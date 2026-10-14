@@ -282,8 +282,13 @@ std::vector<torch::Tensor> mix_bwd_v2_a(
         "mix_bwd_v2_a: all inputs must be contiguous CUDA");
     int B = dout.size(0), C = dout.size(1);
     int spatial = (int)(dout.numel() / ((long)B * C));
-    TORCH_CHECK(C <= 256 && (256 % C) == 0,
-        "mix_bwd_v2_a: C must divide 256 and be <= 256");
+    // The v2 kernel iterates channels sequentially and parallelises only over
+    // spatial, so the v1 requirement that C divide 256 no longer applies - only
+    // the shared-memory cap does. Keeping the old check silently disabled the
+    // fused backward for every default config, since max_dim = 48 and
+    // 256 % 48 != 0.
+    TORCH_CHECK(C <= 1024,
+        "mix_bwd_v2_a: C must not exceed MB_MAX_C (1024)");
     auto opts = dout.options();
     auto dn2 = torch::empty_like(dout);
     auto d_hp_pre = torch::empty_like(dout);

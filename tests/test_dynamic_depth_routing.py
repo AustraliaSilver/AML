@@ -297,7 +297,9 @@ class TestFisherEWC(unittest.TestCase):
         self._one_task(e, m)
         self.assertTrue(e._fisher_all)
         self.assertTrue(all(v.numel() > 0 for v in e._fisher_all.values()))
-        self.assertEqual(e.penalty().item(), 0.0)
+        # one task, so B/A == theta* exactly in exact arithmetic; the residual
+        # is float32 round-off, not a behavioural difference
+        self.assertAlmostEqual(e.penalty().item(), 0.0, places=9)
         _drift_a_shared_param(m)
         self.assertGreater(e.penalty().item(), 0.0)
 
