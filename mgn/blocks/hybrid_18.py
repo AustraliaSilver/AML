@@ -54,7 +54,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         num_heads: int = 4,
         norm_type: str = "bn",
         arch_prior: str = "staged",
-        compute_cost: bool = False
+        compute_cost: bool = False,
+        encoder_tail_act: str = "none"
     ):
         super().__init__()
         self.K = K
@@ -66,7 +67,18 @@ class ConvAML_18Layer_Hybrid(nn.Module):
 
         self.head_dim = max_dim * 16
 
-        # Ultra-fast GPU Vision Encoder: Single conv stem + pool to eliminate redundant deep conv passes
+        # Ultra-fast GPU Vision Encoder: Single conv stem + pool to eliminate redundant
+        # deep conv passes.
+        #
+        # The final activation is configurable because a terminal ReLU makes the
+        # domain router structurally incapable of separating tasks. ReLU forces
+        # every latent into the non-negative orthant, so pairwise cosine similarity
+        # is pinned near 1: measured centroids for MNIST/CIFAR-10/Fashion sat at
+        # cos = 0.92 / 0.90 / 0.81, and the autonomous router scored 68-79% on its
+        # OWN final encoder - collapsing A_auto to 8% while A_oracle held 98%.
+        # "none" keeps the features signed and lets the centroids separate.
+        tail_act = {"relu": nn.ReLU(inplace=True), "tanh": nn.Tanh(),
+                    "none": nn.Identity(), "gelu": nn.GELU()}[encoder_tail_act]
         self.vision_encoder = nn.Sequential(
             nn.Conv2d(3, max_dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(max_dim),
@@ -74,7 +86,7 @@ class ConvAML_18Layer_Hybrid(nn.Module):
             nn.AdaptiveAvgPool2d((2, 2)),
             nn.Flatten(),
             nn.Linear(max_dim * 4, latent_dim),
-            nn.ReLU(inplace=True)
+            tail_act
         )
 
         # Prototype selector: Maps latent z to prototype distribution pi [B, K]

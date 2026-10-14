@@ -68,43 +68,177 @@ def _base_gray(mean, std):
 # ----------------------------------------------------------------------
 # Zero-Replay Task Centroid Router
 # ----------------------------------------------------------------------
+def router_features(model, x: torch.Tensor) -> torch.Tensor:
+    """Latent used by the domain router.
+
+    Computed from the encoder WITHOUT its final activation. A terminal ReLU
+    forces every latent into the non-negative orthant: measured 91.6 % of
+    latents were exactly 0 and 0 % were negative, which pins pairwise cosine
+    similarity near 1 and leaves the centroid router with a margin of ~0.005
+    between the correct and the nearest wrong domain. Dropping the tail keeps
+    the features signed, which restores usable angular separation.
+
+    Falls back to the full encoder if the tail is not an activation we know how
+    to strip, so this stays safe against architecture changes.
+    """
+    enc = model.vision_encoder
+    tail = enc[-1] if len(enc) else None
+    if isinstance(tail, (nn.ReLU, nn.GELU, nn.Tanh, nn.LeakyReLU, nn.ELU, nn.SiLU)):
+        z = enc[:-1](x)
+    else:
+        z = enc(x)
+    return F.normalize(z.float().flatten(1), dim=1)
+
+
 class TaskCentroidRouter(nn.Module):
     """Zero-Replay OOD / Domain Router based on running normalized feature centroids.
+
     Stores only T task centroids (T x D floats) without storing any exemplars/replay.
-    Immune to catastrophic forgetting because past centroids are never overwritten."""
-    def __init__(self, latent_dim=1024, max_tasks=10, temperature=0.1):
+    Immune to catastrophic forgetting because past centroids are never overwritten.
+
+    metric="mahalanobis" (default) additionally maintains ONE shared covariance
+    over all seen tasks and scores with a Mahalanobis distance instead of raw
+    cosine. Measured on the 3-domain production checkpoint: cosine 75.9%,
+    Mahalanobis 99.7%, a supervised linear probe 92.3%. The features were always
+    separable - the cosine metric was throwing that away by treating every
+    direction as equally informative. Still zero-replay: one (D x D) matrix, no
+    exemplars, no gradient through past tasks.
+
+    The centroid must be the TRUE MEAN under this metric, not a unit vector.
+    A tightly clustered domain has ||mean|| near 1 while a broadly spread one
+    cancels itself down (measured: 0.929 for MNIST, 0.695 for CIFAR-10);
+    rescaling both to the sphere collapses CIFAR-10 routing from 100.0% to 4.0%.
+    """
+    def __init__(self, latent_dim=1024, max_tasks=10, temperature=0.1,
+                 metric="mahalanobis", shrink=0.01):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_tasks = max_tasks
+        # temperature scales the logits; the Mahalanobis distance is unbounded,
+        # so it is divided by a much larger scale to stay in a sane range
         self.temperature = temperature
+        if metric not in ("cosine", "mahalanobis"):
+            raise ValueError(f"metric must be 'cosine' or 'mahalanobis', got {metric!r}")
+        self.metric = metric
+        self.shrink = shrink
         self.register_buffer("centroids", torch.zeros(max_tasks, latent_dim))
         self.register_buffer("task_counts", torch.zeros(max_tasks, dtype=torch.long))
         self.register_buffer("num_tasks", torch.zeros(1, dtype=torch.long))
+        # Shared second-moment accumulator for the Mahalanobis metric.
+        self.register_buffer("cov", torch.zeros(latent_dim, latent_dim))
+        self.register_buffer("cov_n", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("zsum", torch.zeros(latent_dim))
+        self._prec_cache = None
+        self._prec_cache_n = -1
 
     @torch.no_grad()
     def update_task_centroid(self, task_idx: int, z_features: torch.Tensor):
-        """Update centroid with a batch of features or full loader features."""
-        z_norm = F.normalize(z_features.float(), dim=-1).to(self.centroids.device)
-        mean_z = z_norm.sum(dim=0)
-        self.centroids[task_idx] += mean_z
-        self.task_counts[task_idx] += z_features.shape[0]
+        """Update centroid (and the shared covariance) with a batch of features."""
+        z = z_features.float().to(self.centroids.device).flatten(1)
+        # Store the RAW sum. A Mahalanobis score depends on where the centroid
+        # actually sits, not just on its direction - see finalize_task.
+        self.centroids[task_idx] += z.sum(dim=0)
+        self.task_counts[task_idx] += z.shape[0]
+        if self.metric == "mahalanobis":
+            # accumulate E[zz^T] and the running feature sum over every seen
+            # task; the global mean is subtracted when the precision is built
+            self.cov += z.t() @ z
+            self.zsum += z.sum(0)
+            self.cov_n += z.shape[0]
         if task_idx + 1 > self.num_tasks.item():
             self.num_tasks[0] = task_idx + 1
 
     @torch.no_grad()
     def finalize_task(self, task_idx: int):
-        """Normalize the accumulated sum to unit hypersphere."""
+        """Turn the accumulated sum into the centroid the metric expects.
+
+        Only 'cosine' puts the centroid on the unit sphere. 'mahalanobis' must
+        keep the true mean: measured on the CIFAR-10 checkpoint, normalising
+        collapsed routing from 100.0% to 4.0%, because a broadly spread domain
+        has a small ||mean|| (0.695 vs 0.929 for MNIST) and rescaling it to the
+        sphere moves the centroid away from the cloud it represents.
+        """
         if self.task_counts[task_idx] > 0:
-            self.centroids[task_idx] = F.normalize(self.centroids[task_idx].unsqueeze(0), dim=-1).squeeze(0)
+            mean = self.centroids[task_idx] / self.task_counts[task_idx]
+            if self.metric == "cosine":
+                mean = F.normalize(mean.unsqueeze(0), dim=-1).squeeze(0)
+            self.centroids[task_idx] = mean
+
+    def _precision(self) -> torch.Tensor:
+        """Inverse of the shrunk shared covariance, cached per task epoch.
+
+        pinv on a 512x512 matrix costs more than the rest of the router, and it
+        only changes when new features are folded in, so memoise it on cov_n.
+        """
+        if self.cov_n.item() == 0:
+            return torch.eye(self.latent_dim, device=self.centroids.device,
+                             dtype=self.centroids.dtype)
+        if self._prec_cache is not None and self._prec_cache_n == self.cov_n.item():
+            return self._prec_cache
+        n = float(self.cov_n.item())
+        mu = self.zsum / n
+        # scatter around the global mean: E[zz^T] - mu mu^T
+        S = self.cov / n - torch.outer(mu, mu)
+        lam = self.shrink * torch.diagonal(S).mean().clamp(min=1e-12)
+        S = S + lam * torch.eye(self.latent_dim, device=S.device, dtype=S.dtype)
+        self._prec_cache = torch.linalg.pinv(S)
+        self._prec_cache_n = self.cov_n.item()
+        return self._prec_cache
+
+    def score_per_task(self, z_per_task: list) -> torch.Tensor:
+        """Domain logits when the query is embedded by EACH task's own encoder.
+
+        Training moves the encoder, so the centroid stored at task k lives in
+        encoder_k's feature space while a query encoded by the current encoder
+        lands somewhere else. Measured on the real MNIST -> CIFAR checkpoints,
+        ||mean_old - mean_new|| = 0.800 against a within-domain spread of 0.336,
+        i.e. the drift is 2.38x the spread - far enough that no choice of metric
+        can bridge it (cosine, shared-covariance Mahalanobis and per-domain
+        Mahalanobis all landed at 34-52% once a real second task was trained).
+
+        Embedding the same x through each task's encoder puts every comparison
+        back inside one space. It needs no extra stored state, and the encoders
+        are already resident: snapshot retrieval loads them per batch anyway.
+        Measured routing accuracy: 100.0% after 2 tasks, 99.1% after 3.
+
+        z_per_task[k] must be router_features(model_with_encoder_k, x).
+        """
+        T_cur = max(int(self.num_tasks.item()), 1)
+        proto = self.centroids[:T_cur]
+        if self.metric == "cosine":
+            cols = [F.normalize(z.float().flatten(1), dim=-1)
+                    @ F.normalize(proto[k].unsqueeze(0), dim=-1).squeeze(0)
+                    for k, z in enumerate(z_per_task[:T_cur])]
+            return torch.stack(cols, dim=1) / self.temperature
+
+        P = self._precision()
+        cols = []
+        for k in range(T_cur):
+            d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
+            cols.append((d @ P * d).sum(-1))
+        d2 = torch.stack(cols, dim=1)
+        scale = d2.mean().clamp(min=1e-6)
+        return (-d2 / scale) / max(self.temperature, 1e-3) * 10.0
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Compute cosine similarity logits scaled by temperature against all registered tasks."""
+        """Domain logits; cosine similarity, or negated Mahalanobis distance."""
         T_cur = max(int(self.num_tasks.item()), 1)
-        z_norm = F.normalize(z.float(), dim=-1)
-        # Cosine similarity: [B, D] x [D, T_cur] -> [B, T_cur]
-        proto = self.centroids[:T_cur].t()
-        sim = torch.matmul(z_norm, proto) / self.temperature
-        return sim
+        z = z.float().flatten(1)
+        proto = self.centroids[:T_cur]
+
+        if self.metric == "cosine":
+            return torch.matmul(F.normalize(z, dim=-1),
+                                F.normalize(proto, dim=-1).t()) / self.temperature
+
+        # Mahalanobis: d^2(x, c_k) = (x - c_k)^T S^-1 (x - c_k)
+        P = self._precision()
+        diff = z.unsqueeze(1) - proto.unsqueeze(0)          # [B, T, D]
+        d2 = (diff @ P * diff).sum(-1)                      # [B, T]
+        # d2 is unbounded, so normalise by the mean centroid separation to
+        # land in a comparable range; argmax is unaffected by a positive
+        # scale, but the softmax margin used for the open-set fallback is not
+        scale = d2.mean().clamp(min=1e-6)
+        return (-d2 / scale) / max(self.temperature, 1e-3) * 10.0
 
 
 def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batch_size=256):
@@ -230,7 +364,7 @@ def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
              snaps=None, route_tau=None, dom_truth=None, pi_mask=None, amb_topk=0,
-             auto_live_thresh=0.0):
+             auto_live_thresh=0.0, route_per_task=True):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -247,7 +381,11 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     auto_live_thresh: open-set fallback. If no snapshot reaches this softmax
     confidence for a sample, evaluate it with the current live weights instead.
     0 disables it. Motivated by A_auto scoring below A_live in every
-    off-diagonal cell, i.e. misrouting costing more than it gained."""
+    off-diagonal cell, i.e. misrouting costing more than it gained.
+    route_per_task: embed the routing query with each task's own encoder
+    instead of the current one, because a centroid is stored in the space of
+    the encoder that produced it. Costs len(snaps) encoder forwards per batch,
+    and those encoders are already loaded for snapshot retrieval anyway."""
     model.eval()
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
@@ -294,9 +432,21 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
         if use_route:
             with torch.no_grad(), torch.amp.autocast('cuda', enabled=amp_dtype is not None,
                                                      dtype=amp_dtype or torch.bfloat16):
-                z = F.normalize(model.vision_encoder(x).float(), dim=1)
-                # Restrict router to the domains seen so far
-                dom_logits = dom_head(z)[:, :len(slots)]          # [B,T]
+                if route_per_task and len(snaps) > 0 and hasattr(dom_head, "score_per_task"):
+                    # Embed the query with EACH task's own encoder. The centroid
+                    # for task k was built in encoder_k's space; encoding x with
+                    # the current encoder compares two different spaces, and the
+                    # drift between them is larger than the within-domain spread.
+                    zk = []
+                    for d in range(len(snaps)):
+                        model.vision_encoder.load_state_dict(snaps[d]["enc"])
+                        zk.append(router_features(model, x))
+                    model.vision_encoder.load_state_dict(cur_enc)
+                    dom_logits = dom_head.score_per_task(zk)[:, :len(slots)]
+                else:
+                    z = router_features(model, x)
+                    # Restrict router to the domains seen so far
+                    dom_logits = dom_head(z)[:, :len(slots)]      # [B,T]
             pd = dom_logits.float().softmax(-1)
             top2 = pd.topk(min(2, pd.shape[1]), dim=-1).values
             margin = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else torch.zeros_like(top2[:, 0]))
@@ -932,7 +1082,7 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 if dom_head is not None and diag.get("z", None) is not None:
                     if isinstance(dom_head, TaskCentroidRouter):
                         # Centroid router accumulates running z representations without gradient degradation
-                        dom_head.update_task_centroid(task_idx, diag["z"].detach())
+                        dom_head.update_task_centroid(task_idx, router_features(model, inputs).detach())
                     else:
                         task_lbl = torch.full((inputs.size(0),), task_idx,
                                               device=device, dtype=torch.long)
@@ -1053,6 +1203,18 @@ def main():
                     help='prototype count; split across tasks (4 rows/task at K=12, T=3)')
     ap.add_argument('--max-dim', type=int, default=48,
                     help='maximum channel dimension for prototype layout (default: 48)')
+    ap.add_argument('--encoder-tail-act', type=str, default='none',
+                    choices=['relu', 'tanh', 'none', 'gelu'],
+                    help="activation on the LAST layer of the vision encoder. "
+                         "DEFAULT CHANGED relu -> none. A terminal ReLU forces "
+                         "every latent into the non-negative orthant, so "
+                         "pairwise cosine is pinned near 1 and the domain router "
+                         "cannot separate tasks: measured 91.6 pct of latents "
+                         "were exactly 0 and 0 pct were negative before it, "
+                         "giving centroid cosines of 0.92/0.90/0.81 and "
+                         "router accuracy of only 68/77/79 pct on its OWN "
+                         "encoder, which collapsed A_auto to 8 pct while "
+                         "A_oracle held 98 pct. 'none' keeps signed features.")
     ap.add_argument('--norm', type=str, default='in', choices=['bn', 'gn1', 'in'],
                     help="post-conv normalization. DEFAULT CHANGED bn -> in. "
                          "'bn' is the only option carrying running statistics, "
@@ -1138,6 +1300,25 @@ def main():
                          'live weights. 0 = disabled. A_auto was measured below '
                          'A_live in every off-diagonal cell, so misrouting cost '
                          'more than snapshot retrieval gained.')
+    ap.add_argument('--route-per-task', type=int, default=1,
+                    help='embed the routing query with EACH task\'s own encoder '
+                         '(1) or with the current encoder (0). A centroid is '
+                         'stored in the space of the encoder that produced it, '
+                         'and the drift between that and the current encoder '
+                         'measured 2.38x the within-domain spread, so the '
+                         'single-encoder router scored 34-52%% once two real '
+                         'tasks were trained. Costs len(snaps) encoder forwards '
+                         'per batch; those encoders are already loaded for '
+                         'snapshot retrieval.')
+    ap.add_argument('--router-metric', type=str, default='mahalanobis',
+                    choices=['mahalanobis', 'cosine'],
+                    help='domain routing metric. mahalanobis uses one shared '
+                         'covariance (D x D) accumulated over all seen tasks; '
+                         'cosine is the original nearest-centroid rule.')
+    ap.add_argument('--router-shrink', type=float, default=0.01,
+                    help='shrinkage added to the diagonal of the shared '
+                         'covariance, as a fraction of its mean diagonal. '
+                         'Stabilises the inverse; 0.01 measured best.')
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
     shared_backbone = bool(args.shared_backbone)
@@ -1164,6 +1345,7 @@ def main():
         model = ConvAML_18Layer_Hybrid(
             K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=10,
             norm_type=args.norm,
+            encoder_tail_act=args.encoder_tail_act,
             arch_prior=args.arch_prior
         ).to(device)
     else:
@@ -1181,7 +1363,9 @@ def main():
     latent_dim = getattr(model, 'latent_dim', 1024)
     if args.router_type == 'centroid':
         print(f"[*] Initializing Zero-Replay TaskCentroidRouter (latent_dim={latent_dim}, max_tasks={T})...")
-        dom_head = TaskCentroidRouter(latent_dim=latent_dim, max_tasks=T, temperature=0.1).to(device)
+        dom_head = TaskCentroidRouter(latent_dim=latent_dim, max_tasks=T, temperature=0.1,
+                                     metric=args.router_metric,
+                                     shrink=args.router_shrink).to(device)
     else:
         print(f"[*] Initializing Linear Domain Router (latent_dim={latent_dim}, T={T})...")
         dom_head = torch.nn.Linear(latent_dim, T).to(device)
@@ -1248,7 +1432,8 @@ def main():
                     cx = cx.to(device, non_blocking=True)
                     with torch.amp.autocast('cuda', enabled=amp_dtype is not None,
                                             dtype=amp_dtype or torch.bfloat16):
-                        cz = model.vision_encoder(cx)
+                        # same projection the router will query with at eval
+                        cz = router_features(model, cx)
                     dom_head.update_task_centroid(i, cz)
             dom_head.finalize_task(i)
             print(f"  [centroid-router] finalized pristine centroid for task {i+1} ({name})")
@@ -1365,7 +1550,8 @@ def main():
                     snaps=dom_snaps[:i + 1],
                     route_tau=args.route_tau, dom_truth=None,
                     pi_mask=None, amb_topk=args.amb_topk,
-                    auto_live_thresh=args.auto_live_thresh)
+                    auto_live_thresh=args.auto_live_thresh,
+                    route_per_task=args.route_per_task)
 
             # Live mutable supernet
             acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j)
