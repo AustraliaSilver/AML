@@ -68,14 +68,14 @@ Các thí nghiệm trong thư mục này được tổ chức theo 4 giai đoạ
 
 | Tệp Mã Nguồn | Giai Đoạn | Trạng Thái | Mô Tả & Mục Đích |
 | :--- | :---: | :---: | :--- |
-| [`train_continual_aml.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/train_continual_aml.py) | **Phase 4** | **ACTIVE (Production)** | **Điểm nhập chính hiện tại**. Huấn luyện Continual Learning 18 tầng, snapshotting toàn diện, 0-replay, Router centroid. |
-| [`mgn/blocks/hybrid_18.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/mgn/blocks/hybrid_18.py) | **Phase 4** | **ACTIVE (Production)** | Kiến trúc 18 tầng Hybrid Supernet (6 Plain @ 32x32, 6 ResNet @ 16x16, 6 ViT @ 8x8). |
-| [`experiments/noreplay_cl.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/noreplay_cl.py) | **Phase 3** | **ARCHIVAL (Pilot)** | Kịch bản nghiên cứu mở đường cho No-Replay CL. Đã chứng minh EWC/KD thất bại và dẫn tới thiết kế snapshot trong Phase 4. |
-| [`experiments/benchmark_conv_aml.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/benchmark_conv_aml.py) | **Phase 2** | **BENCHMARK (Static)** | Benchmark so sánh ConvAML 4-layer với các baseline tĩnh (SmallCNN, ResNetBlock) trên ảnh thô. |
-| [`experiments/benchmark.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/benchmark.py) | **Phase 1** | **HISTORICAL** | Benchmark MGN nguyên bản trên tập dữ liệu bảng và PCA feature reduction. |
-| [`experiments/benchmark_hts_baselines.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/benchmark_hts_baselines.py) | **Phase 2/3** | **BASELINE** | Mã so sánh đối chiếu với phương pháp Hypernetwork-to-Structure (HtS). |
-| [`experiments/test_fashion_mnist.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/experiments/test_fashion_mnist.py) | **Phase 2** | **TEST** | Đánh giá độ co giãn tham số (`P_eff`, `L_eff`, `D_eff`) trên Fashion-MNIST. |
-| [`benchmarks/benchmark_cl_comparison.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/benchmarks/benchmark_cl_comparison.py) | **Phase 4** | **ACTIVE (Benchmark)** | So sánh Continual Learning Zero-Replay: Plain CNN vs ResNet-18 vs ViT vs AML 18-Layer Hybrid. |
+| [`train_continual_aml.py`](../train_continual_aml.py) | **Phase 4** | **ACTIVE (Production)** | **Điểm nhập chính hiện tại**. Huấn luyện Continual Learning 18 tầng, snapshotting toàn diện, 0-replay, Router centroid. |
+| [`mgn/blocks/hybrid_18.py`](../mgn/blocks/hybrid_18.py) | **Phase 4** | **ACTIVE (Production)** | Kiến trúc 18 tầng Hybrid Supernet (6 Plain @ 32x32, 6 ResNet @ 16x16, 6 ViT @ 8x8). |
+| [`experiments/noreplay_cl.py`](../experiments/noreplay_cl.py) | **Phase 3** | **ARCHIVAL (Pilot)** | Kịch bản nghiên cứu mở đường cho No-Replay CL. Đã chứng minh EWC/KD thất bại và dẫn tới thiết kế snapshot trong Phase 4. |
+| [`experiments/benchmark_conv_aml.py`](../experiments/benchmark_conv_aml.py) | **Phase 2** | **BENCHMARK (Static)** | Benchmark so sánh ConvAML 4-layer với các baseline tĩnh (SmallCNN, ResNetBlock) trên ảnh thô. |
+| [`experiments/benchmark.py`](../experiments/benchmark.py) | **Phase 1** | **HISTORICAL** | Benchmark MGN nguyên bản trên tập dữ liệu bảng và PCA feature reduction. |
+| [`experiments/benchmark_hts_baselines.py`](../experiments/benchmark_hts_baselines.py) | **Phase 2/3** | **BASELINE** | Mã so sánh đối chiếu với phương pháp Hypernetwork-to-Structure (HtS). |
+| [`experiments/test_fashion_mnist.py`](../experiments/test_fashion_mnist.py) | **Phase 2** | **TEST** | Đánh giá độ co giãn tham số (`P_eff`, `L_eff`, `D_eff`) trên Fashion-MNIST. |
+| [`benchmarks/benchmark_cl_comparison.py`](../benchmarks/benchmark_cl_comparison.py) | **Phase 4** | **ACTIVE (Benchmark)** | So sánh Continual Learning Zero-Replay: Plain CNN vs ResNet-18 vs ViT vs AML 18-Layer Hybrid. |
 
 ---
 
@@ -100,15 +100,50 @@ Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual L
 - `conv_aml_all.json`: Bảng tổng hợp hợp nhất các độ đo hiệu năng `E_AML`, số lượng tham số thực tế `P_eff`, và số tầng hoạt động `L_eff`.
 
 ### 3.3. Đối Chiếu Thực Nghiệm Continual Learning (Zero-Replay): AML vs CNN vs ResNet vs ViT
-Được đo đạc tự động từ kịch bản [`benchmarks/benchmark_cl_comparison.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/benchmarks/benchmark_cl_comparison.py) qua chuỗi 3 tác vụ (**MNIST → CIFAR-10 → Fashion-MNIST**):
+Được đo đạc tự động từ kịch bản [`benchmarks/benchmark_cl_comparison.py`](../benchmarks/benchmark_cl_comparison.py) qua chuỗi 3 tác vụ (**MNIST → CIFAR-10 → Fashion-MNIST**):
 
 | Architecture / Model | Giao Thức | Độ Chính Xác Cuối (`A_avg`) | BWT | Quên Lãng (Forgetting) | Tổng Tham Số | Bộ Nhớ Model |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Plain CNN (18-Layer)** | Không Replay | 31.56% | -54.66% | **54.66%** | 385,594 | 1.47 MB |
 | **Standard ResNet-18** | Không Replay | 34.54% | -55.07% | **55.07%** | 348,730 | 1.33 MB |
 | **Vision Transformer (ViT)** | Không Replay | 25.36% | -14.61% | **14.61%** | 232,234 | 0.89 MB |
-| **AML Live Weights** | Không Snapshot | 29.73% | -46.50% | **46.50%** | 12,759,873 | 48.7 MB |
-| **AML 18-Layer Hybrid (Ours)** | **Snapshot Cô Lập** | **75.46%** | **+0.00%** | **0.00%** | 12,759,873 | **+1.3 MB / task** (INT8) |
+| **AML Live Weights** | Không Snapshot | 29.73% | -46.50% | **46.50%** | 1,871,385 | 7.49 MB |
+| **AML 18-Layer Hybrid (Ours)** | **Snapshot Cô Lập** | **75.46%** | **+0.00%** | **0.00%** | 1,871,385 | **+7.5 MB / task** |
+
+#### Router — lịch sử chẩn đoán (xem B21–B27)
+
+`A_auto` từng sụp về 8.01%. Mỗi nguyên nhân được sửa lại **lộ ra nguyên nhân
+kế tiếp**, và bốn nguyên nhân độc lập chồng lên nhau:
+
+| Bước | `A[2,2]` | `route_acc` | Nguyên nhân còn lại |
+|---|---|---|---|
+| Đầu phiên | 8.01% | — | ReLU cuối, cosine, centroid cũ |
+| Bỏ ReLU cuối | 22.00% | — | metric |
+| Mahalanobis | 16.37% | — | metric (hỏng MNIST) |
+| Embed theo từng task | 13.05% | — | **bf16 làm chết tín hiệu** |
+| Có `route_acc` | 9.67% | **100%** | **`pi_mask` sai hàng** |
+| `pi_mask` theo mẫu | **33.55%** | 100% | — |
+
+Đáng chú ý nhất: **bf16 autocast làm hai encoder khác nhau cho feature giống
+hệt** (`maxdiff = 0.000` so với `0.368` ở fp32). Không thể phát hiện bằng đo
+offline, vì mọi phép đo ngoài đều chạy fp32 trên CPU và cho thấy encoder "nhạy
+cảm bình thường". Chi tiết ở B25.
+
+Số liệu hai task (lịch rút ngắn `--epochs 3,6`):
+
+```
+A[1,1] mnist  : auto 87.24% | oracle 87.24% | route_acc 100.00%
+A[2,1] mnist  : auto 87.16% | oracle 87.24% | route_acc  99.85%
+A[2,2] cifar10: auto 33.55% | oracle 33.55% | route_acc 100.00%
+```
+
+> **Ghi chú về số liệu.** Bảng trên dùng kết quả đo trước khi sửa
+> `vision_encoder` và `stem` từ `BatchNorm2d` cứng sang `make_norm(norm_type, ...)`
+> (xem README.md mục 3.1a và B21 trong
+> `experiments/dynamic_depth_routing_2026-10-14.md`). Số tham số đã được đo lại
+> trực tiếp từ `ConvAML_18Layer_Hybrid`: **1,871,385 tham số = 7.49 MB**, và mỗi
+> task lưu khoảng **7.5 MB** snapshot. Con số `12,759,873 / 48.7 MB / +1.3 MB INT8`
+> từng ghi ở đây là của bản mô hình cũ và **không còn đúng** — đã sửa tại đây.
 
 #### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn (A[i, j]):
 
@@ -154,4 +189,4 @@ python experiments/noreplay_cl.py --tag pilot_reproduce --tasks mnist,cifar10,fa
 ## 5. Lưu Ý Về Tính Nhất Quán Kỹ Thuật
 
 1. **Zero-Replay Principle**: Tất cả các kịch bản Continual Learning đều mặc định `--replay-per-class 0` (hoàn toàn không lưu mẫu cũ trong bộ nhớ đệm episodic).
-2. **Architecture Transition**: Các tệp trong `experiments/` phản ánh hành trình nghiên cứu từ 4 layers lên 18 layers. Khi tham chiếu kiến trúc mới nhất, luôn đối chiếu với [`mgn/blocks/hybrid_18.py`](file:///C:/Users/hunga/OneDrive/Desktop/D/New%20folder%20%288%29/mgn/blocks/hybrid_18.py).
+2. **Architecture Transition**: Các tệp trong `experiments/` phản ánh hành trình nghiên cứu từ 4 layers lên 18 layers. Khi tham chiếu kiến trúc mới nhất, luôn đối chiếu với [`mgn/blocks/hybrid_18.py`](../mgn/blocks/hybrid_18.py).

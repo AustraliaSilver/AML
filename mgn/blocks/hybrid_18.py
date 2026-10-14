@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .hybrid_router import HybridBlock
+from .cnn_block import make_norm, conv_has_bias
 from mgn.generator import DistanceRouter
 
 
@@ -79,9 +80,17 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         # "none" keeps the features signed and lets the centroids separate.
         tail_act = {"relu": nn.ReLU(inplace=True), "tanh": nn.Tanh(),
                     "none": nn.Identity(), "gelu": nn.GELU()}[encoder_tail_act]
+        #
+        # The norm here MUST honour norm_type. It used to be hardcoded
+        # nn.BatchNorm2d, which meant --norm in silently did not apply to the
+        # encoder - and that is the module the domain router reads from. With
+        # BatchNorm left in place the running stats are rewritten by every
+        # later task, so the router queried one distribution and compared it
+        # against centroids captured under another.
         self.vision_encoder = nn.Sequential(
-            nn.Conv2d(3, max_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(max_dim),
+            nn.Conv2d(3, max_dim, kernel_size=3, padding=1,
+                      bias=conv_has_bias(norm_type)),
+            make_norm(norm_type, max_dim),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((2, 2)),
             nn.Flatten(),
@@ -142,10 +151,12 @@ class ConvAML_18Layer_Hybrid(nn.Module):
             else:
                 self.block_mode_prototypes.data.normal_(0.0, 1e-2)
 
-        # Stem convolution (3 -> max_dim)
+        # Stem convolution (3 -> max_dim). Same reason as the encoder: this
+        # norm must follow norm_type rather than being hardcoded to BatchNorm.
         self.stem = nn.Sequential(
-            nn.Conv2d(3, max_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(max_dim),
+            nn.Conv2d(3, max_dim, kernel_size=3, padding=1,
+                      bias=conv_has_bias(norm_type)),
+            make_norm(norm_type, max_dim),
             nn.ReLU(inplace=True)
         )
 
@@ -202,10 +213,16 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         # 2. Prototype routing
         pi_logits = self.prototype_selector(z)
         if pi_mask is not None:
+            # pi_mask may be [K], applying to the whole batch, or [B, K], one row
+            # per sample. The per-sample form is what the autonomous protocol
+            # needs: routing is decided per image, so the usable prototype rows
+            # differ per image within a batch.
+            if pi_mask.dim() == 1:
+                pi_mask = pi_mask.unsqueeze(0)
             if pi_mask.dtype == torch.bool:
-                pi_logits = pi_logits.masked_fill(~pi_mask.unsqueeze(0), -1e4)
+                pi_logits = pi_logits.masked_fill(~pi_mask, -1e4)
             else:
-                pi_logits = pi_logits.masked_fill((pi_mask == 0).unsqueeze(0), -1e4)
+                pi_logits = pi_logits.masked_fill(pi_mask == 0, -1e4)
 
         if self.training:
             pi = F.gumbel_softmax(pi_logits, tau=tau, hard=False, dim=-1)

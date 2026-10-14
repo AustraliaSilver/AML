@@ -555,6 +555,219 @@ README rather than deleted, so the discrepancy stays visible.
 **Conclusion:** EWC as implemented is not a working anti-forgetting mechanism
 here. The earlier "halves live forgetting" claim does not survive scale.
 
+### B21 — `--norm` never reached the encoder or the stem
+
+`make_norm()` was introduced in B16 so that `--norm` would be honoured, and the 18
+hybrid blocks do call it. But two modules were left as hardcoded
+`nn.BatchNorm2d`:
+
+- `hybrid_18.py` `vision_encoder` — the module the **domain router reads from**
+- `hybrid_18.py` `stem`
+
+Verified at runtime rather than by reading alone:
+
+```
+norm_type='in':
+  vision_encoder: ['Conv2d', 'BatchNorm2d', ...]   ← not InstanceNorm2d
+  stem         : ['Conv2d', 'BatchNorm2d', 'ReLU'] ← not InstanceNorm2d
+  layers[0]    : HybridBlock                        ← correct
+```
+
+So `--norm in` bought nothing where it mattered most. BatchNorm is the only norm
+in the set that carries running statistics, and in a continual supernet those are
+rewritten by every subsequent task — the encoder the router queries under one
+task's distribution was being compared against centroids captured under another.
+
+Both now call `make_norm(norm_type, max_dim)` with `conv_has_bias(norm_type)` on
+the conv, so a non-BatchNorm conv carries the shift that BatchNorm would have
+supplied. Measured: `--norm in` yields `InstanceNorm2d` in both, `bn` yields
+`BatchNorm2d`, `gn1` yields `GroupNorm`. Total parameters 1,871,385 (7.49 MB),
+unchanged in magnitude.
+
+Regression tests in `tests/test_domain_router.py::TestNormPropagation` assert the
+norm type reaches both modules, that no running statistics survive under
+`--norm in`, and that conv bias matches the norm choice.
+
+### B22 — the centroid was blended with dead-encoder features
+
+`train_task()` calls `update_task_centroid()` on every step, so by the end of a
+task the running sum is mostly features from encoder states that no longer exist.
+The trainer then zeroes the centroid and rebuilds it from a clean pass, but the
+**shared covariance** kept the training-time contributions, because it is global
+and cannot be rebuilt per task in isolation.
+
+Measured, by reconstructing both variants from the same checkpoints:
+
+```
+clean centroid, covariance from the clean pass : routing 100.0 % / 100.0 %
+blended centroid, covariance from mid-training  : routing 100.0 % /  82.0 %
+```
+
+MNIST alone fell to 64.6 %. A 3-epoch task leaves 65.8 % of its centroid mass
+and a 6-epoch task 79.3 % describing encoders that no longer exist.
+
+Fix: the two paths are now explicit. `update_task_centroid()` (training) leaves
+the covariance alone; `finalize_task_features()` (the final pass) is the only
+thing that feeds it.
+
+### B23 — a centroid is stored in the space of the encoder that produced it
+
+The router scored a query embedded with the **current** encoder against
+centroids captured under **each task's** encoder. Measured drift on the real
+MNIST → CIFAR checkpoints:
+
+```
+||mean_old - mean_new||      = 0.800
+within-domain spread         = 0.336
+drift / spread               = 2.38x
+```
+
+Routing accuracy at that point, by method:
+
+| method | 2 tasks | 3 tasks |
+|---|---|---|
+| cosine, current encoder | 33.4 % | 33.4 % |
+| shared Mahalanobis, current encoder | 33.3 % | 33.3 % |
+| **per-domain** Mahalanobis, current encoder | 50.0 % | 34.2 % |
+| **per-task embedding**, shared covariance | **100.0 %** | **99.1 %** |
+
+No metric choice bridges a coordinate mismatch — which is why the ReLU and
+metric fixes alone plateaued. Note that per-domain covariance costs 1 MB per task
+and does **not** help. Embedding the query once per task needs no extra stored
+state, because snapshot retrieval already loads each encoder per batch.
+
+### B24 — `finalize_task` normalised the centroid under every metric
+
+It L2-normalised unconditionally. Under Mahalanobis that moves the centroid off
+the cloud it represents: a tight domain has ‖mean‖ near 1 (0.929 measured for
+MNIST) while a broad one cancels itself down (0.695 for CIFAR-10), and rescaling
+both to the sphere collapsed CIFAR-10 routing from 100.0 % to 4.0 %. Only the
+cosine metric normalises now.
+
+### Process note — three wrong turns, and what each cost
+
+Recorded because the method is the part worth keeping.
+
+1. **Measured on the wrong artifact.** An A/B on `after_fashion.pth` (a
+   three-task checkpoint) was used to predict two-task behaviour. It did not
+   transfer, and the change built on it was *worse* end-to-end.
+2. **A wrong sign in a distance table.** `argmax` was used where `argmin` was
+   required, which printed 0 % for a metric that was actually at 99.9 %.
+3. **A silently overwritten checkpoint.** `aml_continual_after_mnist.pth` had
+   been rewritten by a later two-task run, so a diagnostic "confirming" a fix
+   was measuring an encoder that had trained on both domains.
+
+Each cost a full twelve-minute run. A three-minute offline diagnostic would have
+caught all three first. The rule adopted afterwards: **diagnose before training,
+and never commit a change whose end-to-end number has not been seen.**
+
+### B25 — bf16 autocast collapsed the router's input to nothing
+
+The most expensive bug in the project, and the one that made four earlier
+"fixes" look wrong.
+
+`router_features()` ran inside the evaluation autocast context. The encoder ends
+in `AdaptiveAvgPool2d((2, 2))`, which averages 32x32 down to 2x2: the values that
+survive are small and nearly equal, and bf16 carries about three decimal digits.
+Two genuinely different encoders therefore produced **bitwise identical**
+features:
+
+```
+GPU fp32          maxdiff = 0.36782     cos = 0.915
+GPU bf16 autocast maxdiff = 0.00000     cos = 1.000000
+```
+
+With every domain collapsed onto one point, the centroids became
+indistinguishable and routing had no signal left. No metric change could have
+recovered it.
+
+**Why it survived four wrong diagnoses:** every offline measurement ran in fp32
+on CPU and reported `cos(A,B) = 0.75` - i.e. "the encoder is weight-sensitive,
+the router logic must be at fault". The bug only appears on the execution path
+the trainer actually uses. See the process note above.
+
+`router_features()` now pins fp32 via `torch.autocast(enabled=False)`, and
+`TestRouterFeatures::test_bf16_autocast_cannot_collapse_two_encoders` asserts
+that two encoders stay distinguishable under bf16.
+
+### B26 — A_auto scored samples against prototype rows trained on another domain
+
+`route_acc` (added this session) showed routing at **100 %** on the CIFAR-10
+cell while `A_auto` was still 9.67 % against a 32.12 % oracle. The router was
+no longer the suspect, so the fault was downstream.
+
+The prototype selector is shared across tasks and each task only ever trained
+its own rows:
+
+```
+MNIST -> rows [0:6)     CIFAR -> rows [6:12)
+```
+
+`A_auto` passed `pi_mask=None`, so a CIFAR image was scored against all 12 rows,
+6 of which had never seen CIFAR. Measured on the same weights with routing
+already correct:
+
+```
+pi_mask = the task's own rows (oracle) : 32.63 %
+pi_mask = None (as shipped)             : 10.86 %
+```
+
+Passing `pi_mask_j` was also wrong, for a different reason: it is built from the
+**true** task index, which hands the task identity straight to the selector.
+The fix builds a per-sample mask from `d_pred` - the router's own decision - so
+nothing leaks that the router had not already decided:
+
+```python
+pm = torch.zeros(B, K, dtype=torch.bool)
+for d in range(T):
+    pm[d_pred == d, lo_d:hi_d] = True
+```
+
+Routing is per image, so the mask has to be per image too; that required
+`pi_mask` to accept `[B, K]` alongside `[K]` in `hybrid_18.py`. An ambiguous
+sample retried under snapshot `d` uses **that** snapshot's rows, not the rows
+its router argmax pointed at.
+
+### B27 — the router was never the whole problem
+
+A[2,2] across this session, each step exposing the next cause:
+
+| step | A[2,2] | route_acc | cause still outstanding |
+|---|---|---|---|
+| session start | 8.01 % | - | ReLU tail, cosine, stale centroids |
+| drop the ReLU tail | 22.00 % | - | metric |
+| Mahalanobis | 16.37 % | - | metric (broke MNIST instead) |
+| per-task embedding | 13.05 % | - | **bf16** |
+| route_acc added | 9.67 % | **100 %** | **pi_mask** |
+| per-sample pi_mask | **33.55 %** | 100 % | - |
+
+Four independent causes, stacked. None was predictable from the one before it,
+and the last two only became visible once the previous was removed.
+
+### Process note — five wrong diagnoses, one root cause each
+
+Recorded because the pattern, not the individual bugs, is the lesson.
+
+1. A/B on a three-task checkpoint used to predict two-task behaviour. It did
+   not transfer, and the change built on it was *worse* end-to-end.
+2. `argmax` where `argmin` was required, printing 0 % for a metric that was
+   actually at 99.9 %.
+3. A checkpoint that had been silently overwritten by a later run, so a
+   diagnostic "confirming" a fix measured an encoder trained on both domains.
+4. A 1-epoch debug run read as an architecture defect: `cos(z0,z1) = 1.0` on
+   two barely-diverged encoders is expected, not a bug.
+5. **fp32/CPU measurements of code that runs bf16/GPU** (B25).
+
+All five produced entirely plausible numbers, all five led to a confident claim,
+and all five were wrong. The sixth measurement, on the same input and both
+devices, found the cause in one shot.
+
+The rule adopted: **measure on the execution path the trainer actually uses, in
+the precision it actually uses.** Unit tests and offline reproductions are for
+checking a hypothesis, never for confirming one. And `route_acc` now exists so
+that "is this the router or something downstream" is answered by the log rather
+than by a script written after the fact.
+
 ### B20 — the autonomous router is now the binding constraint
 
 With BatchNorm removed and a strong backbone, the remaining error concentrates in

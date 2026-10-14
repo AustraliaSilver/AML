@@ -16,7 +16,7 @@ from train_continual_aml import TaskCentroidRouter, router_features
 
 def _fit(router, X, y, n_cls):
     for i in range(n_cls):
-        router.update_task_centroid(i, X[y == i])
+        router.finalize_task_features(i, X[y == i])
         router.finalize_task(i)
     router.num_tasks[0] = n_cls
     return router
@@ -66,13 +66,48 @@ class TestRouterMetric(unittest.TestCase):
         """No exemplars retained: only centroids and one shared covariance."""
         r = TaskCentroidRouter(16, 3)
         for i in range(3):
-            r.update_task_centroid(i, torch.randn(50, 16))
+            r.finalize_task_features(i, torch.randn(50, 16))
         names = [n for n, _ in r.named_buffers()]
         self.assertIn("cov", names)
         self.assertIn("centroids", names)
         self.assertEqual(r.cov.shape, (16, 16))
         # no buffer grows with the number of samples
         self.assertEqual(r.cov_n.item(), 150)
+
+    def test_training_steps_do_not_pollute_the_covariance(self):
+        """Regression: update_task_centroid runs every training step, and those
+        features come from encoder states that no longer exist by the end of the
+        task. The shared covariance is global and cannot be corrected after the
+        fact, so the training path must leave it alone - a 6-epoch task would
+        otherwise leave 79% of the second moment describing a dead encoder."""
+        r = TaskCentroidRouter(16, 2)
+        for step in range(200):
+            r.update_task_centroid(0, torch.randn(8, 16) + step)
+        self.assertEqual(r.cov_n.item(), 0,
+                         "training-step accumulation must not feed the covariance")
+        self.assertTrue(torch.equal(r.cov, torch.zeros(16, 16)))
+
+        r.finalize_task_features(0, torch.randn(50, 16))
+        self.assertEqual(r.cov_n.item(), 50,
+                         "the clean pass is what feeds the covariance")
+
+    def test_finalize_overrides_the_training_accumulation(self):
+        """The trainer resets the centroid before its clean pass; after that the
+        stored centroid must describe the final encoder only."""
+        torch.manual_seed(0)
+        r = TaskCentroidRouter(16, 1)
+        for step in range(100):
+            r.update_task_centroid(0, torch.randn(8, 16) * 5 + step)   # drift
+        r.centroids[0].zero_()
+        r.task_counts[0].zero_()
+
+        clean = torch.randn(100, 16)
+        r.finalize_task_features(0, clean)
+        r.finalize_task(0)
+        r.num_tasks[0] = 1
+
+        self.assertTrue(torch.allclose(r.centroids[0], clean.mean(0), atol=1e-4),
+                        "centroid must equal the clean mean, not a blend")
 
     def test_past_centroids_survive_later_tasks(self):
         r = TaskCentroidRouter(8, 4)
@@ -128,11 +163,11 @@ class TestRouterMetric(unittest.TestCase):
         X = (torch.randn(2, 100, 16) + shift).reshape(200, 16)
         y = torch.arange(2).repeat_interleave(100)
 
-        r.update_task_centroid(0, X[y == 0]); r.finalize_task(0)
+        r.finalize_task_features(0, X[y == 0]); r.finalize_task(0)
         first = r._precision().clone()
         self.assertTrue(torch.equal(first, r._precision()), "cache must be reused")
 
-        r.update_task_centroid(1, X[y == 1]); r.finalize_task(1)
+        r.finalize_task_features(1, X[y == 1]); r.finalize_task(1)
         self.assertFalse(torch.equal(first, r._precision()),
                          "cache must be rebuilt after a new task")
 
@@ -322,6 +357,55 @@ class TestScorePerTask(unittest.TestCase):
         self.assertTrue(torch.isfinite(out).all())
 
 
+class TestPerSamplePrototypeMask(unittest.TestCase):
+    """The prototype selector must honour a per-sample row mask.
+
+    The selector is shared across tasks and each task only ever trained its own
+    rows, so scoring a sample against every task's rows scores it against rows
+    trained on a different domain. Measured on the CIFAR-10 cell with routing
+    already correct: 32.63 % with the right rows allowed, 10.86 % with all of
+    them. The mask comes from the ROUTER's choice, never the true task id.
+    """
+
+    def _model(self):
+        from mgn.blocks import ConvAML_18Layer_Hybrid
+        return ConvAML_18Layer_Hybrid(K=12, max_layers=18, max_dim=16,
+                                      num_classes=10, encoder_tail_act="none").eval()
+
+    def test_1d_mask_still_works(self):
+        m = self._model()
+        x = torch.randn(6, 3, 32, 32)
+        one = torch.zeros(m.K, device=x.device)      # [K] applies to the batch
+        one[0:6] = True
+        with torch.no_grad():
+            _, _, pi_one, _ = m(x, tau=0.1, pi_mask=one)
+        self.assertLess(float(pi_one[..., 6:].abs().max()), 1e-3,
+                           "masked rows must not receive probability mass")
+
+    def test_per_sample_masks_differ_within_one_batch(self):
+        """Two samples in the same batch get different masks - that is the whole
+        point, since routing is decided per image."""
+        m = self._model()
+        x = torch.randn(2, 3, 32, 32)
+        pm = torch.zeros(2, m.K, dtype=torch.bool)
+        pm[0, 0:6] = True
+        pm[1, 6:12] = True
+        with torch.no_grad():
+            _, _, pi, _ = m(x, tau=0.1, pi_mask=pm)
+        self.assertEqual(tuple(pi.shape), (2, m.K))
+        self.assertLess(float(pi[0, 6:].abs().max()), 1e-3)
+        self.assertLess(float(pi[1, 0:6].abs().max()), 1e-3)
+
+    def test_mask_survives_training_mode(self):
+        """train() routes through gumbel_softmax, which must respect the mask too."""
+        m = self._model().train()
+        pm = torch.zeros(3, m.K, dtype=torch.bool)
+        pm[:, 0:6] = True
+        out, _, pi, _ = m(torch.randn(3, 3, 32, 32), tau=0.8, pi_mask=pm)
+        self.assertEqual(tuple(pi.shape), (3, m.K))
+        self.assertTrue(torch.isfinite(out).all())
+
+
 class TestRouterFeatures(unittest.TestCase):
     """The router latent must not be squashed into the non-negative orthant."""
 
@@ -344,11 +428,96 @@ class TestRouterFeatures(unittest.TestCase):
         z = router_features(m, torch.randn(4, 3, 32, 32))
         self.assertEqual(z.shape, (4, m.latent_dim))
 
+
+class TestNormPropagation(unittest.TestCase):
+    """--norm must reach the encoder and the stem, not just the 18 blocks.
+
+    Regression: both were hardcoded to nn.BatchNorm2d, so `--norm in` silently
+    left the module the domain router reads from on BatchNorm - whose running
+    stats are then rewritten by every later task, so the router compared
+    features captured under one distribution against centroids from another.
+    """
+
+    EXPECTED = {"in": "InstanceNorm2d", "bn": "BatchNorm2d", "gn1": "GroupNorm"}
+
+    def _norms(self, norm_type):
+        from mgn.blocks import ConvAML_18Layer_Hybrid
+        m = ConvAML_18Layer_Hybrid(K=4, max_dim=16, max_layers=18,
+                                   num_classes=10, norm_type=norm_type)
+        return type(m.vision_encoder[1]).__name__, type(m.stem[1]).__name__
+
+    def test_encoder_follows_norm_type(self):
+        for nt, expected in self.EXPECTED.items():
+            enc, _ = self._norms(nt)
+            self.assertEqual(enc, expected, f"--norm {nt} did not reach vision_encoder")
+
+    def test_stem_follows_norm_type(self):
+        for nt, expected in self.EXPECTED.items():
+            _, stem = self._norms(nt)
+            self.assertEqual(stem, expected, f"--norm {nt} did not reach stem")
+
+    def test_encoder_has_no_running_statistics_under_instance_norm(self):
+        """The concrete harm: running stats are what a later task overwrites."""
+        from mgn.blocks import ConvAML_18Layer_Hybrid
+        m = ConvAML_18Layer_Hybrid(K=4, max_dim=16, max_layers=18,
+                                   num_classes=10, norm_type="in")
+        for mod in (m.vision_encoder[1], m.stem[1]):
+            self.assertFalse(getattr(mod, "track_running_stats", False),
+                             f"{type(mod).__name__} still carries running stats")
+
+    def test_conv_bias_matches_the_norm(self):
+        """A non-BatchNorm conv supplies its own shift, so it must carry a bias."""
+        from mgn.blocks import ConvAML_18Layer_Hybrid
+        m = ConvAML_18Layer_Hybrid(K=4, max_dim=16, max_layers=18,
+                                   num_classes=10, norm_type="in")
+        self.assertIsNotNone(m.vision_encoder[0].bias)
+        self.assertIsNotNone(m.stem[0].bias)
+        b = ConvAML_18Layer_Hybrid(K=4, max_dim=16, max_layers=18,
+                                   num_classes=10, norm_type="bn")
+        self.assertIsNone(b.vision_encoder[0].bias)
+        self.assertIsNone(b.stem[0].bias)
+
     def test_output_is_l2_normalised(self):
         from mgn.blocks import ConvAML_18Layer_Hybrid
         m = ConvAML_18Layer_Hybrid(K=4, max_layers=18, max_dim=16, num_classes=10)
         z = router_features(m, torch.randn(8, 3, 32, 32))
         self.assertTrue(torch.allclose(z.norm(dim=1), torch.ones(8), atol=1e-4))
+
+    def test_bf16_autocast_cannot_collapse_two_encoders(self):
+        """Regression, and the most expensive bug in this project.
+
+        The encoder ends in AdaptiveAvgPool2d((2, 2)), so the values that
+        reach the router are small and nearly equal. Under bf16 autocast they
+        round to the same value and two DIFFERENT encoders produce bitwise
+        identical features - measured maxdiff 0.000, cos 1.000000, against
+        maxdiff 0.368 in fp32. Routing then collapsed to 0 %, and because
+        route_acc did not exist, it took a long time to find.
+
+        router_features must pin fp32 regardless of the ambient autocast.
+        """
+        from mgn.blocks import ConvAML_18Layer_Hybrid
+        if not torch.cuda.is_available():
+            self.skipTest("needs CUDA to exercise autocast")
+
+        D = 48
+        torch.manual_seed(0)
+
+        def encoder(scale):
+            m = ConvAML_18Layer_Hybrid(K=2, max_dim=D, max_layers=18, num_classes=10,
+                                       norm_type="in", encoder_tail_act="none")
+            with torch.no_grad():
+                m.vision_encoder[0].weight.mul_(scale)
+            return m.cuda().eval()
+
+        a, b = encoder(1.0), encoder(1.08)
+        x = torch.randn(16, 3, 32, 32, device="cuda")
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            za, zb = router_features(a, x), router_features(b, x)
+
+        self.assertGreater((za - zb).abs().max().item(), 1e-3,
+                           "router_features collapsed two encoders into one "
+                           "embedding - reduced precision leaked in")
 
 
 if __name__ == "__main__":

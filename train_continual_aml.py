@@ -71,22 +71,36 @@ def _base_gray(mean, std):
 def router_features(model, x: torch.Tensor) -> torch.Tensor:
     """Latent used by the domain router.
 
-    Computed from the encoder WITHOUT its final activation. A terminal ReLU
-    forces every latent into the non-negative orthant: measured 91.6 % of
-    latents were exactly 0 and 0 % were negative, which pins pairwise cosine
-    similarity near 1 and leaves the centroid router with a margin of ~0.005
-    between the correct and the nearest wrong domain. Dropping the tail keeps
-    the features signed, which restores usable angular separation.
+    Two properties are non-negotiable here, and both were violated at the cost
+    of the whole router.
+
+    1. Computed from the encoder WITHOUT its final activation. A terminal ReLU
+       forces every latent into the non-negative orthant: measured 91.6 % of
+       latents were exactly 0 and 0 % were negative, which pins pairwise cosine
+       similarity near 1 and leaves a margin of only ~0.005 between the correct
+       and the nearest wrong domain.
+
+    2. Always in fp32, never in reduced precision. The encoder ends in
+       AdaptiveAvgPool2d((2, 2)), which averages 32x32 down to 2x2 and flattens
+       the signal; the values that survive are small and nearly equal. Under
+       bf16 autocast they round to the same value, so two different encoders
+       produced BITWISE IDENTICAL features: maxdiff 0.000, cos 1.000000. Measured
+       on the real MNIST and CIFAR-10 checkpoints, fp32 gives maxdiff 0.368 and
+       bf16 gives 0.000. That single difference collapsed routing to 0 %, and no
+       amount of metric tuning could have recovered it - there was no signal
+       left to separate the domains.
 
     Falls back to the full encoder if the tail is not an activation we know how
     to strip, so this stays safe against architecture changes.
     """
     enc = model.vision_encoder
     tail = enc[-1] if len(enc) else None
-    if isinstance(tail, (nn.ReLU, nn.GELU, nn.Tanh, nn.LeakyReLU, nn.ELU, nn.SiLU)):
-        z = enc[:-1](x)
-    else:
-        z = enc(x)
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        xi = x.float()
+        if isinstance(tail, (nn.ReLU, nn.GELU, nn.Tanh, nn.LeakyReLU, nn.ELU, nn.SiLU)):
+            z = enc[:-1](xi)
+        else:
+            z = enc(xi)
     return F.normalize(z.float().flatten(1), dim=1)
 
 
@@ -125,6 +139,10 @@ class TaskCentroidRouter(nn.Module):
         self.register_buffer("task_counts", torch.zeros(max_tasks, dtype=torch.long))
         self.register_buffer("num_tasks", torch.zeros(1, dtype=torch.long))
         # Shared second-moment accumulator for the Mahalanobis metric.
+        # cov/zsum/cov_n hold the CLEAN pass only: the trainer feeds these from
+        # the final pass over each domain, never from the per-step training
+        # accumulation, because mid-training features come from encoder states
+        # that no longer exist by the time the task ends.
         self.register_buffer("cov", torch.zeros(latent_dim, latent_dim))
         self.register_buffer("cov_n", torch.zeros(1, dtype=torch.long))
         self.register_buffer("zsum", torch.zeros(latent_dim))
@@ -133,13 +151,42 @@ class TaskCentroidRouter(nn.Module):
 
     @torch.no_grad()
     def update_task_centroid(self, task_idx: int, z_features: torch.Tensor):
-        """Update centroid (and the shared covariance) with a batch of features."""
+        """Accumulate a batch into the running centroid, for TRAINING only.
+
+        Called on every step, so by the end of a 6-epoch task most of what it
+        gathered came from encoder states that no longer exist - and it
+        deliberately does NOT touch the shared covariance, because that is
+        global and cannot be corrected later without keeping every intermediate
+        feature around.
+
+        finalize_task_features() is the authoritative pass: it rebuilds the
+        centroid from the final encoder and is the only thing that feeds the
+        covariance. Measured: letting this blend into the final centroid put
+        routing at 82.0% overall and 64.6% on the first domain, against 100.0%
+        when the clean pass wins.
+        """
+        self._accumulate(task_idx, z_features, into_cov=False)
+
+    @torch.no_grad()
+    def finalize_task_features(self, task_idx: int, z_features: torch.Tensor):
+        """Accumulate a batch into the centroid AND the shared covariance.
+
+        The authoritative path. The trainer runs it once per domain with the
+        encoder in its final state, which is exactly the encoder the router is
+        queried with later, so both the centroid and the covariance describe a
+        space that really exists.
+        """
+        self._accumulate(task_idx, z_features, into_cov=True)
+
+    @torch.no_grad()
+    def _accumulate(self, task_idx: int, z_features: torch.Tensor,
+                    into_cov: bool):
         z = z_features.float().to(self.centroids.device).flatten(1)
         # Store the RAW sum. A Mahalanobis score depends on where the centroid
         # actually sits, not just on its direction - see finalize_task.
         self.centroids[task_idx] += z.sum(dim=0)
         self.task_counts[task_idx] += z.shape[0]
-        if self.metric == "mahalanobis":
+        if self.metric == "mahalanobis" and into_cov:
             # accumulate E[zz^T] and the running feature sum over every seen
             # task; the global mean is subtracted when the precision is built
             self.cov += z.t() @ z
@@ -364,7 +411,8 @@ def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
              snaps=None, route_tau=None, dom_truth=None, pi_mask=None, amb_topk=0,
-             auto_live_thresh=0.0, route_per_task=True):
+             auto_live_thresh=0.0, route_per_task=True, route_truth=None,
+             proto_row_ranges=None):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -385,7 +433,17 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     route_per_task: embed the routing query with each task's own encoder
     instead of the current one, because a centroid is stored in the space of
     the encoder that produced it. Costs len(snaps) encoder forwards per batch,
-    and those encoders are already loaded for snapshot retrieval anyway."""
+    and those encoders are already loaded for snapshot retrieval anyway.
+
+    route_truth: label used ONLY to report fp["route_acc"]. It never influences
+    the prediction - dom_truth does that, which pins the domain and turns the
+    run into an oracle. Without this, A_auto below A_oracle cannot be
+    attributed to the router versus the snapshot, and diagnosing it offline is
+    slow and, repeatedly, wrong.
+    proto_row_ranges: [(lo, hi), ...] per seen task, the prototype rows that task
+    owns. When given, each sample may only use the rows of the task the ROUTER
+    chose. This is derived from the router's own decision, never from the true
+    task id, so it leaks nothing."""
     model.eval()
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
@@ -452,8 +510,15 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             margin = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else torch.zeros_like(top2[:, 0]))
             pred_argmax = dom_logits.argmax(-1)
             route_n += pred_argmax.numel()
+            # route_truth scores the router WITHOUT letting it steer the
+            # prediction. dom_truth pins d_pred to the oracle, so it measures
+            # the snapshot rather than the router - which is why the autonomous
+            # protocol had no routing telemetry at all.
+            if route_truth is not None:
+                route_hits += int((pred_argmax == route_truth).sum().item())
             if dom_truth is not None:
-                route_hits += int((pred_argmax == dom_truth).sum().item())
+                # oracle: the domain is given, so the router is bypassed and
+                # scoring it here would just double-count route_truth
                 d_pred = torch.full((x.shape[0],), dom_truth, dtype=torch.long, device=device)
                 amb = None
             else:
@@ -485,6 +550,21 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 res_b = b[d_pred]                                                             # [B,L]
                 block_b = torch.stack([1.0 - res_b, res_b], dim=-1)                           # [B,L,2]
             override = (gates_b, block_b)
+
+            # Per-sample prototype mask, built from the ROUTER's own choice.
+            # The prototype selector is shared across tasks, and each task only
+            # ever trained its own rows. Scoring a sample against rows that were
+            # trained on a different domain is what cost A[2,2] everything:
+            # measured 32.63 % with the correct rows allowed and 10.86 % with
+            # all of them. This uses d_pred, never the true task id, so it
+            # leaks nothing the router did not already decide.
+            if proto_row_ranges is not None:
+                pm = torch.zeros(x.shape[0], model.K, dtype=torch.bool, device=device)
+                for d2 in range(len(proto_row_ranges)):
+                    lo, hi = proto_row_ranges[d2]
+                    pm[d_pred == d2, lo:hi] = True
+            else:
+                pm = None   # fall back to pi_mask (which may be [K]) below
 
         if use_snaps:
             amb_t = amb if amb is not None else torch.zeros_like(d_pred, dtype=torch.bool)
@@ -523,9 +603,10 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                         model.block_mode_head.load_state_dict(sh["block"])
                 if idx_c.any():
                     with torch.amp.autocast('cuda', **ac):
+                        _pm = pm[idx_c] if pm is not None else pi_mask
                         o, st, p, dg = model(x[idx_c], tau=0.1,
                                              struct_override=(override[0][idx_c], override[1][idx_c]),
-                                             pi_mask=pi_mask)
+                                             pi_mask=_pm)
                     outs_conf.append((idx_c, o))
                     pi_conf.append((idx_c, p.float()))
                     ls_full[idx_c] = dg["layer_soft"].float()
@@ -534,9 +615,18 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                     wtot += idx_c.sum().item()
                 if want_amb:
                     with torch.amp.autocast('cuda', **ac):
+                        # An ambiguous sample is being retried under THIS
+                        # snapshot, so the rows it may use are this snapshot's
+                        # rows - not the ones its router argmax pointed at.
+                        _pma = pi_mask
+                        if proto_row_ranges is not None and d < len(proto_row_ranges):
+                            _lo, _hi = proto_row_ranges[d]
+                            _pma = torch.zeros(int(amb_t.sum()), model.K,
+                                               dtype=torch.bool, device=device)
+                            _pma[:, _lo:_hi] = True
                         o2, _, p2, dg2 = model(x[amb_t], tau=0.1,
                                                struct_override=(override[0][amb_t], override[1][amb_t]),
-                                               pi_mask=pi_mask)
+                                               pi_mask=_pma)
                     conf2 = o2.float().softmax(-1).max(-1).values
                     upd = conf2 > best_conf
                     if best_out is None:
@@ -1423,7 +1513,21 @@ def main():
 
         # Finalize domain centroid router for this task
         if isinstance(dom_head, TaskCentroidRouter):
-            # Compute fresh, exact centroid over clean test/validation split of the domain
+            # Rebuild the centroid from scratch over the clean eval split, with
+            # the encoder in its FINAL state.
+            #
+            # This has to override what training accumulated. train_task() calls
+            # update_task_centroid on every step, so the running sum mixes
+            # features from encoder states that no longer exist - by the end of
+            # a 6-epoch task that is 79% of the samples. The snapshot the router
+            # is queried with is the final one, so a blended centroid describes
+            # an encoder that never existed: measured routing fell from 100.0%
+            # to 82.0% overall and to 64.6% on the first domain.
+            #
+            # The shared covariance is fed here and ONLY here: it is global, so
+            # mid-training contributions could not be removed afterwards without
+            # retaining every intermediate feature. The training-step path
+            # (update_task_centroid) therefore leaves it alone.
             dom_head.centroids[i].zero_()
             dom_head.task_counts[i].zero_()
             model.eval()
@@ -1434,7 +1538,7 @@ def main():
                                             dtype=amp_dtype or torch.bfloat16):
                         # same projection the router will query with at eval
                         cz = router_features(model, cx)
-                    dom_head.update_task_centroid(i, cz)
+                    dom_head.finalize_task_features(i, cz)
             dom_head.finalize_task(i)
             print(f"  [centroid-router] finalized pristine centroid for task {i+1} ({name})")
 
@@ -1527,22 +1631,22 @@ def main():
             # Domain-IL (Autonomous routing via Centroid / dom_head without truth)
             acc_auto = acc_oracle
             if use_route:
-                # A_auto is the Domain-IL / Class-IL protocol: it must be able to
-                # run WITHOUT the task identity. Passing pi_mask_j leaked it two
-                # ways.
+                # A_auto runs WITHOUT the true task id. Handing it pi_mask_j
+                # leaked that id straight to the prototype selector.
                 #
-                # 1. Direct leak - pi_mask_j is built from the TRUE task index j,
-                #    so the prototype selector was told which task's rows to use
-                #    even though the router was supposed to decide that.
-                # 2. Paradox - pi_mask_j allows rows [sj:ej). When the router
-                #    predicts d < j, evaluate() has loaded snaps[d], whose
-                #    proto_weights rows [sj:ej) were still their untrained
-                #    initial values when task d finished. The model would then
-                #    classify against random head weights.
+                # But pi_mask=None is not the fix either: the selector is shared
+                # and each task only ever trained its OWN rows, so scoring a
+                # sample against every task's rows means scoring it against rows
+                # trained on a different domain. Measured on the CIFAR-10 cell
+                # with correct routing: 32.63 % when the right rows are allowed,
+                # 10.86 % when all 12 are.
                 #
-                # The autonomous protocol therefore gets NO task mask: the
-                # router's prediction and the snapshot it selects are the only
-                # sources of task identity.
+                # proto_row_ranges closes that gap using d_pred - the ROUTER's
+                # own decision - so each sample may use the rows of the task the
+                # router assigned it. No true task id is involved.
+                ranges = [(round(k * model.K / len(tasks)),
+                           round((k + 1) * model.K / len(tasks)))
+                          for k in range(i + 1)]
                 acc_auto, fp_auto = evaluate(
                     model, el, device, amp_dtype,
                     dom_head=dom_head,
@@ -1551,7 +1655,8 @@ def main():
                     route_tau=args.route_tau, dom_truth=None,
                     pi_mask=None, amb_topk=args.amb_topk,
                     auto_live_thresh=args.auto_live_thresh,
-                    route_per_task=args.route_per_task)
+                    route_per_task=args.route_per_task, route_truth=j,
+                    proto_row_ranges=ranges)
 
             # Live mutable supernet
             acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j)
@@ -1565,7 +1670,13 @@ def main():
             lf = ""
             if use_route and args.auto_live_thresh > 0:
                 lf = f" | live-fallback {fp_auto['live_fallback_frac']*100:.0f}%"
-            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): auto: {acc_auto*100:.2f}% | oracle: {acc_oracle*100:.2f}% | live: {acc_live*100:.2f}%{lf}", flush=True)
+            # route_acc separates "the router chose the wrong domain" from "the
+            # router chose right and the snapshot still scored badly". Without
+            # this, A_auto below A_oracle is ambiguous and has to be diagnosed
+            # offline, which is slow and, repeatedly, wrong.
+            ra = fp_auto.get("route_acc") if fp_auto else None
+            rt = f" | route_acc {ra*100:.2f}%" if ra is not None else ""
+            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): auto: {acc_auto*100:.2f}% | oracle: {acc_oracle*100:.2f}% | live: {acc_live*100:.2f}%{lf}{rt}", flush=True)
 
         torch.save(model.state_dict(), os.path.join(_ROOT, f"aml_continual_after_{name}.pth"))
 
