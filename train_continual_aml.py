@@ -941,8 +941,16 @@ class FisherEWC:
         self.lambda_ = ewc_lambda
         self.enabled = ewc_lambda > 0.0
         self._fisher: Dict[str, torch.Tensor] = {}   # within-task accumulator
-        self._fisher_all: Dict[str, torch.Tensor] = {}   # across ALL tasks
-        self._star: Dict[str, torch.Tensor] = {}
+        # Across tasks, EWC needs sum_t F^(t) and sum_t F^(t) * theta*^(t).
+        # Storing a running mean of theta* alongside a running sum of F is NOT
+        # equivalent: task 1's Fisher would be spent pulling theta towards
+        # theta*^(2), which already forgot task 1. The exact expansion
+        #   sum_t F^(t)(theta - theta*^(t))^2
+        #     = (sum_t F^(t)) * theta^2 - 2 (sum_t F^(t) theta*^(t)) * theta + c
+        # needs only the two accumulators below, and c is theta-independent so it
+        # never enters the gradient. Same memory as the old (F, theta*) pair.
+        self._fisher_all: Dict[str, torch.Tensor] = {}   # A = sum_t F^(t)
+        self._star_all: Dict[str, torch.Tensor] = {}      # B = sum_t F^(t) theta*^(t)
         self._n = 0
 
     @staticmethod
@@ -964,15 +972,24 @@ class FisherEWC:
         # Guard on _fisher_all (the across-task accumulator), NOT _fisher (the
         # within-task one, which consolidate() resets). Guarding on the latter
         # made the penalty identically zero for every task after the first.
-        if not self.enabled or not self._fisher_all or not self._star:
+        if not self.enabled or not self._fisher_all:
             return torch.zeros((), device=next(self.model.parameters()).device)
         total = None
         params = dict(self.model.named_parameters())
-        for n, f in self._fisher_all.items():
+        for n, a in self._fisher_all.items():
             p = params.get(n)
-            if p is None:
+            b = self._star_all.get(n)
+            if p is None or b is None:
                 continue
-            d = (p - self._star[n]) ** 2 * f
+            # Completed square: A(theta - B/A)^2
+            #   = A theta^2 - 2 B theta + B^2/A
+            # has exactly the gradient of the true multi-task quadratic
+            # (2A theta - 2B) while staying non-negative and vanishing at the
+            # Fisher-weighted mean B/A. Writing it as A theta^2 - 2 B theta
+            # instead would report a large NEGATIVE number at the optimum,
+            # because the theta-independent term is dropped.
+            mu = b / a.clamp(min=1e-12)
+            d = a * (p - mu) ** 2
             total = d.sum() if total is None else total + d.sum()
         if total is None:
             dev = next(self.model.parameters()).device
@@ -1002,31 +1019,35 @@ class FisherEWC:
 
     @torch.no_grad()
     def consolidate(self) -> None:
-        """Close the task window: average this task's Fisher, fold it into the
-        running across-task Fisher, and re-pin theta*.
+        """Close the task window: average this task's Fisher and fold it into
+        the two across-task accumulators.
 
-        The across-task accumulator is what penalty() reads. Folding into it
-        rather than replacing it matters: replacing made the penalty drop back
-        to exactly zero for every task after the first, i.e. EWC would have
-        silently done nothing. theta* is pinned to the MOST RECENT task
-        (sequential EWC) rather than to a per-task copy, which is what keeps
-        the stored state at one vector instead of one per task.
+        A += F^(t) and B += F^(t) * theta*^(t), where theta*^(t) is this task's
+        own weights at the moment it finished. Pairing the running sum of F with
+        a single re-pinned theta* was the defect: after task 2 it scored task
+        1's Fisher against task 2's weights, i.e. it anchored the model to a
+        point that had already forgotten task 1.
         """
         if not self.enabled or self._n == 0:
             return
         inv = 1.0 / float(self._n)
+        params = dict(self.model.named_parameters())
         for n, f in self._fisher.items():
             f.mul_(inv)
-            prev = self._fisher_all.get(n)
-            self._fisher_all[n] = f if prev is None else prev + f
-        params = dict(self.model.named_parameters())
-        self._star = {n: params[n].detach().clone() for n in self._fisher_all}
+            p = params.get(n)
+            if p is None:
+                continue
+            prev_a = self._fisher_all.get(n)
+            self._fisher_all[n] = f.clone() if prev_a is None else prev_a + f
+            prev_b = self._star_all.get(n)
+            contrib = f * p.detach().float()
+            self._star_all[n] = contrib if prev_b is None else prev_b + contrib
         self._fisher = {}
         self._n = 0
 
     def state_bytes(self) -> int:
         return sum(v.numel() for v in self._fisher_all.values()) + \
-            sum(v.numel() for v in self._star.values())
+            sum(v.numel() for v in self._star_all.values())
 
 
 def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-4,
@@ -1086,7 +1107,8 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                scaler=None, w_pi_final=0.0, log_prefix="", replay: ReplayBuffer = None,
                isolator: ProtoIsolator = None, dom_head=None, task_idx=0,
                anchor=None, anchor_lam=1e-3, aug="basic", workers=2, steps=0,
-               arch_lr=3e-3, depth_cost=0.0, flops_cost=0.0, depth_target=0.0, ewc=None):
+               arch_lr=3e-3, depth_cost=0.0, flops_cost=0.0, depth_target=0.0, ewc=None,
+               n_tasks: int = 1):
     trainloader, _ = get_task_data(name, os.path.join(_ROOT, "data"), workers=workers, aug=aug)
     _, testloader = get_task_data(name, os.path.join(_ROOT, "data"), workers=workers)
 
@@ -1157,8 +1179,28 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             opt.zero_grad(set_to_none=True)
             opt_arch.zero_grad(set_to_none=True)
 
+            # Per-sample prototype mask. Replayed exemplars belong to an EARLIER
+            # task, whose prototype rows were trained on that task's domain, so
+            # forcing them through the CURRENT task's rows would replay them
+            # against the wrong head - the replay would actively teach the wrong
+            # association. The 1-D task_pi_mask covers only the current task, so
+            # it is correct only when there is no replay at all.
+            if re_t is not None and hasattr(model, "K"):
+                rows = torch.zeros(inputs.size(0), model.K, dtype=torch.bool,
+                                   device=device)
+                src = torch.full((inputs.size(0),), task_idx,
+                                 device=device, dtype=torch.long)
+                src[inputs.size(0) - re_t.numel():] = re_t
+                for t_ in src.unique().tolist():
+                    lo = round(t_ * model.K / n_tasks)
+                    hi = round((t_ + 1) * model.K / n_tasks)
+                    rows[src == t_, lo:hi] = True
+                batch_pi_mask = rows
+            else:
+                batch_pi_mask = task_pi_mask
+
             with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
-                outputs, struct, pi, diag = model(inputs, tau=0.8, pi_mask=task_pi_mask)
+                outputs, struct, pi, diag = model(inputs, tau=0.8, pi_mask=batch_pi_mask)
                 loss = ce(outputs, targets)
                 if w_pi > 0:
                     pif = pi.float()
@@ -1499,7 +1541,8 @@ def main():
                    ewc=ewc,
                    aug=args.aug,
                    workers=args.workers,
-                   steps=args.steps)
+                   steps=args.steps,
+                   n_tasks=T)
 
         # Freeze this domain's structure into its slot & pristine router centroid
         _, el_self = get_task_data(name, os.path.join(_ROOT, "data"))
