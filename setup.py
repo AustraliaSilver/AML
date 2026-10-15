@@ -8,7 +8,7 @@ Enables:
 
 import os
 import sys
-from setuptools import setup, find_packages
+from setuptools import setup
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -88,12 +88,13 @@ if has_torch and torch.cuda.is_available():
     ]
 
 setup(
-    name="aml",
-    version="2.0.0",
-    author="AML Team",
-    description="Adaptive Model Learning with Native CUDA Acceleration & Continual Learning",
-    packages=find_packages(),
+    # Metadata (name, version, dependencies, python_requires, package list)
+    # lives in pyproject.toml and is NOT repeated here: two declarations of the
+    # same field is two sources of truth, and they had already drifted -
+    # `aml` vs `aml-framework`, ">=3.9" vs ">=3.10", and find_packages() with no
+    # include filter vs ["mgn*", "hts_lib*"].
+    #
+    # What remains is the part pyproject cannot express: the CUDA extensions.
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    python_requires=">=3.9",
 )
