@@ -49,6 +49,8 @@ jobs:
           python -c "import mgn, hts_lib;
           from mgn import ModelGenerator, ModelStructure, GeneratedModel;
           print('imports OK')"
+      - name: Install smoke test (the aml-selfcheck console script)
+        run: aml-selfcheck
       - name: Unit tests (CPU-safe, includes train() smoke + protocol tests)
         run: python -m unittest discover tests
       - name: Quickstart demo (exercises mgn + hts_lib end to end)

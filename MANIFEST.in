@@ -1,0 +1,40 @@
+# Source-distribution contents (sdist only; the wheel is pure Python).
+#
+# The wheel deliberately ships NO compiled kernels: the fused _C/_Cin
+# extensions are platform- and CUDA-version-specific, and a `py3-none-any`
+# wheel carrying a Windows .pyd would break every Linux install.
+# `include-package-data = false` in pyproject.toml keeps build artifacts out
+# of the wheel; this file decides what the *sdist* carries instead.
+
+include LICENSE
+include README.md
+include REPRODUCIBILITY.md
+include pyproject.toml
+include setup.py
+include build_ext.py
+include quickstart_aml.py
+include quickstart_hts.py
+
+# C++/CUDA sources: needed only to build the fused kernels from source, e.g.
+#   FORCE_CUDA=1 pip install --no-build-isolation ./aml_framework-<v>.tar.gz
+recursive-include mgn/csrc *.cu *.cpp *.h *.cuh
+
+# The sdist is the library, not the research scaffolding, the datasets, the
+# papers, or the local build output. A stale `aml_framework.egg-info/SOURCES.txt`
+# left behind by an editable install is read as a starting file list, so these
+# prunes are what keep its stale entries (a whole tests/ tree) out.
+prune tests
+prune data
+prune dist
+prune build
+prune .github
+prune paper_and_documents
+prune experiments_archive
+prune AML_Core_Code
+prune contest
+prune scratch
+prune mgn/tests
+
+# Never ship build artifacts, checkpoints or logs from anywhere in the tree.
+recursive-exclude * __pycache__
+global-exclude *.py[cod] *.pyd *.so *.dll *.dylib *.pth *.pt *.log

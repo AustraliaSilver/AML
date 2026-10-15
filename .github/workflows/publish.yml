@@ -1,0 +1,164 @@
+name: Publish
+
+# Two ways in:
+#   * push a tag `v<version>`  -> build, verify and publish to PyPI
+#   * run this workflow by hand -> TestPyPI by default (pick `pypi` for real)
+#
+# Uploads use PyPI Trusted Publishing (OIDC) -- there is no API token to store,
+# rotate or leak. That requires a one-time configuration on the index side:
+# see RELEASING.md. Until it is configured, only the `build` job runs; the
+# publish jobs fail loudly on the OIDC exchange rather than silently doing
+# nothing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Package index to publish to"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail before the upload, not after: a release is immutable on PyPI, so a
+  # tag cut from an unverified commit must be caught here.
+  verify:
+    name: Verify (test suite on the tagged commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install torch (CPU build) and the package with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Unit tests
+        run: python -m pytest tests -q
+      - name: Install smoke test (aml-selfcheck console script)
+        run: aml-selfcheck
+
+  build:
+    name: Build sdist + wheel
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The tag must match the packaged version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          if tag != version:
+              sys.exit(f"tag v{tag} does not match pyproject version {version}: "
+                       f"bump the version or fix the tag before publishing")
+          print(f"tag v{tag} matches pyproject version {version}")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Metadata must render on PyPI
+        run: python -m twine check --strict dist/*
+
+      - name: Artifacts must be clean (pure-Python wheel, complete sdist)
+        run: |
+          python - <<'PY'
+          import glob, sys, tarfile, zipfile
+
+          (wheel,) = glob.glob("dist/*.whl")
+          # A compiled extension inside a `py3-none-any` wheel breaks every
+          # platform except the build host's -- this guards mgn/accel/*.pyd.
+          if not wheel.endswith("-py3-none-any.whl"):
+              sys.exit(f"expected a pure-Python wheel, got {wheel}")
+          names = zipfile.ZipFile(wheel).namelist()
+          for label, bad in (
+              ("compiled artifacts", [n for n in names
+                                      if n.endswith((".pyd", ".so", ".dll", ".dylib"))]),
+              ("test modules", [n for n in names if "/tests/" in n]),
+          ):
+              if bad:
+                  sys.exit(f"{label} leaked into the wheel: {bad}")
+          if "mgn/_selfcheck.py" not in names:
+              sys.exit("the aml-selfcheck entry point is missing from the wheel")
+          print(f"{wheel}: {len(names)} entries, pure Python, no tests")
+
+          # The sdist is what a CUDA host builds the fused kernels from, so it
+          # must carry the C++/CUDA sources -- and nothing that looks like a
+          # checkpoint, the paper, or the repository's own test suite.
+          (sdist,) = glob.glob("dist/*.tar.gz")
+          members = [m.name for m in tarfile.open(sdist).getmembers()]
+          if not any(m.endswith("mgn/csrc/bindings.cpp") for m in members):
+              sys.exit("the sdist is missing mgn/csrc -- CUDA builds would fail")
+          for label, bad in (
+              ("compiled artifacts", [m for m in members
+                                      if m.endswith((".pyd", ".so", ".dll", ".dylib"))]),
+              ("checkpoints", [m for m in members if m.endswith((".pt", ".pth"))]),
+              ("test suites", [m for m in members if "/tests/" in m]),
+              ("the paper", [m for m in members if "paper_and_documents" in m]),
+          ):
+              if bad:
+                  sys.exit(f"{label} leaked into the sdist: {bad[:5]}")
+          print(f"{sdist}: {len(members)} entries, CUDA sources present, clean")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/aml-framework
+    permissions:
+      id-token: write   # OIDC: no long-lived token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/aml-framework
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

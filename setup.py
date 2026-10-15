@@ -5,10 +5,26 @@ Enables:
     pip install -e .
     python setup.py build_ext --inplace
 
-Set FORCE_CUDA=1 to build the extensions on a machine with no visible GPU
-(Docker image builders, cross-compile hosts). `torch.cuda.is_available()`
-alone would silently skip the extensions there, producing an image whose
-imports fail later with a bare ModuleNotFoundError instead of a build error.
+The fused kernels are OPTIONAL and are never published to PyPI: the wheels
+there are pure Python (see MANIFEST.in), because a compiled extension is
+platform- and CUDA-version-specific. `pip install .` therefore builds nothing
+and prints a one-line notice; `import mgn` still works, `mgn.accel` falls back
+to the (numerically identical) PyTorch GroupedConv path, and only the fused
+`mgn.accel._C` / `_Cin` entry points are absent.
+
+To build the extensions, run from a source checkout on a CUDA host:
+
+    python setup.py build_ext --inplace                # uses the local toolchain
+    FORCE_CUDA=1 pip install --no-build-isolation .    # inside pip
+
+`--no-build-isolation` is required because torch is a runtime (not build)
+requirement; without it the isolated build environment has no torch headers.
+
+Set FORCE_CUDA=1 (or AML_BUILD_CUDA=1) to build the extensions on a machine
+with no visible GPU (Docker image builders, cross-compile hosts).
+`torch.cuda.is_available()` alone would silently skip the extensions there,
+producing an image whose imports fail later with a bare ModuleNotFoundError
+instead of a build error.
 """
 
 import os
@@ -32,13 +48,35 @@ except ImportError:
 def _force_cuda():
     """True when the user asked for a CUDA build regardless of local hardware.
 
-    `pip install -e .` inside a Docker build stage has no GPU, so
-    `torch.cuda.is_available()` is False and the extensions are skipped; the
-    image then ships without them and every fused-kernel import fails at run
-    time instead of at build time. FORCE_CUDA=1 makes the intent explicit.
+    Accepts FORCE_CUDA=1 (historic) or AML_BUILD_CUDA=1 (explicit opt-in used by
+    the CUDA install docs). `pip install -e .` inside a Docker build stage has no
+    GPU, so `torch.cuda.is_available()` is False and the extensions would be
+    skipped; the image then ships without them and every fused-kernel import
+    fails at run time instead of at build time.
     """
-    v = os.environ.get("FORCE_CUDA", "")
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    for var in ("FORCE_CUDA", "AML_BUILD_CUDA"):
+        if os.environ.get(var, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def _notice_skip():
+    """Say out loud that the fused kernels are not in this build.
+
+    Without this the skip is invisible: a GPU user who runs a plain
+    `pip install .` gets a working-but-slower install and no hint that the
+    kernels exist or how to get them.
+    """
+    print(
+        "[setup] Fused CUDA kernels NOT built (no torch, or no visible GPU, in "
+        "the build environment).\n"
+        "        Expected for `pip install` from PyPI; the install is "
+        "pure-Python and portable.\n"
+        "        `import mgn` and every PyTorch code path still work; only "
+        "mgn.accel._C / _Cin are absent.\n"
+        "        To build them on a CUDA host: `python build_ext.py`, or "
+        "`FORCE_CUDA=1 pip install --no-build-isolation .`"
+    )
 
 
 if has_torch and (torch.cuda.is_available() or _force_cuda()):
@@ -107,6 +145,8 @@ if has_torch and (torch.cuda.is_available() or _force_cuda()):
             extra_compile_args=extra_compile_args,
         ),
     ]
+else:
+    _notice_skip()
 
 setup(
     # Metadata (name, version, dependencies, python_requires, package list)

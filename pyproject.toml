@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +8,33 @@ version = "2.0.0"
 description = "Architecture Mode Learning (AML) Framework: Meta-Generators (MGN) & Continual Hypernetworks (HtS)"
 authors = [{ name = "AustraliaSilver" }]
 readme = "README.md"
-license = { file = "LICENSE" }
+# PEP 639 SPDX expression. `license-files` needs setuptools>=77, which the
+# build-system requirement above pins; the legacy `license = { file = ... }`
+# table is deprecated and stops building in Feb 2027.
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = [
+    "continual-learning",
+    "catastrophic-forgetting",
+    "hypernetwork",
+    "dynamic-networks",
+    "neural-architecture-search",
+    "meta-learning",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# NOTE: no `License ::` classifier on purpose -- PEP 639 forbids combining it
+# with the SPDX `license` expression above.
 dependencies = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
@@ -26,13 +51,31 @@ experiments = [
     "scikit-learn>=1.0",
     "datasets>=2.14",
 ]
-dev = ["ruff>=0.5"]
+dev = ["ruff>=0.5", "pytest>=7.0", "build>=1.2", "twine>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/AustraliaSilver/AML"
+Repository = "https://github.com/AustraliaSilver/AML"
+Issues = "https://github.com/AustraliaSilver/AML/issues"
+
+[project.scripts]
+# Install smoke test: proves a pip-installed wheel imports and runs a
+# forward/backward pass without downloading any dataset. See mgn/_selfcheck.py.
+aml-selfcheck = "mgn._selfcheck:main"
+
+[tool.setuptools]
+# Keep the wheel pure Python. If this flips to true, a locally built
+# mgn/accel/_C.cp312-win_amd64.pyd can ride into a `py3-none-any` wheel and
+# every non-Windows install breaks with a bogus module error.
+include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["mgn*", "hts_lib*"]
+exclude = ["mgn.tests*", "mgn.csrc*", "tests*"]
+# Namespace discovery would also "find" mgn/csrc (C++/CUDA sources, no .py) and
+# ship an empty package directory; requiring a real __init__.py keeps the wheel
+# to the two importable packages.
+namespaces = false
 
 [tool.ruff]
 target-version = "py310"
