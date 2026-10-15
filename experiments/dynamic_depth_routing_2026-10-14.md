@@ -1045,6 +1045,17 @@ so the isolation window was opened and then ignored.
 projection. It now has its own `AdamW`, a `0.3`-weighted cross-entropy against
 the current task id, and its own gradient-norm clip.
 
+**B38 (high, honesty) — the default run was not the documented run.**
+`--replay-per-class` defaulted to **400**, so a bare
+`python train_continual_aml.py` stored 4 000 exemplars and ran a consolidation
+pass over them, while every headline number in the README and the paper is a
+**zero-replay** number obtained by passing `--replay-per-class 0` explicitly.
+Nothing warned; the reproduction command and the claim simply described two
+different methods. The default is now `0`, and `build_arg_parser()` was extracted
+from `main()` so `tests/test_zero_replay_default.py` can assert the defaults
+against the trainer's own parser — the defaults *are* part of the scientific
+claim, so they are tested like one.
+
 **B37 (perf) — `load_state_dict` was the evaluation bottleneck, not the GPU.**
 `evaluate` swaps the encoder, selector, stem, 18 layers and the head LayerNorm
 once per snapshot per batch. `load_state_dict` re-validates every key and shape
