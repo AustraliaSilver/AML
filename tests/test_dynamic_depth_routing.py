@@ -565,6 +565,28 @@ class TestNormalizationChoices(unittest.TestCase):
         self.assertIsInstance(hb.plain.norm, nn.InstanceNorm2d)
         self.assertIsInstance(hb.resnet.norm1, nn.InstanceNorm2d)
 
+    def test_train_hybrid_norm_matches_the_cli_default(self):
+        """Two scripts, one architecture. `train_hybrid_aml.py` constructed
+        `HybridBlock(in, in, num_heads)` without `norm_type` and hard-coded
+        `nn.GroupNorm` in its stem, so it trained a BatchNorm/GroupNorm network
+        while `train_continual_aml.py --norm in` trained an InstanceNorm one --
+        with nothing in either output saying so. Assert the built modules, not
+        the arguments, since the bug was an argument that was never passed.
+        """
+        import torch.nn as nn
+        from train_hybrid_aml import HybridAMLNetwork
+
+        m = HybridAMLNetwork(num_classes=10, max_layers=2, hidden_dim=8,
+                             K=3, num_heads=2)
+        self.assertIsInstance(m.stem[1], nn.InstanceNorm2d)
+        self.assertIsInstance(m.layers[0].plain.norm, nn.InstanceNorm2d)
+        self.assertIsInstance(m.layers[0].resnet.norm1, nn.InstanceNorm2d)
+        # and the comparison remains reachable, since that is the experiment
+        b = HybridAMLNetwork(num_classes=10, max_layers=2, hidden_dim=8,
+                             K=3, num_heads=2, norm_type="bn")
+        self.assertIsInstance(b.stem[1], nn.BatchNorm2d)
+        self.assertIsInstance(b.layers[0].plain.norm, nn.BatchNorm2d)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1301,6 +1301,82 @@ exists precisely so that the next question is answered by loading what the run
 stored and checking agreement first (8e-5), not by rebuilding the statistics and
 hoping.
 
+**B42 (medium) — a class default was missed by the B33 fix, and the one caller it
+did reach trained a different model from the documented one.**
+
+B33 aligned `norm_type` to `in` in `cnn_block.py` and `hybrid_18.py`. It missed
+`hybrid_router.HybridBlock`, which kept `norm_type: str = "bn"`. The search was
+"which files take a `norm_type` argument", not "which classes do" — and the class
+that was missed is the one every `HybridBlock` consumer goes through.
+
+The production continual runs were **not** affected: `hybrid_18.py:169` passes
+`norm_type=norm_type` explicitly. The casualty was
+**`train_hybrid_aml.py`**, which constructs `HybridBlock(in, in, num_heads)`
+without it and hard-coded `nn.GroupNorm(1, hidden_dim)` in its stem. So the
+single-task hybrid trainer built a **BatchNorm/GroupNorm** network while
+`train_continual_aml.py --norm in` built an **InstanceNorm** one — two scripts
+documented as training the same architecture, training different models, with
+nothing in either output saying so. For a claim about a 13-point normalization
+effect, that is not a cosmetic inconsistency.
+
+Fixed in both places: `HybridBlock`'s default, and `train_hybrid_aml.py`, which
+now takes `--norm {in,bn,gn}` (default `in`), routes it to `make_norm` in the stem
+and to the blocks, and is pinned by
+`test_train_hybrid_norm_matches_the_cli_default`. The regression guard that
+matters is not per-block:
+
+* `test_every_block_default_matches_the_cli_default` walks the four block classes
+  and asserts the signature default is `in`. A new block with a different default
+  fails the test.
+* `test_class_default_actually_builds_instance_norm` builds each one and inspects
+  the module, because a signature can agree with a caller that ignores it.
+
+All three are in `tests/test_dynamic_depth_routing.py` (40 tests). No reported
+number changes: `train_hybrid_aml.py` is not the source of any figure in the
+README, the experiments write-up or the paper, and the continual runs pass the
+norm explicitly.
+
+**B43 (low, packaging) — the CUDA extensions could not be cross-compiled.**
+
+`setup.py` gated the extension build on `torch.cuda.is_available()`, so a Docker
+image build stage — which by design has no GPU — silently produced an image whose
+`mgn.accel` imports fail at run time with a bare `ModuleNotFoundError` instead of
+at build time. `FORCE_CUDA=1` now forces the build and prints that it did.
+
+**B44 (low, reproducibility) — the docs pointed at scripts that do not exist.**
+
+`REPRODUCIBILITY.md` and §10 below instructed the reader to run `scratch/ab_arch.py`,
+`scratch/diag_arch_grad.py` and `scratch/test_p2_p3.py`. `scratch/` is git-ignored
+and has never been shipped, so a fresh clone cannot run any of them. Both places
+now list the tests that replaced the checks worth keeping, say plainly that the
+original scripts are not shipped, and give the shipped-trainer commands for the
+`--steps 60` A/Bs behind §2c. A reproduction command that fails on a clean clone
+is worse than no command.
+
+**B45 (medium, honesty) — the paper described a system the repository no longer
+contains.**
+
+Three separate claims in the paper were stale against its own later sections:
+
+* a limitation bullet read *"The current system supports only PlainConv and
+  ResNet blocks"* — contradicting §1 (tri-modal vocabulary), §6.4 (the tri-modal
+  configuration under test) and §7 (the CNN+ResNet+ViT 18-layer hybrid);
+* *"AML currently generates a single architecture for the entire batch"* —
+  superseded; the executor takes a `[B, K]` per-sample `pi_mask` and routes per
+  sample (B35 fixed the benchmark half of this);
+* *"all experiments were conducted on CPU"* — superseded by the fused CUDA
+  path and its parity gate (B31, B39).
+
+Each is now retracted in place rather than quietly edited, and the space is filled
+with the limitation that actually holds: the paper's model equations are the
+**legacy** two-mode GroupNorm supernet, the continual experiments use the
+**three-mode** InstanceNorm hybrid, and the executor section says so at the top
+and spells out the three differences. Two new limitations replace the retracted
+ones — the domain router's one-directional error and the single-seed caveat.
+`tests/test_paper_latex.py` now fails on the retracted sentences, on a missing
+`8{\times}8` token-pooling claim, and on the paper and the shipped normalisation
+default disagreeing.
+
 ---
 
 ## 11. Open items, stated as open

@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mgn.blocks import HybridBlock
+from mgn.blocks.cnn_block import make_norm
 from mgn.generator import DistanceRouter
 
 
@@ -23,7 +24,8 @@ class HybridAMLNetwork(nn.Module):
     - Mode 1: ResNetBlock
     - Mode 2: VisionTransformerBlock
     """
-    def __init__(self, num_classes=10, max_layers=6, hidden_dim=48, K=8, num_heads=4):
+    def __init__(self, num_classes=10, max_layers=6, hidden_dim=48, K=8, num_heads=4,
+                 norm_type='in'):
         super().__init__()
         self.max_layers = max_layers
         self.hidden_dim = hidden_dim
@@ -32,7 +34,7 @@ class HybridAMLNetwork(nn.Module):
         # Layers: First conv stem, followed by dynamic HybridBlocks
         self.stem = nn.Sequential(
             nn.Conv2d(3, hidden_dim, 3, padding=1),
-            nn.GroupNorm(1, hidden_dim),
+            make_norm(norm_type, hidden_dim),
             nn.ReLU()
         )
 
@@ -46,7 +48,8 @@ class HybridAMLNetwork(nn.Module):
         self.mode_prototypes = nn.Parameter(torch.randn(K, max_layers, 3) * 0.1)
 
         self.layers = nn.ModuleList([
-            HybridBlock(in_channels=hidden_dim, out_channels=hidden_dim, num_heads=num_heads)
+            HybridBlock(in_channels=hidden_dim, out_channels=hidden_dim,
+                        num_heads=num_heads, norm_type=norm_type)
             for _ in range(max_layers)
         ])
 
@@ -86,7 +89,8 @@ class HybridAMLNetwork(nn.Module):
         return out, mode_weights
 
 
-def train_hybrid_aml(dataset='mnist', epochs=5, batch_size=64, lr=1e-3, steps_per_epoch=0):
+def train_hybrid_aml(dataset='mnist', epochs=5, batch_size=64, lr=1e-3, steps_per_epoch=0,
+                     norm_type='in'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] Training Hybrid AML (CNN + ViT) on dataset '{dataset}' ({device})...")
 
@@ -135,7 +139,8 @@ def train_hybrid_aml(dataset='mnist', epochs=5, batch_size=64, lr=1e-3, steps_pe
         num_workers=num_workers, pin_memory=True if num_workers > 0 else False
     )
 
-    model = HybridAMLNetwork(num_classes=10, max_layers=6, hidden_dim=48, K=8, num_heads=4).to(device)
+    model = HybridAMLNetwork(num_classes=10, max_layers=6, hidden_dim=48, K=8,
+                            num_heads=4, norm_type=norm_type).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
 
@@ -208,5 +213,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--steps', type=int, default=0, help='0 for full epoch')
+    # B42: this script used to build BatchNorm blocks while train_continual_aml.py
+    # built InstanceNorm ones, so two scripts documented as training the same
+    # architecture trained different models. The default now matches the CLI
+    # default everywhere else; 'bn' is kept reachable for the comparison.
+    parser.add_argument('--norm', type=str, default='in', choices=['in', 'bn', 'gn'],
+                        help='post-convolution normalisation (default: in)')
     args = parser.parse_args()
-    train_hybrid_aml(dataset=args.dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, steps_per_epoch=args.steps)
+    train_hybrid_aml(dataset=args.dataset, epochs=args.epochs, batch_size=args.batch_size,
+                     lr=args.lr, steps_per_epoch=args.steps, norm_type=args.norm)
