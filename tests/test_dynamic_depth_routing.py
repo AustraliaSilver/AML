@@ -427,6 +427,63 @@ class TestOpenSetFallback(unittest.TestCase):
         self.assertEqual(acc_off, acc_on,
                          "fallback must not alter the task-oracle protocol")
 
+    def test_live_fallback_uses_the_live_structure_not_the_rejected_slots(self):
+        """Regression: the open-set fallback re-ran the LIVE weights under the
+        REJECTED snapshot's gate/block-mode slot (struct_override), i.e. one
+        model's architecture with another's weights, so the fallback was neither
+        A_live nor that domain's prediction (same defect class as B46)."""
+        from train_continual_aml import evaluate
+        m = _model(max_dim=16).eval()
+        dev = torch.device("cpu")
+        loader = self._tiny_loader(n=64)
+        x, _y = loader[0]
+
+        snap = {
+            "enc": {k: v.detach().clone() for k, v in m.vision_encoder.state_dict().items()},
+            "sel": {k: v.detach().clone() for k, v in m.prototype_selector.state_dict().items()},
+            "stem": {k: v.detach().clone() for k, v in m.stem.state_dict().items()},
+            "layers": {k: v.detach().clone() for k, v in m.layers.state_dict().items()},
+            "ln": {k: v.detach().clone() for k, v in m.ln.state_dict().items()},
+            "struct_heads": {"sprotos": m.structure_prototypes.detach().clone(),
+                             "bmprotos": m.block_mode_prototypes.detach().clone()},
+            "protos": m.proto_weights.detach().to("cpu", torch.float32).clone(),
+        }
+        # A deliberately WRONG structure for the one stored domain: every layer
+        # gate closed. If the fallback reuses it, the live weights run the wrong
+        # graph.
+        with torch.no_grad():
+            _, st, _, _ = m(x, tau=0.1)
+        slots = [{"gate": torch.zeros(m.max_layers),
+                  "bm_mode": st.block_mode[0].clone(),
+                  "bm_res": st.block_mode[0, :, 1].clone()}]
+
+        class _Head(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.l = torch.nn.Linear(m.latent_dim, 1)
+
+            def forward(self, z):
+                return self.l(z)
+
+        # The fixture must be able to tell the two structures apart, or the
+        # equality asserted below proves nothing.
+        with torch.no_grad():
+            live = m(x, tau=0.1)[0].argmax(-1)
+            over = m(x, tau=0.1, struct_override=(
+                slots[0]["gate"].view(1, -1).repeat(x.shape[0], 1),
+                slots[0]["bm_mode"].view(1, *slots[0]["bm_mode"].shape).repeat(x.shape[0], 1, 1),
+            ))[0].argmax(-1)
+        self.assertFalse(bool((live == over).all()),
+                         "the closed-gate structure must change the answer")
+
+        acc_live, _ = evaluate(m, loader, dev)
+        acc_fb, _ = evaluate(m, loader, dev, dom_head=_Head(), slots=slots,
+                             snaps=[snap], route_tau=0.6, dom_truth=0,
+                             auto_live_thresh=1.0)
+        self.assertEqual(acc_fb, acc_live,
+                         "the live fallback must be the live model, not the "
+                         "live weights under the rejected slot's structure")
+
 
 class TestAmbiguousRetryBudget(unittest.TestCase):
     """The ambiguous-sample retry is the real inference cost: it re-loads

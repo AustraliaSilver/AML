@@ -1598,6 +1598,171 @@ optional); `twine check --strict` PASSED on the wheel and the sdist. What is *no
 measured: nothing has been uploaded, so the OIDC exchange with a real index is
 still untested (open item 11).
 
+**B59 (report triage, part 1: Python) — an external report of ~23 defects was
+read against the tree rather than accepted on its word. The real Python defects
+are fixed and pinned by tests; the "critical" labels mostly do not survive the
+check.**
+
+Measured, not asserted: `ruff check .` clean; `pytest -q` **275 passed + 45
+subtests** (was 256 + 45), 10 warnings (the `max_dim=8` fixtures from B51). Each
+item below was reproduced against the current tree before it was touched, and
+the reachability is stated because several are not on any documented path. The
+remaining report items described code that had already been fixed before the
+report was filed, or paths that do not exist in this tree; they were checked
+against the source and are not re-listed.
+
+- **The fused executor silently dropped the HtS low-rank adapters (silent wrong
+  answer).** `ModelGenerator` folds the adapters into the generated weights, and
+  `mgn/executor.py` re-derives those weights from `(prototypes, pi)` in the fused
+  CUDA path, which has no adapter term. `TaskNetwork._fusable` intended to refuse
+  such models but tested `hasattr(model, "hts_adapters")` on the `GeneratedModel`
+  the generator returns, which never carries that attribute, so the check was
+  always False. `GeneratedModel` now carries `has_hts_adapters`, the generator
+  sets it, and `_fusable` refuses. Reachable through
+  `experiments/benchmark_conv_aml.py --fused-executor` and library users of
+  `TaskNetwork(fused=True)`; **not** the production trainer, which builds
+  `AcceleratedCVNetwork`. Consequence, disclosed rather than hidden: every
+  conv-mode generator attaches adapters, so that flag now falls back to eager.
+  A fused kernel that computes the adapters is future work (open item 13); the
+  parity tests delete the adapters so the kernel stays exercised.
+- **`contrastive_architecture_loss` read a key conv models do not have.** It took
+  its device from `weights["fc1.weight"]`; conv models expose `c1.weight`/
+  `out.weight`, so it raised `KeyError`. The device now comes from
+  `structure.layer_gates`. Only reached when `lambda_contrastive > 0` (default
+  0.0), which is why no shipped run tripped it.
+- **`HtSResidualBlock` built invalid GroupNorm group counts.** `min(8, out_d//4)`
+  is 7 for `out_d=30` (`30 % 7 != 0` -> `num_channels must be divisible by
+  num_groups`) and 0 for `out_d < 4`. Two helpers keep every already-working
+  width bit-identical and pick a true divisor otherwise: `_norm_groups` for
+  gn2/shortcut (24/48/96 -> 6/8/8, unchanged) and `_stem_groups` for gn1, which
+  reproduces its historical constant `GroupNorm(4, C)`. A single shared helper
+  preferring `min(cap, C//4)` would have quietly moved C=8/12 from 4 groups to
+  2/3 and changed every HtS number; the regression test pins both.
+- **`VisionTransformerBlock` did not reconcile `num_heads` with the channel
+  count.** `num_heads` is a free argument and `--max-dim` a free CLI value, and
+  nothing checked that the width divides by the head count; an indivisible pair
+  failed deep inside `forward`. It is rejected at construction now.
+- **`train_continual_aml.py`.** Four independent fixes, all on paths the
+  documented command reaches only in their crash cases, so none of them moves the
+  published numbers:
+  * `ambiguous_candidate_mask` scatters into an `[B, n_domains]` tensor with
+    STRUCTURE-SLOT indices, and `len(slots)` is not forced to equal
+    `len(snaps)`; a top-k column `>= n_domains` was an out-of-bounds `scatter_`
+    (a CUDA device-side assert). Invalid slots are `-inf`'d before the top-k and
+    `k` is capped. With `--amb-topk 0` (the default, and the production command)
+    the function returns all-ones exactly as before, so the fix is a strict
+    no-op there.
+  * `score_per_task`'s Mahalanobis branches looped `range(T_cur)` over
+    `z_per_task`: an `IndexError` when `num_tasks` (a monotonic counter) exceeded
+    the stored snapshots. Bounded like the cosine branch.
+  * `evaluate` treated `snaps=[]` as "has snapshots": the per-snapshot loop did
+    nothing, `outs_conf`/`best_out` stayed empty and `ref_o.shape[1]` raised
+    `AttributeError` on `None`. An empty list now means no snapshots, and a batch
+    whose every row routes to a domain without a snapshot falls back to the live
+    weights.
+  * `--auto-live-thresh`'s live fallback ran the LIVE weights under the rejected
+    domain's gate/block-mode slot — architecture from one model, weights from
+    another. It runs the live model under its own structure now. Off by default
+    and absent from the production command, so it does not alter the documented
+    numbers.
+  * `_DATA_CACHE` was keyed on the dataset name alone, so calling `get_task_data`
+    twice for the same name with different roots returned the first root's
+    tensors. Keyed on `(name, abspath(data_root))`.
+- **The static extractor was not a faithful replica of its mother.**
+  `extract_child_truedynamic` read `pi` from `ood_router.get_pi`, but the mother
+  routes with `prototype_selector`; `get_pi` additionally partitioned `K=12`
+  rows against `rows_per_task=24`, so with one active task the row sums were 0.5
+  and later tasks were zeroed. It uses the mother's own router now, and `get_pi`
+  partitions the rows exactly (`sum_k pi_k = 1`, every active task's rows
+  non-zero). `StaticLayer` hardcoded `nn.GroupNorm(1, C)` regardless of the
+  mother's `norm_mode`, so a child extracted from an InstanceNorm mother
+  normalised differently from the model it came from; it builds the matching op
+  now (`_norm_layer`). Reachable through `quickstart_aml.py`, which extracts a
+  `ConvAML_CIFAR_TrueDynamic` child. The paper's appendix listing is updated to
+  the shipping source.
+- **`fused_autograd._norm_bwd`** looked for `instance_norm_bwd` only in `_C`, so
+  a `_Cin`-only build fell back to ATen even though `_Cin.instance_norm_bwd`
+  existed and was never referenced. It dispatches lazily on either module now
+  (the other half of the report's item is open item 14).
+- **`mgn/trainer.py`.** The stability snapshot rebuilt a hand-listed
+  `ModelStructure` and dropped `use_conv`/`in_channels`; it copies the whole
+  structure now. The `torch.compile` dry run fed `VisionModelGenerator` a flat
+  vector, so `--compile` silently disabled itself for a 4D generator.
+
+Checked and **refuted, left unchanged**: the report's memory-buffer item.
+`EpisodicMemoryBuffer` mixes `torch.randperm` with `random.shuffle`, but
+`hts_lib.utils.set_seed` seeds `random`, `numpy` and `torch` together, and the
+buffer is only reached through it (`experiments/benchmark_hts_baselines.py`
+imports that `set_seed`), so exemplar selection already reproduced. Rewriting the
+shuffle to the torch RNG would not have added reproducibility and would have
+moved the HtS baseline numbers, so the file is untouched;
+`tests/test_hts_core.py` now pins the actual contract.
+
+**B60 (report triage, part 2: CUDA) — three latent memory/launch defects in the
+native kernels, verified by rebuilding.**
+
+Measured, not asserted: `python build_ext.py` -> `_C: OK (11 exports)`,
+`_Cin: OK (4 exports)`; the full suite above runs against the rebuilt `.pyd`.
+
+- `in/bindings_in.cpp:in_maxpool2x2_bwd` passed `data_ptr()` straight through
+  from the incoming tensors, and `dh_out` is an upstream autograd gradient that
+  can be a non-contiguous view (a sliced gradient, a transposed activation) while
+  the launcher indexes it as flat `[B, C, H, W]`. The GN twin
+  (`maxpool2x2_bwd`) already normalised with `.contiguous()`; this one did not,
+  so a non-contiguous gradient silently indexed the wrong memory. Normalised to
+  match.
+- `bindings.cpp:mix_bwd_v2_b` had no input validation at all, while its sibling
+  `mix_bwd_v2_a` checks contiguity/CUDA and the `MB_MAX_C` bound. A
+  non-contiguous or CPU tensor reached the kernel through a raw `data_ptr`. The
+  same `TORCH_CHECK`s are added.
+- The four maxpool/norm kernels computed the per-IMAGE base as
+  `int base = ((b * C + c) * H + h0) * W_` (or `(b * C + c) * spatial`). That
+  scales with `B*C*H*W` — about 4x the flat output index the grid is sized for —
+  and could overflow before the flat index did. Widened to `long` in
+  `fused_pipeline.cu`, `fused_backward.cu`, `in/fused_backward_in.cu` and
+  `in/fused_pipeline_in.cu`. No behaviour change at any reachable shape.
+- `kernels/batched_hyper_linear.cu`'s three launchers used the implicit legacy
+  default stream and never checked the launch, and `grid.z = batch` is capped at
+  65535. On a non-default current stream the default stream's implicit
+  serialisation does not apply, so the kernel could race the surrounding ops (and
+  this is what breaks under CUDA graph capture); an oversize batch silently
+  covered only the first 65535 elements. Now on `getCurrentCUDAStream()` with
+  `cudaGetLastError()` checked and a loud throw past 65535.
+- **Dead code.** `kernels/fused_chain_conv.cu`, `kernels/fused_post_conv.cu` and
+  `kernels/fused_norm_relu_gate.cu` were compiled into `_C` but referenced by
+  nothing: their exports do not appear in `bindings.cpp`,
+  `fused_norm_relu_gate.cu` existed only to satisfy `fused_chain_conv.cu`, and
+  even the latter's declared `tiled_conv_fwd_launcher` was never called. Removed
+  from `setup.py` and `build_ext.py` and deleted (486 lines).
+
+**B61 (report triage, part 3) — reported defects examined and deliberately NOT
+changed, so that "not fixed" is not mistaken for "not read".**
+
+Each would move training or evaluation numerics for no correctness gain, or is
+unreachable. The report's severity labels are quoted, not endorsed.
+
+- **`drop_last` when fitting the router** (the report's own estimate: 0.16 %).
+  That is below the 0.26-point same-seed spread already documented (open item 4)
+  and the fit-split question is open item 1. Changing it would move the routing
+  calibration every published number sits on, for an effect smaller than the
+  measurement noise.
+- **`GradScaler` under bf16, and the missing clip.** Under bf16 autocast the
+  scaler is a numerical no-op except for inf-skip; but `hts_lib`'s autocast
+  defaults to **fp16**, where the scaler is required, so it stays. Adding the
+  clip the report asks for in `hts_lib` would move its numbers without touching
+  the AML ones; left as a deliberate asymmetry.
+- **`attn_dim = out_c // 4`** (`mgn/executor.py`) is 0 for `out_c < 4`.
+  Unreachable: `hybrid_18.py` rejects `max_dim < 16`, and the reachable half of
+  the same class of bug (`num_heads` divisibility) is fixed in B59.
+- **AdamW momentum on frozen rows.** The reported concern is stale momentum on
+  weights that are "worn". `restore()` rewrites those weights bit-exactly each
+  step, so the momentum has no practical effect; changing the optimiser would
+  move the numbers.
+- **`mix_bwd_v2_a/b` are not exported by `_Cin`.** Only the `_norm_bwd` dispatch
+  half is fixed (B59). Exporting the mix backward from `_Cin` means adding
+  `fused_backward.cu` to its source list — a build-shape change — so it is open
+  item 14, not silently done.
+
 ---
 
 ## 11. Open items, stated as open
@@ -1674,3 +1839,29 @@ Written down so that "not done" is not later mistaken for "not noticed".
     CUDA host must compile the sdist themselves, and nothing exercises that path
     end-to-end in CI: `validate_ext_in.py` runs only when the runner already has a
     GPU, and the release workflow never builds the extensions at all.
+13. **The fused executor has no HtS-adapter term, so `--fused-executor` is now a
+    no-op for the default generator (B59).** Refusing to run a fused kernel that
+    computes a different function from the model is correct, but it means the
+    speedup only exists for models without adapters, which is nothing in this
+    repo. The fix is a fused kernel that folds `A(pi) @ B` into the re-mixed
+    weights; it has not been written. The parity tests delete the adapters so the
+    kernel itself stays under test.
+14. **`mix_bwd_v2_a/b` are still not exported by `_Cin` (B59/B61).** The Python
+    `_norm_bwd` dispatch now finds `_Cin.instance_norm_bwd`, but the mix backward
+    kernels live in `fused_backward.cu`, which is not in `_Cin`'s source list.
+    Adding it means rebuilding `_Cin` with the `mb_*` buffer guards it currently
+    lacks; not attempted, so a `_Cin`-only build still falls back for the mix
+    half.
+15. **Most CUDA kernels still index with 32-bit `int` (B60).** B60 widened the
+    per-image bases, which are the offsets that overflow first, but the flat
+    indices (`int total = B * C * spatial`, `int idx = blockIdx.x * blockDim.x +
+    threadIdx.x`) remain: past ~2^31 elements the grid arithmetic overflows and
+    the kernel mis-indexes or writes zeros instead of failing. Unreachable at
+    every shape this project trains on (32x32 inputs, `C <= 1024`, `B <= 256`),
+    so it is a documented limit rather than a fixed bug.
+16. **The B59 Python fixes are argued to be no-ops for the production command by
+    reachability, not re-measured.** `--amb-topk` defaults to 0, the
+    auto-live-thresh fallback is off, and the production run never passes
+    `snaps=[]`, so none of the touched branches fire; but that is an argument
+    from control flow, and "the branch cannot fire" has been wrong before in this
+    log. A full re-run is the way to close it (with open item 7).

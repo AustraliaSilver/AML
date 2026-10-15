@@ -21,12 +21,15 @@ git clone https://github.com/AustraliaSilver/AML.git
 cd AML
 pip install -e .
 
-# 2. Run unit & integration test suite (65 tests, ~10s runtime)
+# 2. Run unit & integration test suite (~1 min runtime)
 pytest tests/test_hybrid_18_advanced.py tests/test_hybrid_18.py
 python -m unittest discover tests
 ```
 
-Expected result: All unit tests pass cleanly (`Ran 50 tests in ~9s -> OK`, `5 passed in ~8s`).
+Expected result: everything passes cleanly — `10 passed in ~7s` for the first
+command, `Ran 257 tests in ~59s` / `OK` for the second (the exact counts grow as
+tests are added; zero failures is the contract). GPU-only tests skip on a
+CPU-only machine.
 
 ---
 

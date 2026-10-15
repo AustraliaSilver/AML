@@ -3067,14 +3067,21 @@ def project_to_budget(
 ### Static Model Extraction (Hard Pruning)
 The static-extraction step is the culmination of the NAS pipeline: it compiles the dynamic Supernet into an ultra-fast, lightweight \texttt{nn.Sequential} model with no Gumbel--Softmax and no dynamic ops. In the current codebase this lives in \texttt{AML\_Core\_Code/extract\_static\_model.py}.
 
-\paragraph{Version note.} An earlier release of this appendix embedded \texttt{export.py}, which has since been removed from the repository in favour of \texttt{extract\_static\_model.py}. The listing below is taken from the file that actually ships. The substantive change is in \texttt{StaticLayer}: the older \texttt{ExportedLayer} carried a single convolution, whereas the AML block is \emph{two} convolutions, and an extracted residual branch that dropped \texttt{conv2} would not be a faithful replica of the block it was distilled from.
+\paragraph{Version note.} An earlier release of this appendix embedded \texttt{export.py}, which has since been removed from the repository in favour of \texttt{extract\_static\_model.py}. The listing below is taken from the file that actually ships. The substantive change is in \texttt{StaticLayer}: the older \texttt{ExportedLayer} carried a single convolution, whereas the AML block is \emph{two} convolutions, and an extracted residual branch that dropped \texttt{conv2} would not be a faithful replica of the block it was distilled from. The child must also normalise the way its mother does: the extracts are built for InstanceNorm mothers (see the note on selectable normalization above), so \texttt{StaticLayer} takes the mother's \texttt{norm\_mode} and builds the matching op rather than hardcoding single-group GroupNorm.
 
-\begin{lstlisting}[language=Python, caption=AML\_Core\_Code/extract\_static\_model.py (current listing): StaticLayer, the 2-conv static replica of one AML block. The layer gate gate\_c and the channel mask dim\_mask are frozen as buffers, so the compiled network has no dynamic branches left at inference time.]
+\begin{lstlisting}[language=Python, caption=AML\_Core\_Code/extract\_static\_model.py (current listing): the \_norm\_layer helper and StaticLayer, the 2-conv static replica of one AML block. The layer gate gate\_c and the channel mask dim\_mask are frozen as buffers, so the compiled network has no dynamic branches left at inference time.]
+def _norm_layer(norm_mode, channels, groups=1):
+    """Weightless normalisation matching the mother's per-layer op."""
+    if str(norm_mode).lower() in ("in", "instance"):
+        return nn.InstanceNorm2d(channels, affine=False)
+    return nn.GroupNorm(groups, channels)
+
+
 class StaticLayer(nn.Module):
     """Static replica of one 2-conv AML block (plain + residual mix)."""
 
     def __init__(self, conv_w, conv_b, conv2_w, conv2_b, gate_c, dim_mask,
-                 g_plain, g_resnet, is_first_layer=False):
+                 g_plain, g_resnet, is_first_layer=False, norm_mode="gn1"):
         super().__init__()
         self.is_first_layer = is_first_layer
         self.conv = nn.Conv2d(conv_w.shape[1], conv_w.shape[0], 3, padding=1)
@@ -3084,8 +3091,8 @@ class StaticLayer(nn.Module):
         self.conv2.weight.data = conv2_w
         self.conv2.bias.data = conv2_b
 
-        self.norm = nn.GroupNorm(1, conv_w.shape[0])
-        self.norm2 = nn.GroupNorm(1, conv2_w.shape[0])
+        self.norm = _norm_layer(norm_mode, conv_w.shape[0])
+        self.norm2 = _norm_layer(norm_mode, conv2_w.shape[0])
 
         self.register_buffer('gate_c', gate_c)
         self.register_buffer('dim_mask', dim_mask)
