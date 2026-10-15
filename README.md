@@ -133,6 +133,16 @@ both later tasks.
 > scale** — they are kept below but are no longer evidence of anything. The
 > Fisher anchor is evidently too weak against a 5 460-step CIFAR schedule.
 >
+> > **Caveat added 2026-10-15 — this measurement predates the EWC fix.** The
+> > penalty used here paired a running sum of Fisher with a *single* `θ*` that
+> > was re-pinned to the most recent task, so from task 2 on it anchored task 1's
+> > Fisher to weights that had already forgotten task 1 (audit entry B30). The
+> > implementation is now the exact multi-task quadratic in two accumulators,
+> > checked against a brute-force reference. **So this table is evidence that
+> > *that implementation* does not help, not evidence that diagonal-Fisher EWC
+> > does not help.** It has not been re-measured since; anyone citing "EWC is
+> > refuted at scale" is citing a result from the broken version.
+>
 > **2. The router is the binding constraint.** `A_auto` collapses to 8.01 % on
 > MNIST after CIFAR-10 while `A_oracle` holds 97.94 % — the snapshot is fine, the
 > router simply picks the wrong domain. This is now the single largest source of
