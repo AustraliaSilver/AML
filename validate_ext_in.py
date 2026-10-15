@@ -283,6 +283,56 @@ def main():
     print("    -> the L=18 drift above is at or below the reference's own")
     print("       disagreement with itself, so it measures conditioning, not kernel error.")
 
+    # ---- 5. widths that do NOT divide 256 (i.e. the production shape) ----------
+    #
+    # This is the check that was missing, and it was missing in a way that made
+    # every other check here look sufficient.
+    #
+    # The v1 kernels required `256 % C == 0`. build_case defaults to D=64, and 64
+    # divides 256, so every case in this file happened to satisfy the old
+    # constraint -- the suite could not have detected a C-dependent kernel bug if
+    # one existed. When the guard was relaxed to `C <= MB_MAX_C` (the v2 kernel
+    # walks channels sequentially and only needs a bound), the fused backward
+    # became reachable at the SHIPPED default `--max-dim 48` for the first time.
+    # At that moment the only widths ever validated and the only width actually
+    # run in production stopped overlapping: 48 is nowhere in this file.
+    #
+    # So: gate the gradient at non-divisor widths, and gate the forward at the
+    # exact production shape L=18, D=48.
+    print("\n[5] Forward+grad parity at widths that do not divide 256 "
+          "(production is --max-dim 48)")
+    for D in (48, 40, 96):
+        c = build_case(L=3, D=D, pool=False)
+        assert 256 % D != 0, "this check is only meaningful off the divisors"
+        fwd_err, errs = grad_parity(c)
+        noise = grad_noise(c, "in")
+        worst = max(v for v in errs.values() if v == v)
+        worst_noise = max(v for v in noise.values() if v == v)
+        tol = max(GRAD_TOL, NOISE_FACTOR * worst_noise)
+        ok = worst < tol
+        failures += [] if ok else [f"grad D={D}"]
+        print(f"    D={D:3d} (256 % {D} = {256 % D:3d}): fwd={fwd_err:.5f}  "
+              f"worst_grad={worst:.5f} (noise {worst_noise:.5f}, tol {tol:.5f})  "
+              f"{'OK' if ok else 'FAIL'}")
+
+    c48 = build_case(L=18, D=48)
+    with torch.no_grad():
+        res48 = _Cin.in_fused_forward_and_save(
+            c48["x"].float().contiguous(), c48["protos"].float().contiguous(),
+            c48["pi"].float().contiguous(), c48["lg"].float().contiguous(),
+            c48["dm"].float().contiguous(), c48["bm"].float().contiguous(),
+            c48["w_offsets"], c48["b_offsets"], c48["w2_offsets"], c48["b2_offsets"],
+            c48["C_ins"], c48["C_outs"], c48["Hs"], c48["Ws"], c48["D"])
+        ref48 = ref_forward(c48, c48["x"], c48["protos"], c48["pi"],
+                            c48["lg"], c48["dm"], c48["bm"], "in")
+    e48 = rel(res48[0], ref48)
+    n48 = ref_noise(c48, "in")
+    tol48 = max(FWD_TOL, NOISE_FACTOR * n48)
+    ok = e48 < tol48
+    failures += [] if ok else ["IN forward D=48 L=18"]
+    print(f"    L=18 D=48 (production)        : rel_err {e48:.5f} "
+          f"(reference noise {n48:.5f}, tol {tol48:.5f})  {'OK' if ok else 'FAIL'}")
+
     print()
     if failures:
         print(f"FAILED: {', '.join(failures)}")
