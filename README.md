@@ -178,42 +178,65 @@ produced the predictions):
 >    was never evidence about three tasks.
 > 4. **Root cause, measured on the run's own checkpoints** — see §3.4a.
 
-#### 3.4a Why the router collapses at the third task
+#### 3.4a Why the router collapses — and how the first answer was wrong
 
-`--router-metric mahalanobis` scored every candidate against **one** covariance
-pooled over all seen tasks, while `score_per_task` embeds each query with the
-encoder of the candidate domain. Those are three feature spaces that share only
-a dimension, so the pooled second moment describes none of them well.
-`probes/probe_router_stage3.py` rebuilds the router state from this run's own
-per-task checkpoints and reproduces the collapse exactly:
+The run above used `--router-metric mahalanobis`: one covariance pooled over all
+seen tasks, while `score_per_task` embeds each query with the encoder of the
+candidate domain. Those are three feature spaces that share only a dimension,
+so a pooled second moment describes none of them well.
 
-| routing accuracy, 3 tasks | shared (shipped) | per-task covariance |
-| :-- | --: | --: |
-| MNIST | **6.07 %** (run: 5.94 %) | **95.10 %** |
-| CIFAR-10 | **41.16 %** (run: 50.01 %) | **99.98 %** |
-| Fashion | 98.78 % (run: 99.39 %) | 85.75 % |
+**First attempt (wrong).** Rebuilding the router state from this run's own
+checkpoints (`probes/probe_router_stage3.py`) suggested that per-task
+covariances with `α = 0.15` mixing would give 97.13 % mean routing accuracy
+against 48.67 % for the pooled matrix. Shipping that default made the run
+**worse**: `A[2,1]` fell from 93.96 % to 1.29 %, with `route_hist [129, 9871]` —
+almost every MNIST image routed to CIFAR-10. The prediction was wrong.
 
-Per-task alone gives up Fashion, so the shipped metric mixes the two:
-`S_k = (1 − α)·S_k + α·S_pooled`.
+**Why it was wrong.** The trainer estimated the centroid and second moment from
+the **TEST** split — the same images the router is later asked to route. That is
+a leak, and it is also why the probe (which fitted on TRAIN) disagreed with
+every run it was meant to explain. `probes/probe_router_agreement.py` compares
+the probe's centroids against the ones the run actually stored:
 
-| α | MNIST | CIFAR-10 | Fashion | mean |
-|---|---|---|---|---|
-| 0.00 | 95.10 % | 99.98 % | 85.75 % | 93.61 % |
-| 0.10 | 96.35 % | 99.95 % | 93.13 % | 96.48 % |
-| **0.15** | **95.37 %** | **99.67 %** | **96.36 %** | **97.13 %** |
-| 0.25 | 85.34 % | 98.08 % | 98.01 % | 93.81 % |
-| 0.50 | 46.39 % | 90.48 % | 98.82 % | 78.56 % |
-| 1.00 | 6.07 % | 41.16 % | 98.78 % | 48.67 % |
+| task | fit split | ‖μ − μ_stored‖ | relative |
+| :-- | :-- | --: | --: |
+| CIFAR-10 | test | 0.00007 | **8e-5** |
+| CIFAR-10 | train | 0.05715 | 6.4e-2 |
 
-`--router-metric mahalanobis-task --router-cov-alpha 0.15` is now the default
-(`mahalanobis` and `cosine` remain available). The optimum is a broad plateau
-between 0.10 and 0.20 rather than a knife edge, and the storage cost is
-`T × D × D` floats — 3.0 MB at T = 3, D = 512 — still no exemplars.
+The embedding path reproduces the trainer exactly; only the split differed. And
+the leak was doing real work: CIFAR-10's train and test centroids are 6.4 %
+apart, and with honest train-fitted statistics **every** metric degrades,
+including the one that shipped.
 
-> The table above is measured on the run's own checkpoints, not on a
-> reimplementation, and it reproduces the run's `route_acc` to within 0.1–9
-> points before the change. It is a diagnosis, not yet a confirmation: the
-> end-to-end rerun with the new default is reported below when it completes.
+**Second attempt (measured, honest).** With train-fitted statistics the missing
+piece is not which matrix is used but whether the scores are *comparable*.
+Per-task whitening alone is worse than the shared matrix — each distance is
+measured in a space whitened for a different task, so a broadly spread domain
+wins every query. Adding the log-determinant of the task's own covariance makes
+the score a tempered Gaussian likelihood. Sweeping the weight
+(`probes/probe_router_calibration.py`):
+
+| log-det weight β | MNIST | CIFAR-10 | Fashion | mean (3 tasks) |
+| :-- | --: | --: | --: | --: |
+| 0.00 | 2.55 % | 100.00 % | 0.00 % | 34.18 % |
+| **0.50** | **100.00 %** | **92.62 %** | **99.95 %** | **97.52 %** |
+| 1.00 | 100.00 % | 72.86 % | 99.93 % | 90.93 % |
+
+On two tasks the same sweep gives 51.74 / **99.97** / 99.25 at β = 0 / 0.5 / 1.
+Mixing the pooled matrix back in only hurts (97.52 / 85.50 / 74.95 / 64.83 at
+α = 0 / 0.25 / 0.5 / 1), so the defaults are now:
+
+```
+--router-metric mahalanobis-task --router-cov-alpha 0.0 \
+--router-logdet-weight 0.5 --router-fit-split train
+```
+
+Storage cost is `T × D × D` floats — 3.0 MB at T = 3, D = 512 — and still **no
+exemplars**: these are second moments, not images.
+
+> The 93.96 % at stage 2 in the run above was measured with test-fitted router
+> statistics. Treat it as an optimistic upper bound. The numbers above are the
+> honest ones, and the end-to-end confirmation is the next section.
 
 ### 3.1b Previous production run (2026-10-14) — superseded
 
