@@ -570,6 +570,59 @@ def snapshot_bytes(snap: dict) -> int:
     return walk(snap)
 
 
+def build_task_snapshot(model, shared_backbone: bool = False,
+                        structural: bool = False, snap_q8: bool = False) -> dict:
+    """The per-task state written after each task, in one place.
+
+    Three modes, selected by `--snapshot-mode`:
+
+    * **full** (default): encoder + selector + stem + 18 layers + ln + structure
+      heads + prototypes. 7.209 MB per task in the 10-class hybrid, of which
+      5.854 MB -- 81.2 % -- is a copy of the trunk (B64).
+    * **shared** (identical to `--shared-backbone 1`, option 3A): drops the
+      stem/trunk/ln copy and leaves EWC alone to hold the shared weights.
+    * **structural**: drops *every* weight copy. The encoder, selector, trunk
+      and prototype library all come from the live model, so whatever retains
+      them (EWC, or a frozen trunk) is solely responsible. What remains per task
+      is the structure library plus the structure slot -- about 0.046 MB.
+
+    `evaluate` applies a snapshot key only when that key is present, so a mode
+    that omits the trunk or the encoder is a supported state, not a broken one.
+    """
+    snap: dict = {}
+    if not structural:
+        snap["enc"] = {k: v.detach().clone() for k, v in
+                       model.vision_encoder.state_dict().items()}
+        snap["sel"] = {k: v.detach().clone() for k, v in
+                       model.prototype_selector.state_dict().items()}
+    if hasattr(model, "layers") and not shared_backbone:
+        snap["stem"] = {k: v.detach().clone() for k, v in model.stem.state_dict().items()}
+        snap["layers"] = {k: v.detach().clone() for k, v in model.layers.state_dict().items()}
+        if hasattr(model, "ln"):
+            snap["ln"] = {k: v.detach().clone() for k, v in model.ln.state_dict().items()}
+    if hasattr(model, "structure_prototypes"):
+        snap["struct_heads"] = {
+            "sprotos": model.structure_prototypes.detach().clone(),
+            "bmprotos": model.block_mode_prototypes.detach().clone(),
+        }
+    elif hasattr(model, "structure_delta"):
+        snap["struct_heads"] = {
+            "delta": {k: v.detach().clone() for k, v in
+                      model.structure_delta.state_dict().items()},
+            "block": {k: v.detach().clone() for k, v in
+                      model.block_mode_head.state_dict().items()},
+        }
+    if not structural:
+        pw = model.proto_weights.detach()
+        if snap_q8:
+            scale = pw.abs().max().clamp(min=1e-12) / 127.0
+            snap["protos"] = {"q": torch.round(pw / scale).to(torch.int8).cpu(),
+                              "scale": scale.cpu()}
+        else:
+            snap["protos"] = pw.to("cpu", torch.float32).clone()
+    return snap
+
+
 def state_targets(module: nn.Module) -> dict:
     """Live parameter/buffer tensors of `module`, keyed like its state_dict.
 
@@ -730,8 +783,13 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                              model.block_mode_head.state_dict().items()}
         deq_protos = []
         for d in range(len(snaps)):
-            pr = snaps[d]["protos"]
-            if isinstance(pr, dict):
+            # A structural snapshot carries no prototype library: the live rows
+            # are then used, and they are protected for free because class_range_ce
+            # only ever supervises a task's own rows.
+            pr = snaps[d].get("protos")
+            if pr is None:
+                deq_protos.append(None)
+            elif isinstance(pr, dict):
                 deq_protos.append(pr["q"].to(device).float() * pr["scale"])
             else:
                 deq_protos.append(pr.to(device))
@@ -749,7 +807,10 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                     # drift between them is larger than the within-domain spread.
                     zk = []
                     for d in range(len(snaps)):
-                        apply_state(dst_enc, snaps[d]["enc"])
+                        # Without a per-task encoder (structural mode) the routing
+                        # query falls back to the shared live encoder.
+                        if "enc" in snaps[d]:
+                            apply_state(dst_enc, snaps[d]["enc"])
                         zk.append(router_features(model, x))
                     apply_state(dst_enc, cur_enc)
                     dom_logits = dom_head.score_per_task(zk)[:, :len(slots)]
@@ -837,9 +898,12 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 want_amb = has_amb and bool(need_dom[d])
                 if not idx_c.any() and not want_amb:
                     continue
-                apply_state(dst_enc, snaps[d]["enc"])
-                apply_state(dst_sel, snaps[d]["sel"])
-                model.proto_weights.data.copy_(deq_protos[d])
+                if "enc" in snaps[d]:
+                    apply_state(dst_enc, snaps[d]["enc"])
+                if "sel" in snaps[d]:
+                    apply_state(dst_sel, snaps[d]["sel"])
+                if deq_protos[d] is not None:
+                    model.proto_weights.data.copy_(deq_protos[d])
                 if "layers" in snaps[d] and dst_layers is not None:
                     apply_state(dst_stem, snaps[d]["stem"])
                     apply_state(dst_layers, snaps[d]["layers"])
@@ -1815,6 +1879,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          'per-task copy of stem / 18 layers / ln (5.9 MB per task) '
                          'and rely on EWC alone to retain earlier domains. '
                          'Per-task state drops to ~1.2 MB, O(1) in depth.')
+    ap.add_argument('--snapshot-mode', type=str, default='full',
+                    choices=['full', 'shared', 'structural'],
+                    help='how much per-task state to store. "full" (default) = '
+                         'enc + sel + stem + 18 layers + ln + structure heads + '
+                         'prototypes (7.2 MB/task at 10 classes, 81%% of it the '
+                         'trunk copy). "shared" == --shared-backbone 1. '
+                         '"structural" = NO per-task weights at all: only the '
+                         'structure library (~0.05 MB/task) plus the structure '
+                         'slot, with the shared trunk held by EWC.')
     ap.add_argument('--auto-live-thresh', type=float, default=0.0,
                     help='open-set fallback: if no snapshot reaches this softmax '
                          'confidence for a sample, evaluate it with the current '
@@ -1877,11 +1950,18 @@ def main():
     ap = build_arg_parser()
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
-    shared_backbone = bool(args.shared_backbone)
+    structural_snap = args.snapshot_mode == 'structural'
+    shared_backbone = bool(args.shared_backbone) or args.snapshot_mode in ('shared', 'structural')
     if shared_backbone and args.ewc_lambda <= 0:
         print("[!] --shared-backbone without --ewc-lambda>0 has NOTHING holding "
               "the shared weights in place; A_live will collapse. "
               "This is the intended experiment, not a bug.")
+    if structural_snap:
+        print("[!] --snapshot-mode structural stores NO per-task weights: the "
+              "trunk, encoder, selector and prototypes all come from the shared "
+              "live model, so EWC alone retains them. With --ewc-lambda 0 this "
+              "degenerates to the naive baseline. Role: the ~0.05 MB/task point "
+              "of the storage curve, to be read against the 7.209 MB default.")
 
     set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2066,50 +2146,34 @@ def main():
         slots[i] = collect_structure_slot(model, router_fit, device, amp_dtype)
         print(f"  [slot] stored structure slot for '{name}'")
 
-        dom_snaps[i] = {
-            "enc": {k: v.detach().clone() for k, v in model.vision_encoder.state_dict().items()},
-            "sel": {k: v.detach().clone() for k, v in model.prototype_selector.state_dict().items()},
-        }
-        if hasattr(model, "layers") and not shared_backbone:
-            dom_snaps[i]["stem"] = {k: v.detach().clone() for k, v in model.stem.state_dict().items()}
-            dom_snaps[i]["layers"] = {k: v.detach().clone() for k, v in model.layers.state_dict().items()}
-            if hasattr(model, "ln"):
-                dom_snaps[i]["ln"] = {k: v.detach().clone() for k, v in model.ln.state_dict().items()}
-        if shared_backbone and hasattr(model, "layers"):
+        dom_snaps[i] = build_task_snapshot(model, shared_backbone=shared_backbone,
+                                           structural=structural_snap,
+                                           snap_q8=args.snap_q8)
+        if structural_snap:
+            print(f"  [snapshot-mode structural] {snapshot_bytes(dom_snaps[i]) / 1e6:.3f} MB "
+                  f"per task for '{name}' - structure library + slot only; every "
+                  f"weight comes from the shared live model")
+        elif shared_backbone and hasattr(model, "layers"):
             n_l = sum(p.numel() for p in model.layers.parameters())
             print(f"  [shared-backbone] 3A: no per-task copy of stem + 18 layers "
                   f"+ ln ({n_l/1e6:.2f}M params, "
                   f"{n_l*4/1e6:.2f} MB) - EWC is solely responsible for "
                   f"retaining earlier domains")
-        if hasattr(model, "structure_prototypes"):
-            dom_snaps[i]["struct_heads"] = {
-                "sprotos": model.structure_prototypes.detach().clone(),
-                "bmprotos": model.block_mode_prototypes.detach().clone(),
-            }
-        elif hasattr(model, "structure_delta"):
-            dom_snaps[i]["struct_heads"] = {
-                "delta": {k: v.detach().clone() for k, v in model.structure_delta.state_dict().items()},
-                "block": {k: v.detach().clone() for k, v in model.block_mode_head.state_dict().items()},
-            }
-        pw = model.proto_weights.detach()
-        if args.snap_q8:
-            scale = pw.abs().max().clamp(min=1e-12) / 127.0
-            dom_snaps[i]["protos"] = {"q": torch.round(pw / scale).to(torch.int8).cpu(),
-                                      "scale": scale.cpu()}
-            tag = "enc+sel+struct+prototypes" if shared_backbone else \
-                  "enc+sel+stem+layers+ln+struct+prototypes"
-            # Report the WHOLE snapshot, not just the int8 prototype block: in
-            # the 18-layer hybrid the prototype library is 92 k elements (~90 KB),
-            # so printing its size in whole MB rounds to "0 MB" and reads as if
-            # nothing had been stored, while the snapshot is dominated by the
-            # fp32 encoder + trunk (7.49 MB at the default --norm in).
-            proto_kb = dom_snaps[i]["protos"]["q"].numel() / 1024
-            total_mb = snapshot_bytes(dom_snaps[i]) / 1e6
-            print(f"  [snap] stored {tag}(int8, prototypes {proto_kb:.0f} KB; "
-                  f"snapshot {total_mb:.2f} MB) for '{name}'")
-        else:
-            dom_snaps[i]["protos"] = pw.to("cpu", torch.float32).clone()
-            print(f"  [snap] stored enc+sel+struct+prototypes(fp32) for '{name}'")
+        if not structural_snap:
+            if args.snap_q8:
+                tag = "enc+sel+struct+prototypes" if shared_backbone else \
+                      "enc+sel+stem+layers+ln+struct+prototypes"
+                # Report the WHOLE snapshot, not just the int8 prototype block: in
+                # the 18-layer hybrid the prototype library is 92 k elements (~90 KB),
+                # so printing its size in whole MB rounds to "0 MB" and reads as if
+                # nothing had been stored, while the snapshot is dominated by the
+                # fp32 encoder + trunk (7.49 MB at the default --norm in).
+                proto_kb = dom_snaps[i]["protos"]["q"].numel() / 1024
+                total_mb = snapshot_bytes(dom_snaps[i]) / 1e6
+                print(f"  [snap] stored {tag}(int8, prototypes {proto_kb:.0f} KB; "
+                      f"snapshot {total_mb:.2f} MB) for '{name}'")
+            else:
+                print(f"  [snap] stored enc+sel+struct+prototypes(fp32) for '{name}'")
 
         # Persist the routing state. Without this the router's centroids,
         # covariance and the snapshots that define their feature spaces exist
@@ -2124,7 +2188,7 @@ def main():
                  "args": vars(args)},
                 os.path.join(_ROOT, f"routing_state_after_{name}.pt"))
             print(f"  [routing] saved routing_state_after_{name}.pt "
-                  f"({snapshot_bytes({'protos': dom_snaps[i]['protos']}) / 1e6:.2f} MB "
+                  f"({(snapshot_bytes({'protos': dom_snaps[i]['protos']}) if 'protos' in dom_snaps[i] else 0) / 1e6:.2f} MB "
                   f"of prototypes + router buffers)")
 
         # Snapshot the shared encoder/router for next-task anchoring
