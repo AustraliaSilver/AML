@@ -623,6 +623,43 @@ def build_task_snapshot(model, shared_backbone: bool = False,
     return snap
 
 
+# Normalisation layers are never frozen by `--freeze-trunk`: the sandbox result
+# that made freezing competitive at 0 bytes/task kept normalisers (and the head)
+# free, and in a continual supernet the running statistics are exactly what has
+# to re-track a new input distribution.
+_NORM_TYPES = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+               nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d,
+               nn.GroupNorm, nn.LayerNorm)
+
+
+def freeze_trunk_(model) -> tuple:
+    """Freeze the shared trunk's matrix weights, leaving normalisers trainable.
+
+    The trunk is `layers` (the 18 hybrid blocks) plus `stem` and `ln`. What
+    stays free is the model-level structure library (`structure_prototypes`,
+    `block_mode_prototypes`), the prototype head and the router - which is the
+    interesting part: the hypothesis under test is that a *frozen* trunk can
+    still be re-pointed at a new domain by the structure, with no per-task
+    weight copy.
+
+    Returns `(frozen_params, kept_params)`.
+    """
+    frozen = kept = 0
+    for root in ("layers", "stem", "ln"):
+        mod = getattr(model, root, None)
+        if mod is None:
+            continue
+        free_ids = {id(p) for m in mod.modules() if isinstance(m, _NORM_TYPES)
+                    for p in m.parameters()}
+        for p in mod.parameters():
+            if id(p) in free_ids:
+                kept += p.numel()
+            else:
+                p.requires_grad_(False)
+                frozen += p.numel()
+    return frozen, kept
+
+
 def state_targets(module: nn.Module) -> dict:
     """Live parameter/buffer tensors of `module`, keyed like its state_dict.
 
@@ -1888,6 +1925,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          '"structural" = NO per-task weights at all: only the '
                          'structure library (~0.05 MB/task) plus the structure '
                          'slot, with the shared trunk held by EWC.')
+    ap.add_argument('--freeze-trunk', type=int, default=0,
+                    help='after the first task, freeze the matrix weights of the '
+                         'shared stem / 18 hybrid blocks / ln, leaving every '
+                         'normaliser plus the structure library, prototype head '
+                         'and router trainable. Combined with --snapshot-mode '
+                         'structural this is the weight-free configuration: '
+                         'nothing has to hold the trunk in place because nothing '
+                         'moves it. 0 = off (default).')
     ap.add_argument('--auto-live-thresh', type=float, default=0.0,
                     help='open-set fallback: if no snapshot reaches this softmax '
                          'confidence for a sample, evaluate it with the current '
@@ -1959,9 +2004,15 @@ def main():
     if structural_snap:
         print("[!] --snapshot-mode structural stores NO per-task weights: the "
               "trunk, encoder, selector and prototypes all come from the shared "
-              "live model, so EWC alone retains them. With --ewc-lambda 0 this "
-              "degenerates to the naive baseline. Role: the ~0.05 MB/task point "
-              "of the storage curve, to be read against the 7.209 MB default.")
+              "live model. NOTE: EWC is documented NOT to hold the trunk at the "
+              "production schedule (B19), so a weight-free snapshot needs "
+              "--freeze-trunk 1; without it this degenerates to the naive "
+              "baseline. Role: the ~0.05 MB/task point of the storage curve, to "
+              "be read against the 7.209 MB default.")
+    if args.freeze_trunk and not structural_snap:
+        print("[!] --freeze-trunk with --snapshot-mode full stores T "
+              "byte-identical copies of a trunk that never changes. Use "
+              "--snapshot-mode structural if the point is per-task storage.")
 
     set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2032,6 +2083,12 @@ def main():
 
     for i, name in enumerate(tasks):
         print(f"\n===== TASK {i+1}/{T}: {name} =====", flush=True)
+        if i > 0 and args.freeze_trunk:
+            n_frozen, n_kept = freeze_trunk_(model)
+            print(f"  [freeze-trunk] frozen {n_frozen/1e6:.2f}M trunk params, "
+                  f"kept {n_kept/1e6:.3f}M normaliser params trainable - the "
+                  f"structure library, prototype head and router stay free",
+                  flush=True)
         # reinit=False: future prototype rows keep their ORIGINAL kaiming
         # values forever. Earlier tasks' routing may lean on these rows;
         # re-randomizing them per task silently corrupts that routing

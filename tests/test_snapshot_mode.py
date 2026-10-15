@@ -14,7 +14,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from train_continual_aml import build_task_snapshot, snapshot_bytes
+from train_continual_aml import build_task_snapshot, freeze_trunk_, snapshot_bytes
 
 
 class _Stub(nn.Module):
@@ -109,6 +109,42 @@ class TestSnapshotMode(unittest.TestCase):
         """ViT-style / trunk-less models must not grow phantom keys."""
         snap = build_task_snapshot(_Stub(trunk=False))
         self.assertEqual(set(snap), {"enc", "sel", "struct_heads", "protos"})
+
+
+class TestFreezeTrunk(unittest.TestCase):
+    """`--freeze-trunk` must hold the matrix weights and nothing else.
+
+    The whole point of the configuration is that a *frozen* trunk can still be
+    re-pointed at a new domain by the structure library, so if this helper
+    accidentally froze the structure or the normalisers the experiment would be
+    measuring a different (and known-bad) thing.
+    """
+
+    def test_matrix_weights_freeze_and_norms_stay_trainable(self):
+        model = _Stub()
+        frozen, kept = freeze_trunk_(model)
+        self.assertGreater(frozen, 0)
+        self.assertGreater(kept, 0)
+        self.assertFalse(model.layers[0].weight.requires_grad)
+        self.assertFalse(model.stem.weight.requires_grad)
+        self.assertTrue(model.ln.weight.requires_grad)
+        self.assertTrue(model.ln.bias.requires_grad)
+
+    def test_structure_head_and_router_stay_trainable(self):
+        model = _Stub()
+        freeze_trunk_(model)
+        for p in (model.structure_prototypes, model.block_mode_prototypes,
+                  model.proto_weights, model.vision_encoder.weight):
+            self.assertTrue(p.requires_grad)
+
+    def test_trunkless_model_is_untouched(self):
+        model = _Stub(trunk=False)
+        self.assertEqual(freeze_trunk_(model), (0, 0))
+
+    def test_it_is_idempotent(self):
+        model = _Stub()
+        first = freeze_trunk_(model)
+        self.assertEqual(freeze_trunk_(model), first)
 
 
 if __name__ == "__main__":
