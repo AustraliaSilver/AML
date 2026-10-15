@@ -1197,6 +1197,70 @@ git worktree add $env:TEMP\aml_base HEAD
 python $env:TEMP\aml_base\ab_base.py --steps 60 --freeze 1
 ```
 
+**B41 (critical) — B40's fix was measured on a leak, and the real cause was calibration.**
+
+B40 concluded that one pooled covariance was the problem and that per-task
+matrices with `alpha = 0.15` would fix it (mean routing accuracy 97.13 % against
+48.67 %). The end-to-end run with that default **made stage 2 worse, not
+better**: `A[2,1]` fell from 93.96 % to 1.29 %, `route_hist [129, 9871]` — almost
+every MNIST image routed to CIFAR-10. The prediction was wrong, and the reason
+is the one this log keeps rediscovering: the probe and the trainer were not
+measuring the same thing.
+
+Two separate defects, found in that order.
+
+**The probe was fitted on a different split than the trainer.** The trainer ran
+the router's clean pass over `el_self`, the **TEST** split — i.e. over the very
+images the router is later asked to route. That is a leak, and it is also why
+the offline probe (which fitted on TRAIN) disagreed with every run it was
+supposed to explain. `probes/probe_router_agreement.py` settles it by comparing
+centroids against the ones the run stored:
+
+| task | fit split | ‖μ − μ_stored‖ | relative |
+|---|---|---|---|
+| CIFAR-10 | test | 0.00007 | **8e-5** |
+| CIFAR-10 | train | 0.05715 | 6.4e-2 |
+
+So the probe's embedding path reproduces the trainer exactly; the statistics
+differed only by the split. Removing the leak is not free: CIFAR-10's train and
+test centroids are **6.4 %** apart, and with honest train-fitted statistics
+*every* metric degrades — including the one that shipped:
+
+| routing accuracy, train fit | shared | per-task | per-task + log-det (β=1) |
+|---|---|---|---|
+| MNIST, 2 tasks | 4.74 % | 3.49 % | 100.00 % |
+| MNIST, 3 tasks | 6.74 % | 2.55 % | 100.00 % |
+| Fashion, 3 tasks | 2.43 % | 0.00 % | 99.93 % |
+
+The shipped 93.96 % at stage 2 was therefore partly the leak. That is the
+uncomfortable finding and it is stated rather than buried.
+
+**With honest statistics, the missing term is calibration, not the matrix.**
+Per-task whitening alone is *worse* than the shared matrix, because each distance
+is measured in a space whitened for a different task and the scores stop being
+comparable — a domain with a large spread wins every query. Adding the
+log-determinant of the task's own covariance turns the score into a (tempered)
+Gaussian likelihood, which is comparable by construction. Sweeping both knobs
+(`probes/probe_router_calibration.py`, train-fit statistics):
+
+| log-det weight β | MNIST | CIFAR-10 | Fashion | mean (3 tasks) |
+|---|---|---|---|---|
+| 0.00 | 2.55 % | 100.00 % | 0.00 % | 34.18 % |
+| **0.50** | **100.00 %** | **92.62 %** | **99.95 %** | **97.52 %** |
+| 1.00 | 100.00 % | 72.86 % | 99.93 % | 90.93 % |
+
+and on two tasks: 51.74 / **99.97** / 99.25 at β = 0 / 0.5 / 1. Mixing the
+pooled matrix back in only hurts (α = 0 → 97.52, α = 0.5 → 74.95, α = 1 → 64.83),
+so the shipped defaults are now `cov_alpha = 0`, `logdet_weight = 0.5`.
+
+The lesson is worth stating as a rule rather than an anecdote: **an offline
+probe built on saved checkpoints is only as trustworthy as the data path it
+shares with the trainer.** Two of the three probes built here were wrong, and
+both were wrong in the direction of over-estimating the fix. `--save-routing`
+exists precisely so that the next question is answered by loading what the run
+stored and checking agreement first (8e-5), not by rebuilding the statistics and
+hoping.
+
 ---
 
 ## 11. Open items, stated as open
