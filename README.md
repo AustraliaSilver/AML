@@ -15,6 +15,22 @@ multi-domain continual learning with hypernetworks.
 > [5. Quickstart](#5-quickstart) · [6. CUDA acceleration](#6-native-cuda-acceleration--microbenchmarks) ·
 > [7. Build & train](#7-build-installation--training) · [8. License](#8-license)
 
+### Status stamp — 2026-10-15
+
+Read §3 before quoting any number here. Specifically:
+
+| what | state |
+| :-- | :-- |
+| `A_oracle` at `--epochs 5,28,16` | **measured**: 86.73 % `A_avg`, **zero** forgetting — §3.1a |
+| `A_auto` at the same schedule | **measured, and it fails after task 3** (`route_acc` 5.94 %) — §3.1a, §3.4a |
+| router metric | **changed** to `mahalanobis-task`, `--router-cov-alpha 0.15` (was one pooled covariance) |
+| `--norm` | **`in`** (InstanceNorm), was `bn` |
+| `--replay-per-class` | **0** by default, was 400 — the default run is now the zero-replay run the docs describe |
+| `--encoder-tail-act` | `none` — a terminal ReLU pinned every latent to the non-negative orthant |
+| EWC | implementation fixed (exact multi-task quadratic); the "does not help" measurement predates the fix and is **stale** |
+| benchmark tables in §3.4 / §3.5 | **superseded** — those scripts changed, so their old numbers no longer describe the code |
+| CUDA kernel parity gate | fixed — it was failing a kernel that sits inside the reference's own bf16 noise |
+
 ---
 
 ## 1. Architecture
