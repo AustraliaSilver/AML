@@ -124,7 +124,8 @@ class TaskCentroidRouter(nn.Module):
     rescaling both to the sphere collapses CIFAR-10 routing from 100.0% to 4.0%.
     """
     def __init__(self, latent_dim=1024, max_tasks=10, temperature=0.1,
-                 metric="mahalanobis-task", shrink=0.01, cov_alpha=0.15):
+                 metric="mahalanobis-task", shrink=0.01, cov_alpha=0.0,
+                 logdet_weight=0.5):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_tasks = max_tasks
@@ -139,13 +140,21 @@ class TaskCentroidRouter(nn.Module):
         self.shrink = shrink
         # How much of the POOLED second moment is mixed into each task's own.
         # 0 = purely per-task, 1 = the old shared matrix. Measured on the
-        # production checkpoints (probes/probe_router_stage3.py):
-        #     alpha  0.00    0.15    0.50    1.00 (shared, shipped before)
-        #     MNIST  95.10   95.37   46.39    6.07
-        #     CIFAR  99.98   99.67   90.48   41.16
-        #     Fashn  85.75   96.36   98.82   98.78
-        #     mean   93.61   97.13   78.56   48.67
+        # production checkpoints with statistics fitted on the TRAIN split
+        # (probes/probe_router_calibration.py), mean routing accuracy over the
+        # three domains at logdet_weight = 0.5:
+        #     alpha   0.00    0.25    0.50    1.00 (the old shared matrix)
+        #             97.52   85.50   74.95   64.83
+        # so no pooling at all; the flag stays because the sweep is the
+        # evidence that keeps it at 0.
         self.cov_alpha = cov_alpha
+        # Weight on the log-determinant term of the per-task Gaussian NLL.
+        # Without it a domain whose own features spread widely wins every query;
+        # with full weight it over-corrects. Measured at alpha = 0:
+        #     weight   0.00    0.50    1.00
+        #     3 tasks  34.18   97.52   90.93
+        #     2 tasks  51.74   99.97   99.25
+        self.logdet_weight = logdet_weight
         self.register_buffer("centroids", torch.zeros(max_tasks, latent_dim))
         self.register_buffer("task_counts", torch.zeros(max_tasks, dtype=torch.long))
         self.register_buffer("num_tasks", torch.zeros(1, dtype=torch.long))
@@ -262,7 +271,7 @@ class TaskCentroidRouter(nn.Module):
         return self._prec_cache
 
     def _precisions(self, n_tasks: int):
-        """One precision matrix per task: (1-a) * own + a * pooled.
+        """Per task: the precision matrix AND log|S_k|, cached together.
 
         Cached on (cov_n, cov_n_task[:n]) so the pinv is paid once per finalize,
         not once per batch. Falls back to the shared matrix for any task whose
@@ -274,23 +283,27 @@ class TaskCentroidRouter(nn.Module):
         D = self.latent_dim
         eye = torch.eye(D, device=self.centroids.device, dtype=self.cov.dtype)
         out = []
-        pooled = self._precision()
+        logdets = []
+        n_all = max(float(self.cov_n.item()), 1.0)
+        mu_all = self.zsum / n_all
+        pooled = self.cov / n_all - torch.outer(mu_all, mu_all)
         for k in range(n_tasks):
             n_k = int(self.cov_n_task[k].item())
             if n_k == 0:
-                out.append(pooled)
+                out.append(self._precision())
+                logdets.append(0.0)
                 continue
             mu = self.zsum_task[k] / n_k
             S = self.cov_task[k] / n_k - torch.outer(mu, mu)
-            S = (1.0 - self.cov_alpha) * S + self.cov_alpha * (
-                self.cov / max(float(self.cov_n.item()), 1.0)
-                - torch.outer(self.zsum / max(float(self.cov_n.item()), 1.0),
-                              self.zsum / max(float(self.cov_n.item()), 1.0)))
+            S = (1.0 - self.cov_alpha) * S + self.cov_alpha * pooled
             lam = self.shrink * torch.diagonal(S).mean().clamp(min=1e-12)
-            out.append(torch.linalg.pinv(S + lam * eye))
-        self._prec_task_cache = out
+            Sr = S + lam * eye
+            out.append(torch.linalg.pinv(Sr))
+            _, logdet = torch.linalg.slogdet(Sr)
+            logdets.append(float(logdet))
+        self._prec_task_cache = (out, logdets)
         self._prec_task_cache_n = key
-        return out
+        return self._prec_task_cache
 
     def score_per_task(self, z_per_task: list) -> torch.Tensor:
         """Domain logits when the query is embedded by EACH task's own encoder.
@@ -319,11 +332,14 @@ class TaskCentroidRouter(nn.Module):
             return torch.stack(cols, dim=1) / self.temperature
 
         if self.metric == "mahalanobis-task":
-            P = self._precisions(T_cur)
+            P, logdets = self._precisions(T_cur)
             cols = []
             for k in range(T_cur):
                 d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
-                cols.append((d @ P[k] * d).sum(-1))
+                # Per-task Gaussian NLL, tempered: the log|S_k| term stops a
+                # broadly spread domain from winning every query, and halving
+                # its weight stops it from over-correcting.
+                cols.append((d @ P[k] * d).sum(-1) + self.logdet_weight * logdets[k])
         else:
             P = self._precision()
             cols = []
@@ -345,9 +361,10 @@ class TaskCentroidRouter(nn.Module):
                                 F.normalize(proto, dim=-1).t()) / self.temperature
 
         if self.metric == "mahalanobis-task":
-            P = self._precisions(T_cur)
+            P, logdets = self._precisions(T_cur)
             d2 = torch.stack([
                 ((z - proto[k].unsqueeze(0)) @ P[k] * (z - proto[k].unsqueeze(0))).sum(-1)
+                + self.logdet_weight * logdets[k]
                 for k in range(T_cur)], dim=1)
         else:
             # Mahalanobis: d^2(x, c_k) = (x - c_k)^T S^-1 (x - c_k)
@@ -1609,14 +1626,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help='shrinkage added to the diagonal of the shared '
                          'covariance, as a fraction of its mean diagonal. '
                          'Stabilises the inverse; 0.01 measured best.')
-    ap.add_argument('--router-cov-alpha', type=float, default=0.15,
+    ap.add_argument('--router-fit-split', type=str, default='train',
+                    choices=['train', 'test'],
+                    help='split the router\'s centroid and second moment are '
+                         'estimated on. DEFAULT CHANGED test -> train. The clean '
+                         'pass used to run on the TEST split, i.e. on the very '
+                         'images the router is later asked to route: a leak, and '
+                         'the reason offline analysis of the router kept '
+                         'disagreeing with the trainer. Still zero-replay - no '
+                         'image is stored, only second moments.')
+    ap.add_argument('--router-cov-alpha', type=float, default=0.0,
                     help="fraction of the POOLED second moment mixed into each "
-                         "task's own, for --router-metric mahalanobis-task. "
-                         "0 = purely per-task, 1 = the old shared matrix. "
-                         "Measured mean routing accuracy over the three "
-                         "production domains: 93.61 / 97.13 / 78.56 / 48.67 "
-                         "at alpha = 0.0 / 0.15 / 0.5 / 1.0. The optimum is a "
-                         "broad plateau (0.10-0.20), not a knife edge.")
+                         "task's own. DEFAULT 0 = per-task only. Measured mean "
+                         "routing accuracy (train-fit statistics, 3 domains): "
+                         "97.52 / 85.50 / 74.95 / 64.83 at alpha = 0 / 0.25 / "
+                         "0.5 / 1.0.")
+    ap.add_argument('--router-logdet-weight', type=float, default=0.5,
+                    help="weight on the log|S_k| term of the per-task Gaussian "
+                         "NLL. 0 = bare whitened distance, 1 = full NLL. "
+                         "Measured (alpha = 0, mean over the 3 domains): "
+                         "34.18 / 97.52 / 90.93 at 0 / 0.5 / 1.0; on two "
+                         "domains 51.74 / 99.97 / 99.25. The term is what stops "
+                         "a broadly spread domain from winning every query.")
     return ap
 
 
@@ -1670,7 +1701,8 @@ def main():
         dom_head = TaskCentroidRouter(latent_dim=latent_dim, max_tasks=T, temperature=0.1,
                                      metric=args.router_metric,
                                      shrink=args.router_shrink,
-                                     cov_alpha=args.router_cov_alpha).to(device)
+                                     cov_alpha=args.router_cov_alpha,
+                                     logdet_weight=args.router_logdet_weight).to(device)
     else:
         print(f"[*] Initializing Linear Domain Router (latent_dim={latent_dim}, T={T})...")
         dom_head = torch.nn.Linear(latent_dim, T).to(device)
@@ -1718,7 +1750,18 @@ def main():
                    n_tasks=T)
 
         # Freeze this domain's structure into its slot & pristine router centroid
-        _, el_self = get_task_data(name, os.path.join(_ROOT, "data"))
+        tl_fit, el_self = get_task_data(name, os.path.join(_ROOT, "data"))
+        # The router's centroid and second moment are estimated on the TRAIN
+        # split by default. They used to be estimated on `el_self`, the TEST
+        # split - i.e. on the very images the router is later asked to route.
+        # No exemplars are stored either way, so the method is still
+        # zero-replay, but a statistic fitted on the test inputs is not a
+        # result about test-time behaviour: it is a leak, and it is also why
+        # offline analysis of the router kept disagreeing with the trainer.
+        router_fit = el_self if args.router_fit_split == 'test' else tl_fit
+        print(f"  [centroid-router] fitting statistics on the "
+              f"{args.router_fit_split.upper()} split "
+              f"({len(router_fit.dataset)} images)")
 
         # Close the EWC task window: average the Fisher over this task and pin
         # theta*, so the NEXT task is quadratically anchored to this solution.
@@ -1748,7 +1791,7 @@ def main():
             dom_head.task_counts[i].zero_()
             model.eval()
             with torch.no_grad():
-                for cx, _ in el_self:
+                for cx, _ in router_fit:
                     cx = cx.to(device, non_blocking=True)
                     with torch.amp.autocast('cuda', enabled=amp_dtype is not None,
                                             dtype=amp_dtype or torch.bfloat16):
@@ -1776,7 +1819,7 @@ def main():
             print(f"  [consolidate] {args.consolidate_epochs} passes over "
                   f"{len(replay)} exemplars ({time.time()-t0c:.0f}s)")
 
-        slots[i] = collect_structure_slot(model, el_self, device, amp_dtype)
+        slots[i] = collect_structure_slot(model, router_fit, device, amp_dtype)
         print(f"  [slot] stored structure slot for '{name}'")
 
         dom_snaps[i] = {

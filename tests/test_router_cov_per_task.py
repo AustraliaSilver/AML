@@ -1,10 +1,11 @@
 """The per-task precision must behave like a precision, not like a copy.
 
 `mahalanobis-task` (the new default) keeps one second-moment matrix per task
-instead of one pooled matrix. The failure it fixes is measured, not
-theoretical: on the production checkpoints the pooled matrix routes MNIST at
-6.07% and CIFAR at 41.16%, while per-task routes them 95.37% / 99.67%
-(audit B40).
+instead of one pooled matrix, and adds a log-determinant term so that a domain
+whose own features spread widely does not win every query. The failure it fixes
+is measured: with a single pooled matrix the production checkpoints route MNIST
+at 6.07% and CIFAR-10 at 41.16%, against 95.37% / 99.67% for per-task
+matrices (audit B40/B41).
 
 What these tests pin is the mechanism, because a synthetic reproduction of the
 production feature geometry would be a nice-looking fiction:
@@ -14,6 +15,8 @@ production feature geometry would be a nice-looking fiction:
     symmetric case and cannot regress it),
   - each per-task matrix emphasises its OWN high-variance direction, which is
     the whole reason for keeping it,
+  - the log-determinant term is non-negative for a covariance and is reported
+    per task, so a domain with a larger spread pays more,
   - like the shared matrix, it is fed only by the clean finalize pass.
 """
 import unittest
@@ -26,6 +29,11 @@ from train_continual_aml import TaskCentroidRouter
 def _fit(router, task_idx, feats):
     router.finalize_task_features(task_idx, feats)
     router.finalize_task(task_idx)
+
+
+def _precs(r, n):
+    P, logdets = r._precisions(n)
+    return P, logdets
 
 
 class TestPerTaskPrecision(unittest.TestCase):
@@ -41,10 +49,10 @@ class TestPerTaskPrecision(unittest.TestCase):
         base = base / base.norm(dim=1, keepdim=True)
         for k in range(3):
             _fit(r, k, base.clone())        # literally the same cloud
-        P_shared = r._precision()
-        P_task = r._precisions(3)
+        P, _ = _precs(r, 3)
+        shared = r._precision()
         for k in range(3):
-            self.assertTrue(torch.allclose(P_task[k], P_shared, atol=1e-3),
+            self.assertTrue(torch.allclose(P[k], shared, atol=1e-3),
                             f"task {k} precision should match the shared one "
                             f"when the tasks are statistically identical")
 
@@ -56,9 +64,9 @@ class TestPerTaskPrecision(unittest.TestCase):
             # amount: variance, not a mean shift (the covariance is taken about
             # the task's own mean, so shifting the mean adds no variance)
             z = torch.randn(400, D) * 0.02
-            z[:, k] = z[:, k] * 0 + torch.randn(400) * (1.0 + k)
+            z[:, k] = torch.randn(400) * (1.0 + k)
             _fit(r, k, z)
-        P = r._precisions(3)
+        P, _ = _precs(r, 3)
         d01 = (P[0] - P[1]).abs().max().item()
         self.assertGreater(d01, 1e-2, "per-task precisions must differ")
         # A precision is LARGE where the task's own variance is SMALL. Whitening
@@ -73,15 +81,30 @@ class TestPerTaskPrecision(unittest.TestCase):
                                 f"task {k} precision should down-weight its "
                                 f"own high-variance coordinate {k} vs {j}")
 
+    def test_logdet_is_reported_per_task_and_tracks_spread(self):
+        D = 8
+        r = TaskCentroidRouter(D, 2)
+        narrow = torch.randn(500, D) * 0.01
+        wide = torch.randn(500, D) * 0.01
+        wide[:, 0] = torch.randn(500) * 3.0
+        _fit(r, 0, narrow)
+        _fit(r, 1, wide)
+        _, logdets = _precs(r, 2)
+        self.assertEqual(len(logdets), 2)
+        # log|S| shrinks as the covariance grows: the broadly spread task pays
+        # more for every query, which is the whole point of the term.
+        self.assertGreater(logdets[1], logdets[0] + 1.0)
+
     def test_task_without_a_clean_pass_falls_back_to_shared(self):
         """A partially built router must still score instead of raising."""
         D = 6
         r = TaskCentroidRouter(D, 3)
         _fit(r, 0, torch.randn(50, D))
-        P = r._precisions(3)
+        P, logdets = _precs(r, 3)
         shared = r._precision()
         self.assertTrue(torch.allclose(P[1], shared, atol=1e-6))
         self.assertTrue(torch.allclose(P[2], shared, atol=1e-6))
+        self.assertEqual(logdets[1:], [0.0, 0.0])
 
     def test_training_steps_never_feed_the_per_task_matrices(self):
         """The shared matrix is fed only by the clean pass because mid-training
@@ -92,8 +115,7 @@ class TestPerTaskPrecision(unittest.TestCase):
         for step in range(50):
             r.update_task_centroid(0, torch.randn(8, D) * 10 + step)
         self.assertEqual(int(r.cov_n_task[0].item()), 0)
-        self.assertTrue(torch.equal(r.cov_task[0],
-                                    torch.zeros(D, D)))
+        self.assertTrue(torch.equal(r.cov_task[0], torch.zeros(D, D)))
         _fit(r, 0, torch.randn(30, D))
         self.assertEqual(int(r.cov_n_task[0].item()), 30)
 
@@ -108,9 +130,9 @@ class TestPerTaskPrecision(unittest.TestCase):
         D = 6
         r = TaskCentroidRouter(D, 2)
         _fit(r, 0, torch.randn(40, D))
-        P1 = r._precisions(2)
+        P1, _ = _precs(r, 2)
         _fit(r, 1, torch.randn(40, D))
-        P2 = r._precisions(2)
+        P2, _ = _precs(r, 2)
         self.assertFalse(torch.allclose(P1[1], P2[1]),
                          "a stale cache would keep scoring a task that had no "
                          "second moment when the cache was built")

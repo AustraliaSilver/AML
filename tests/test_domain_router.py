@@ -40,9 +40,17 @@ class TestRouterMetric(unittest.TestCase):
 
     def test_cov_alpha_default_and_range(self):
         r = TaskCentroidRouter(32)
-        self.assertAlmostEqual(r.cov_alpha, 0.15)
+        self.assertAlmostEqual(r.cov_alpha, 0.0,
+                               msg="measured optimum is per-task only; mixing "
+                                   "the pooled term back in only cost accuracy")
         self.assertGreaterEqual(r.cov_alpha, 0.0)
         self.assertLessEqual(r.cov_alpha, 1.0)
+
+    def test_logdet_weight_default(self):
+        """Half the Gaussian NLL term. Measured mean routing accuracy over the
+        three production domains: 34.18 / 97.52 / 90.93 at weight 0 / 0.5 / 1.
+        """
+        self.assertAlmostEqual(TaskCentroidRouter(32).logdet_weight, 0.5)
 
     def test_cosine_still_available(self):
         r = TaskCentroidRouter(32, metric="cosine")
