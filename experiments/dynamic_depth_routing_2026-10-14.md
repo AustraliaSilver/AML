@@ -1900,6 +1900,78 @@ buying.
 
 ---
 
+**B65 (measurement) - the proposed "0 KB per task" mechanism is ~5 MiB per task,
+and its advantage over a random projection is the only claim that survives.**
+
+A separate proposal was put forward to replace the per-task weight snapshot with a
+per-task *subspace*: decompose each trunk weight matrix into a basis `U` and
+residual coefficients `V`, and consolidate `U` with Orthogonal Gradient
+Projection (OGP) so later tasks cannot move the directions task `t` relied on.
+Reported cost: **0 KB per task**.
+
+The original script asserted rather than measured its headline row. It set the
+snapshot arm's accuracy equal to the freshly-trained accuracy and its forgetting
+to exactly `0.0`, so the reference was true by construction; and its gradient hook
+read `inp[0]` of the convolution while the convolution actually consumes
+`res = F.gelu(self.gn1(x))`, so the projection it measured was not the tensor the
+gradient flows through. `experiments/exp_basis_ogp_corrected.py` re-runs the same
+idea with both defects fixed and a control arm added. Task-IL oracle, one seed per
+arm, MNIST -> Fashion-MNIST, on the same small HtS model (`d1,d2,d3 = 24,48,96`,
+5.60 MiB total).
+
+| variant | per-task | fixed | MNIST | FASHION | forgetting |
+| :-- | --: | --: | --: | --: | --: |
+| naive (no mechanism) | 0 | 0 | 38.49 % | 89.46 % | 60.62 % |
+| per-task snapshot | 5.621 MiB | 0 | 99.11 % | 89.95 % | **0.00 %** |
+| ogp, original variant | 4.585 MiB | 0 | 97.23 % | 89.32 % | 1.88 % |
+| ogp, "corrected" variant | 5.173 MiB | 0 | 92.68 % | 88.42 % | 6.43 % |
+| **random projection (control)** | 5.173 MiB | 0 | 69.05 % | 88.86 % | 30.06 % |
+| freeze the basis, store nothing | **0.000 MiB** | 0 | 94.54 % | 83.40 % | 4.57 % |
+| ogp, corrected + kernel lock | 5.173 MiB | 0 | 97.84 % | 88.33 % | 1.27 % |
+
+Four things follow, and the second one is the uncomfortable one:
+
+1. **"0 KB" is not 0 KB.** The basis is built from task `t`'s own weights and is
+   passed into `train_task` for every later task, so it is per-task state that has
+   to be kept. The arms that genuinely store nothing per task are `naive` and
+   `freeze_basis`.
+2. **The mechanism does not work for the stated reason.** The variant the theory
+   calls *incorrect* (4.585 MiB, 1.88 %) beats the variant the theory calls
+   *correct* (5.173 MiB, 6.43 %). If the explanation were the binding constraint,
+   the ordering would be the other way round. What the control does establish is
+   that the gain is not an artifact of picking any subspace at all: a random
+   projection of the same rank and the same byte cost gives 30.06 % forgetting,
+   i.e. the subspace choice is doing real work. So the mechanism is *empirical*,
+   not explained.
+3. **The storage/retention trade is inverted.** Sweeping the retained-variance
+   threshold on the corrected variant: 0.90 -> 1.951 MiB with 1.22 % forgetting,
+   0.95 -> 3.321 MiB / 1.91 %, 0.98 -> 5.170 MiB / 5.37 %, 0.99 -> 6.298 MiB /
+   4.44 %, 1.00 -> 8.365 MiB / 4.13 %. More basis buys *worse* retention. "Keep
+   98 % of the variance" is the wrong objective for this mechanism.
+4. **The constraint leaks.** The diagnostic `|dW . U| / |dW|`, i.e. how much of
+   the update lies inside the protected subspace, is 0.83 for naive and 0.42 for
+   the corrected variant -- identical to the basis-only figure, so the lock is not
+   binding. Four gradient paths are never projected (`task_ctrl`, `gn1`/`gn2`,
+   `shortcut`, the per-task stems and heads) and AdamW momentum plus weight decay
+   act *after* the projection.
+
+Two failures of the original protocol are worth recording because they are what
+made the first table look stronger than it was. The reference "exact by
+construction" row was unreachable in fact: the rank is clamped to
+`min(k, U.shape[1] - 1)`, so one direction is always left out. And the naive
+baseline is not reproducible at one seed per arm -- across three runs of the
+identical configuration it lands at **34.37 %, 38.49 % and 53.27 %**, a
+19-point spread. Any comparison against a ±19-point baseline needs the seeds
+reported, which is why `experiments/exp_zero_per_task.py` now records them.
+
+The verdict on this mechanism as a way to reach 0 bytes per task: it is a working
+anchor (better than nothing, and better than a random subspace) but it is not a
+free one, it is not explained, and it does not dominate freezing the basis, which
+stores a literal zero and reaches 4.57 % forgetting. See B66 for the direct
+0-bytes/task test.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".

@@ -111,14 +111,21 @@ python train_continual_aml.py \
 | `--ewc-lambda` | `0.0` | Elastic Weight Consolidation on the shared trunk. `>0` is what lets forgetting be bounded without storing an 18-layer snapshot per task. |
 | `--amb-topk` | `0` | Restrict the ambiguous-sample retry (router margin `< --route-tau`) to the k most likely domains. `0` retries under every seen snapshot, which re-loads enc + sel + stem + 18 layers + ln (~1.5 M parameters) per domain per batch. `2` is the usual choice. |
 | `--auto-live-thresh` | `0.0` | Open-set fallback for the autonomous protocol: evaluate with live weights when no snapshot reaches this confidence. **Disabled by default** — correctness is verified (it cannot alter `A_oracle`) but an accuracy benefit has not been demonstrated. See the investigation log. |
-| `--shared-backbone` | `0` | P4-3A: store no per-task copy of stem / 18 layers / ln (5.86 MB/task); EWC alone retains earlier domains. Measured A/B at an identical short schedule: live forgetting **23.05 % → 13.91 %**, task-oracle **0.00 % → 9.00 %**, per-task state **7.2 MB → 1.2 MB**. Single seed — treat as suggestive. |
+| `--shared-backbone` | `0` | P4-3A: store no per-task copy of stem / 18 layers / ln (5.86 MB/task) and let EWC alone retain earlier domains. **Superseded.** The A/B below ran at `--steps 50`, where CIFAR-10 saw a quarter of one epoch; at the production schedule EWC does not hold the shared trunk at all and live forgetting stays at **59.23 %** (B19). Per-task state still drops to ~1.34 MB at 10 classes (the sum of the surviving keys in the B64 breakdown: `enc` 0.401 + `sel` 0.805 + `protos` 0.092 + `struct_heads` 0.045 MB), but the retention the flag was supposed to buy is not there. Do not cite the 23.05 % → 13.91 % pair. |
 
 ### 3A decision
 
-`--shared-backbone 1` is **not** a strict improvement. It buys lower average
-error and 6× less per-task storage by giving up the task-oracle zero-forgetting
-claim, which is unavoidable when there is only one trunk to retrieve. Enable it
-when deployment does not supply a task id; keep the default otherwise.
+`--shared-backbone 1` is **not** a strict improvement. It buys 6× less per-task
+storage by giving up the task-oracle zero-forgetting claim, which is unavoidable
+when there is only one trunk to retrieve.
+
+**Correction (B19).** An earlier version of this section also claimed it buys
+lower average error, on the strength of a `--steps 50` A/B. That does not survive
+the production schedule: EWC is not holding the trunk, so the shared-backbone
+configuration is *worse* on retention, not better. The honest statement of what
+3A offers is "6× less per-task storage at the cost of the zero-forgetting claim",
+with no retention benefit. Enable it when deployment does not supply a task id;
+keep the default otherwise.
 
 Depth telemetry is printed every epoch:
 
