@@ -90,42 +90,131 @@ python train_continual_aml.py --model-type hybrid18 \
 
 Measured on **NVIDIA GeForce RTX 3050 Laptop GPU**, `bfloat16`, `--replay-per-class 0`.
 
-### 3.1a Full production run (2026-10-14)
+### 3.1a Full production run (2026-10-15, commit `5969669`)
 
-`--epochs 5,28,16 --ewc-lambda 100`, seed 42, InstanceNorm.
+```bash
+python train_continual_aml.py --tasks mnist,cifar10,fashion \
+  --epochs 5,28,16 --replay-per-class 0 --norm in \
+  --encoder-tail-act none --arch-lr 3e-3 --depth-cost 0.02
+```
+
+Every default is the shipped one: `--ewc-lambda 0` (disabled), `--router-metric
+mahalanobis`, `--route-tau 0.6`, `--route-per-task 1`, seed 42, bf16, RTX 3050
+Laptop GPU. Single seed.
 
 **`A_oracle` — task-oracle snapshot retrieval**
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
-| after MNIST | **97.94 %** | — | — |
-| after CIFAR-10 | **97.94 %** | **67.91 %** | — |
-| after Fashion | **97.94 %** | **67.91 %** | **92.11 %** |
+| after MNIST | **98.65 %** | — | — |
+| after CIFAR-10 | **98.65 %** | **69.22 %** | — |
+| after Fashion | **98.65 %** | **69.22 %** | **92.32 %** |
 
-**BWT = +0.00 % · Forgetting = 0.00 %** — MNIST is bit-stable at 97.94 % through
-both later tasks.
+**A_avg = 86.73 % · BWT = +0.00 % · Forgetting = 0.00 %** — bit-stable
+retrieval: MNIST never moves off 98.65 %, and the forgetting is exactly zero by
+construction of the protocol.
 
-**`A_live` — standard mutable weights**
-
-| after \ eval on | MNIST | CIFAR-10 | Fashion |
-| :-- | --: | --: | --: |
-| after MNIST | 98.09 % | — | — |
-| after CIFAR-10 | 28.00 % | 68.03 % | — |
-| after Fashion | 16.23 % | 31.43 % | 92.09 % |
-
-**BWT = −59.23 % · Forgetting = 59.23 %**
-
-**`A_auto` — autonomous centroid router, no task identity**
+**`A_live` — standard mutable weights, no snapshot**
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
-| after MNIST | 97.94 % | — | — |
-| after CIFAR-10 | **8.01 %** | 67.72 % | — |
-| after Fashion | 26.33 % | 43.19 % | 74.63 % |
+| after MNIST | 98.61 % | — | — |
+| after CIFAR-10 | 21.65 % | 70.10 % | — |
+| after Fashion | 22.95 % | 30.15 % | 92.74 % |
 
-**BWT = −48.07 % · Forgetting = 48.07 %**
+**A_avg = 48.61 % · BWT = −57.80 % · Forgetting = 57.80 %**
 
-> **Two negative results from this run, stated plainly.**
+**`A_auto` — autonomous router, no task identity**
+
+| after \ eval on | MNIST | CIFAR-10 | Fashion |
+| :-- | --: | --: | --: |
+| after MNIST | 98.65 % | — | — |
+| after CIFAR-10 | 93.47 % | 69.22 % | — |
+| after Fashion | **16.09 %** | **42.93 %** | 91.91 % |
+
+**A_avg = 50.31 % · BWT = −54.43 % · Forgetting = 54.43 %**
+
+Routing accuracy behind those cells (`route_acc`, measured on the same path that
+produced the predictions):
+
+| cell | A_auto | A_oracle | route_acc |
+| :-- | --: | --: | --: |
+| A[1,1] | 98.65 % | 98.65 % | 100.00 % |
+| A[2,1] | 93.47 % | 98.65 % | 93.96 % |
+| A[2,2] | 69.22 % | 69.22 % | 100.00 % |
+| A[3,1] | 16.09 % | 98.65 % | **5.94 %** |
+| A[3,2] | 42.93 % | 69.22 % | **50.01 %** |
+| A[3,3] | 91.91 % | 92.32 % | 99.39 % |
+
+> **What this run shows, stated plainly.**
+>
+> 1. **The storage story holds at full scale.** `A_oracle` is 86.73 % with
+>    **exactly zero** forgetting and zero backward transfer, versus 48.61 % for
+>    the same network under standard continual learning. Zero exemplars: the only
+>    per-task state is the snapshot, the centroid and the second moment.
+> 2. **The router is perfect through two tasks and collapses on the third.**
+>    `route_acc` is 100 % / 93.96 % / 100 % through stage 2, then **5.94 %** on
+>    MNIST and **50.01 %** on CIFAR-10 after the third task. 5.94 % is far
+>    *below* chance (33 %), so this is systematic misrouting, not noise.
+> 3. **`A_auto` is therefore not yet close to `A_oracle`.** At 50.31 % it is
+>    1.7 points above `A_live` and 36.4 points below the oracle. The earlier
+>    2-task result (`A[2,2]` auto == oracle) is reproduced here exactly, and it
+>    was never evidence about three tasks.
+> 4. **Root cause, measured on the run's own checkpoints** — see §3.4a.
+
+#### 3.4a Why the router collapses at the third task
+
+`--router-metric mahalanobis` scored every candidate against **one** covariance
+pooled over all seen tasks, while `score_per_task` embeds each query with the
+encoder of the candidate domain. Those are three feature spaces that share only
+a dimension, so the pooled second moment describes none of them well.
+`probes/probe_router_stage3.py` rebuilds the router state from this run's own
+per-task checkpoints and reproduces the collapse exactly:
+
+| routing accuracy, 3 tasks | shared (shipped) | per-task covariance |
+| :-- | --: | --: |
+| MNIST | **6.07 %** (run: 5.94 %) | **95.10 %** |
+| CIFAR-10 | **41.16 %** (run: 50.01 %) | **99.98 %** |
+| Fashion | 98.78 % (run: 99.39 %) | 85.75 % |
+
+Per-task alone gives up Fashion, so the shipped metric mixes the two:
+`S_k = (1 − α)·S_k + α·S_pooled`.
+
+| α | MNIST | CIFAR-10 | Fashion | mean |
+|---|---|---|---|---|
+| 0.00 | 95.10 % | 99.98 % | 85.75 % | 93.61 % |
+| 0.10 | 96.35 % | 99.95 % | 93.13 % | 96.48 % |
+| **0.15** | **95.37 %** | **99.67 %** | **96.36 %** | **97.13 %** |
+| 0.25 | 85.34 % | 98.08 % | 98.01 % | 93.81 % |
+| 0.50 | 46.39 % | 90.48 % | 98.82 % | 78.56 % |
+| 1.00 | 6.07 % | 41.16 % | 98.78 % | 48.67 % |
+
+`--router-metric mahalanobis-task --router-cov-alpha 0.15` is now the default
+(`mahalanobis` and `cosine` remain available). The optimum is a broad plateau
+between 0.10 and 0.20 rather than a knife edge, and the storage cost is
+`T × D × D` floats — 3.0 MB at T = 3, D = 512 — still no exemplars.
+
+> The table above is measured on the run's own checkpoints, not on a
+> reimplementation, and it reproduces the run's `route_acc` to within 0.1–9
+> points before the change. It is a diagnosis, not yet a confirmation: the
+> end-to-end rerun with the new default is reported below when it completes.
+
+### 3.1b Previous production run (2026-10-14) — superseded
+
+Kept so the improvement is visible. Same schedule, different router and
+`--ewc-lambda 100`; **A_auto reached 8.01 % on MNIST after CIFAR-10 against
+A_oracle 97.94 %**. `A_avg` is the mean of the final row of each matrix.
+
+| protocol | A_avg | BWT | Forgetting |
+| :-- | --: | --: | --: |
+| `A_oracle` (2026-10-14) | 85.99 % | +0.00 % | 0.00 % |
+| `A_oracle` (2026-10-15) | **86.73 %** | +0.00 % | 0.00 % |
+| `A_live` (2026-10-14) | 46.58 % | −59.23 % | 59.23 % |
+| `A_live` (2026-10-15) | 48.61 % | −57.80 % | 57.80 % |
+| `A_auto` (2026-10-14) | 48.05 % | −48.07 % | 48.07 % |
+| `A_auto` (2026-10-15) | 50.31 % | −54.43 % | 54.43 % |
+
+> **Two negative results from the 2026-10-14 run, stated plainly.**
 >
 > **1. EWC did not help.** `--ewc-lambda 100` gives `A_live` forgetting 59.23 %,
 > *worse* than the recorded 46.50 % baseline. Earlier EWC and shared-backbone
