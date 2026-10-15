@@ -23,7 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from mgn.blocks.hybrid_18 import ConvAML_18Layer_Hybrid
-from train_continual_aml import TaskCentroidRouter, get_task_data, router_features
+from train_continual_aml import TaskCentroidRouter, router_features
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
