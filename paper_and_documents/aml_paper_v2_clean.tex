@@ -1579,11 +1579,12 @@ construction, and both are reported because they are easy to get backwards.
 First, $\mu_t$ must be the \emph{true mean}: a broadly spread domain has a
 smaller $\|\mu_t\|$ than a tightly clustered one (measured $0.695$ vs $0.929$),
 and rescaling every centroid to the unit sphere collapses CIFAR-10 routing from
-$100.0\%$ to $4.0\%$. Second, a single pooled matrix cannot replace the per-task
-ones: with three tasks it mixes three feature spaces that share only a
-dimension, and routing accuracy measured on the production checkpoints falls to
-$6.07\%$ (MNIST) and $41.16\%$ (CIFAR-10), against $95.37\%$ / $99.67\%$ for
-the per-task matrices.
+$100.0\%$ to $4.0\%$. Second, the covariance must be the task's own: a single
+pooled matrix mixes three feature spaces that share only a dimension, and
+per-task matrices without the log-determinant term are not comparable across
+tasks at all. Both errors were made, measured, and corrected; the resulting
+routing accuracy on the production checkpoints is reported in
+Table~\ref{tab:cl_production}.
 
 \subsection{Empirical Validation on MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST}
 We evaluated the 18-layer Hybrid Supernet against standard static deep architectures (Plain 18-layer CNN, Standard ResNet-18, and Vision Transformer ViT) across the sequence MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST under strict zero-replay constraints ($\text{replay}=0$). Table~\ref{tab:cl_results} reports the resulting continual learning metrics, parameters, and memory footprints.
@@ -1655,30 +1656,60 @@ to the snapshot it retrieves.}
 \toprule
 \textbf{Protocol} & \textbf{$A_{\text{avg}}$} & \textbf{BWT} & \textbf{Forgetting} & \textbf{worst route acc} & \textbf{MNIST after task 3} \\
 \midrule
-$A_{\mathrm{live}}$ (mutable weights) & $48.61\%$ & $-57.80\%$ & $57.80\%$ & -- & $22.95\%$ \\
-$A_{\mathrm{auto}}$ (autonomous router) & $50.31\%$ & $-54.43\%$ & $54.43\%$ & $5.94\%$ & $16.09\%$ \\
-$A_{\mathrm{oracle}}$ (task id given) & $\mathbf{86.73\%}$ & $\mathbf{+0.00\%}$ & $\mathbf{0.00\%}$ & -- & $\mathbf{98.65\%}$ \\
+$A_{\mathrm{live}}$ (mutable weights) & $47.49\%$ & $-58.71\%$ & $58.71\%$ & -- & $23.78\%$ \\
+$A_{\mathrm{auto}}$ (autonomous router) & $81.96\%$ & $-6.34\%$ & $6.34\%$ & $89.02\%$ & $88.96\%$ \\
+$A_{\mathrm{oracle}}$ (task id given) & $\mathbf{86.19\%}$ & $\mathbf{+0.00\%}$ & $\mathbf{0.00\%}$ & -- & $\mathbf{98.54\%}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Two conclusions, one positive and one negative, are reported as measured.
 \textbf{(i) The storage argument holds at full scale.} With no exemplars, the
-snapshot protocol reaches $86.73\%$ average accuracy with \emph{exactly} zero
-backward transfer and zero forgetting, against $48.61\%$ for the same network
-under ordinary sequential fine-tuning: the $38$ point gap is entirely attributable
-to retaining one functional state per task. \textbf{(ii) The autonomous router is
-not yet close to the oracle.} Routing accuracy is $100.00\%$ / $93.96\%$ /
-$100.00\%$ after one and two tasks, then collapses to $5.94\%$ on MNIST and
-$50.01\%$ on CIFAR-10 once the third task has been learned --- far below the
-$33.3\%$ chance level, so the failure is systematic rather than noisy. The cause
-is that a single covariance pooled over three tasks mixes three feature spaces
-that share only a dimension, while each centroid necessarily lives in the space
-of its own encoder; scoring against per-task second moments measured on the same
-checkpoints raises routing accuracy from $6.07\%$ / $41.16\%$ to $95.37\%$ /
-$99.67\%$ on MNIST / CIFAR-10. We report the collapse rather than only the fix,
-because a two-task result cannot distinguish a solved router from one that
-happens not to have been stressed.
+snapshot protocol reaches $86.19\%$ average accuracy with \emph{exactly} zero
+backward transfer and zero forgetting, against $47.49\%$ for the same network
+under ordinary sequential fine-tuning: a $38.7$ point gap attributable entirely
+to retaining one functional state per task. \textbf{(ii) The autonomous router
+reaches within $4.2$ points of the oracle.} Routing accuracy is $100.00\%$ at
+every stage-2 cell and $89.02\%$, $95.00\%$ and $99.97\%$ at stage 3, and
+$A_{\mathrm{auto}}$ rises from $50.31\%$ to $81.96\%$ once the metric and the
+fitting split are corrected. Two corrections were required, and both are
+reported because the first version of each was wrong.
+
+\emph{The metric.} Scoring every candidate against one covariance pooled over all
+seen tasks compares three feature spaces that share only a dimension, because a
+query is embedded by the candidate's own encoder while the centroid was measured
+in that same encoder's space. Replacing the pooled matrix with per-task matrices
+\emph{alone} is worse still: each distance is then whitened in a space prepared
+for a different task, so a broadly spread domain wins every query. Adding the
+log-determinant of the task's own covariance makes the score a tempered Gaussian
+likelihood, which is comparable by construction. Measured mean routing accuracy
+over the three domains, with statistics fitted on the training split:
+
+\begin{center}
+\begin{tabular}{l r r}
+\toprule
+scoring rule & 2 domains & 3 domains \\
+\midrule
+shared covariance (earlier) & $52.37\%$ & $36.39\%$ \\
+per-task covariance & $51.74\%$ & $34.18\%$ \\
+per-task $+\ \beta\log|S_k|$, $\beta=0.5$ & $\mathbf{99.97\%}$ & $\mathbf{97.52\%}$ \\
+per-task $+\ \log|S_k|$, $\beta=1$ & $99.25\%$ & $90.93\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\emph{The fitting split.} The router's centroid and second moment were initially
+estimated on the \emph{test} split --- the same images the router is later asked
+to route. That is a leak, and it was inflating the earlier numbers: CIFAR-10's
+train and test centroids differ by $6.4\%$, and with honest train-fitted
+statistics every metric degrades. The reported run therefore fits on the
+training split, which is the harder and more meaningful setting.
+
+The residual $4.2$ points are one effect, and it has a direction: after the
+third task, $10.98\%$ of MNIST images are routed to Fashion-MNIST and $5.00\%$
+of CIFAR-10 images likewise. All misrouting at that stage goes \emph{forward}
+to the newest encoder's space and never backward to an older one, which
+identifies the next thing to fix instead of leaving it as an unexplained gap.
 
 \section{Conclusion}
 %======================================================================
