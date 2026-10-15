@@ -1045,6 +1045,55 @@ so the isolation window was opened and then ignored.
 projection. It now has its own `AdamW`, a `0.3`-weighted cross-entropy against
 the current task id, and its own gradient-norm clip.
 
+**B40 (high) — the router collapses at the third task: one covariance cannot span three encoders.**
+The 2026-10-15 production run (epochs 5,28,16, seed 42, zero replay) reports
+`route_acc` 100.00 / 93.96 / 100.00 through stage 2, and then **5.94 %** on
+MNIST and **50.01 %** on CIFAR-10 after the third task. `A_auto` falls to
+`A_avg` 50.31 % against `A_oracle` 86.73 %. 5.94 % is far *below* chance (33 %),
+so it is systematic misrouting rather than noise — and `route_acc` is what makes
+it visible at all: without it, "A_auto is bad" has six possible causes.
+
+The cause is a mismatch that only appears once there are three tasks.
+`score_per_task` embeds each query with the encoder of the candidate domain, so
+the comparison for task *k* happens in *encoder_k's* feature space, while the
+Mahalanobis metric used **one** covariance pooled over all tasks. Two pooled
+spaces are still roughly compatible; three are not, and the pooled matrix ends
+up dominated by whichever task contributed the most variance.
+
+Measured on the run's **own checkpoints** — `aml_continual_after_<task>.pt` is
+the model at the end of that task, i.e. exactly the encoder whose space the
+stored centroid lives in — so no retraining is needed and the offline path
+reproduces the run rather than approximating it:
+
+| routing accuracy, 3 tasks | shared (shipped) | per-task covariance |
+|---|---|---|
+| MNIST | **6.07 %** (run: 5.94 %) | **95.10 %** |
+| CIFAR-10 | **41.16 %** (run: 50.01 %) | **99.98 %** |
+| Fashion | 98.78 % (run: 99.39 %) | 85.75 % |
+
+Per-task alone trades Fashion away, so the shipped metric is the hierarchical
+mixture `S_k = (1−α)·S_k + α·S_pooled`:
+
+| α | MNIST | CIFAR-10 | Fashion | mean |
+|---|---|---|---|---|
+| 0.00 | 95.10 % | 99.98 % | 85.75 % | 93.61 % |
+| **0.15** | **95.37 %** | **99.67 %** | **96.36 %** | **97.13 %** |
+| 0.50 | 46.39 % | 90.48 % | 98.82 % | 78.56 % |
+| 1.00 | 6.07 % | 41.16 % | 98.78 % | 48.67 % |
+
+`--router-metric mahalanobis-task --router-cov-alpha 0.15` is the new default;
+`mahalanobis` and `cosine` stay available. Storage grows from one `D×D` matrix
+to `T×D×D` (3.0 MB at T=3, D=512) and the method is still zero-replay — these
+are second moments, not images.
+
+Two things this repeats from earlier in the same log. First, the honest way to
+re-open a question is to persist the state that answers it: `--save-routing`
+now writes the router buffers and the per-task snapshots, because for six
+commits the router existed only in memory and every question about it required
+retraining, which does not reproduce. Second, the "two tasks work" result that
+this whole session chased was real and was never about three tasks; a fix that
+reproduces on two of three sequences is not a fix.
+
 **B39 (high, measurement) — the CUDA parity gate failed a correct kernel.**
 `validate_ext_in.py` reports `IN forward` and `grad L=2,3,4` as FAIL
 (5–17 % relative error), and CI runs it whenever the runner has a GPU — but
