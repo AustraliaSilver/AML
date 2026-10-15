@@ -286,12 +286,27 @@ thực.
 Khuyến nghị sử dụng tệp gốc tại thư mục gốc:
 
 ```bash
-# Option A: Đánh giá nhanh (Smoke test 5 tasks, ~2 phút trên GPU)
-python train_continual_aml.py --tasks mnist,fashion,cifar10,svhn,cifar100 --epochs 1 --max-batches 40 --replay-per-class 0
+# Option A: Đánh giá nhanh (smoke test 3 task, ~2 phút trên GPU)
+python train_continual_aml.py --tasks mnist,cifar10,fashion --epochs 1,1,1 --steps 40 --replay-per-class 0
 
-# Option B: Thí nghiệm đầy đủ chuẩn bài báo (Full 5 tasks Continual Learning)
-python train_continual_aml.py --tasks mnist,fashion,cifar10,svhn,cifar100 --epochs 5 --max-batches 150 --replay-per-class 0 --workers 2
+# Option B: Thí nghiệm đầy đủ chuẩn bài báo (3 task, ~1.6 giờ)
+python train_continual_aml.py --tasks mnist,cifar10,fashion --epochs 5,28,16 --replay-per-class 0 --workers 2
+
+# Mở rộng: CIFAR-10 -> CIFAR-100 -> Tiny ImageNet.
+# Head chung rộng 200 lớp; mỗi task học/đọc lại trên dải lớp riêng [0, n);
+# mỗi task giữ độ phân giải gốc (CIFAR 32x32, Tiny ImageNet 64x64).
+# --data-root có thể là danh sách nhiều gốc, ngăn bởi os.pathsep.
+python train_continual_aml.py --tasks cifar10,cifar100,tinyimagenet \
+  --epochs 20,30,20 --replay-per-class 0 --data-root /kaggle/input/cifar10:/kaggle/input/tiny-imagenet
 ```
+
+> **Ghi chú:** các lệnh cũ trong tài liệu dùng `--tasks mnist,fashion,cifar10,svhn,cifar100`
+> và `--max-batches` là **sai**: `svhn` và `cifar100` từng không được hỗ trợ, và cờ
+> `--max-batches` không tồn tại (nó là `--steps`). Danh sách task hợp lệ hiện tại là
+> `mnist`, `fashion`, `cifar10`, `cifar100`, `tinyimagenet` (nguồn duy nhất:
+> [`mgn/datasets.py`](../mgn/datasets.py)).
+>
+> **Bạn muốn train trên Kaggle 2×T4?** Xem [`notebooks/kaggle_continual_aml.ipynb`](../notebooks/kaggle_continual_aml.ipynb).
 
 ### 4.2. Chạy Lại Các Benchmark Lịch Sử
 

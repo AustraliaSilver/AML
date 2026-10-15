@@ -1792,6 +1792,54 @@ What is still **not** exercised: the pypi.org publish itself -- a `v2.0.0` tag, 
 `workflow_dispatch target=pypi` -- which uses the same workflow and needs the
 like-named trusted publisher on pypi.org (open item 11).
 
+**B63 (new capability) — a task registry, so a sequence is no longer locked to
+10 classes and 32x32.**
+
+The trainer used to hardcode three things: the task list (`mnist`, `fashion`,
+`cifar10`), the class count (`num_classes=10`, baked into the flat prototype head
+as `16*max_dim*num_classes + num_classes`), and a 32x32 input. That made
+"CIFAR-10 -> CIFAR-100 -> Tiny ImageNet" impossible without a rewrite, and it
+meant the documented `--tasks mnist,fashion,cifar10,svhn,cifar100` command in
+`experiments/README.md` had never worked -- it raised `ValueError` on the first
+unknown name (`svhn`), and the `--max-batches` flag in the same block does not
+exist either (it is `--steps`).
+
+`mgn/datasets.py` is now the single source of truth: `TASK_SPECS` gives each task
+its class count, native input side and normalisation, and `--tasks` accepts any
+of `mnist`, `fashion`, `cifar10`, `cifar100`, `tinyimagenet`. Three choices are
+load-bearing:
+
+* **One shared head, per-task class ranges.** The head is `max(n_classes)` wide
+  (200 for CIFAR-10/100/Tiny ImageNet) and a task only ever supervises and reads
+  back the prefix `[0, n)`. A per-task head width was rejected: it would change
+  `get_prototype_layout`'s row width, and with it every `wo`/`bo` offset the
+  fused CUDA kernels index. `class_range_ce` reduces to the old
+  `F.cross_entropy(outputs, targets)` whenever every sample shares the full head
+  width, and `evaluate(n_classes=None)` keeps the old whole-head argmax, so the
+  10-class protocol is **bit-identical** -- asserted in `tests/test_task_registry.py`.
+* **Native resolution per task.** The trunk does not depend on the input size:
+  stride-1 convs with fixed pooling at layers 5/11, an `AdaptiveAvgPool2d((4,4))`
+  classifier head and an `AdaptiveAvgPool2d((2,2))` encoder, and the ViT block
+  pools tokens to <= 8x8 whatever the input. So a 32x32 and a 64x64 task share
+  one trunk and one router, and Tiny ImageNet stays at its native 64x64 instead
+  of being downsampled to 32.
+* **`--data-root` may be an `os.pathsep` list.** Each task uses the first root
+  that already holds it, which is what a Kaggle notebook needs (each dataset is
+  mounted under its own `/kaggle/input/<slug>`). A single root is returned
+  unchanged, so existing runs are unaffected.
+
+`TinyImageNet` reads the directory release directly (torchvision has none),
+tolerating `val`/`valid`, an optional `images/` sub-step, per-class folders or
+`val_annotations.txt`, and numeric class-folder names (ordered numerically). It
+was validated against the export actually in `data/tiny-imagenet`: 100,000 train
+/ 10,000 val images, 200 classes, 500 per class. A Kaggle 2xT4 walkthrough is in
+`notebooks/kaggle_continual_aml.ipynb`.
+
+Evidence: `ruff` clean; `pytest -q` -> 296 passed; a real 3-task smoke run
+(`--tasks cifar10,cifar100,tinyimagenet --steps 8`) on the local data. The
+CIFAR-100 / Tiny ImageNet cells are **not** claimed as results: the README's and
+the paper's numbers remain the MNIST/CIFAR-10/Fashion protocol.
+
 ---
 
 ## 11. Open items, stated as open

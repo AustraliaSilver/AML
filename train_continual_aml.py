@@ -1,8 +1,13 @@
 """
 Continual / multi-domain benchmark for the AML supernet.
 
-Sequence: MNIST -> CIFAR-10 -> Fashion-MNIST (all mapped to 10 classes,
-3x32x32 inputs so the shared supernet consumes them directly).
+Sequence: any comma-separated list of tasks from `mgn.datasets.TASK_SPECS`
+(mnist, fashion, cifar10, cifar100, tinyimagenet), default MNIST -> CIFAR-10 ->
+Fashion-MNIST. The head is ONE shared classifier of width `max(n_classes)` over
+the sequence; each task is trained and read back on its own class range
+`[0, n_classes)`, so a 10-class and a 200-class task can share the supernet
+without a per-task head. Each task keeps its native input resolution (32x32 for
+MNIST/CIFAR, 64x64 for Tiny ImageNet): the trunk is resolution-agnostic.
 
 Architecture:
   - 18-Layer Hybrid Supernet (mgn/blocks/hybrid_18.py) supporting Plain CNN,
@@ -39,6 +44,17 @@ sys.path.insert(0, os.path.join(_ROOT, "AML_Core_Code"))
 
 from train import ConvAML_CIFAR_TrueDynamic, set_seed
 from mgn.blocks import ConvAML_18Layer_Hybrid
+from mgn.datasets import (
+    TASK_SPECS,
+    task_spec,
+    class_counts,
+    num_classes_for,
+    resolve_task_root,
+    CIFAR100_MEAN,
+    CIFAR100_STD,
+    TINY_IMAGENET_MEAN,
+    TINY_IMAGENET_STD,
+)
 
 
 def _prevent_sleep():
@@ -398,6 +414,10 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
     identically, and reproducing with `fast_cache=False` will not match the
     MNIST/Fashion columns. Disclosed as B54 in the audit log.
     """
+    # `data_root` may be an os.pathsep-separated list of roots (on Kaggle each
+    # dataset is mounted under its own /kaggle/input/<slug>); pick the one that
+    # actually holds this task. A single root is returned unchanged.
+    data_root = resolve_task_root(name, data_root)
     cache_key = (name, os.path.abspath(data_root))
     if fast_cache and cache_key in _DATA_CACHE:
         tr, te = _DATA_CACHE[cache_key]
@@ -479,8 +499,43 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
         ])
         tr = torchvision.datasets.CIFAR10(data_root, train=True, download=True, transform=tf_train)
         te = torchvision.datasets.CIFAR10(data_root, train=False, download=True, transform=tf_test)
+    elif name == "cifar100":
+        aug_ops = [transforms.RandomCrop(32, padding=4),
+                   transforms.RandomHorizontalFlip()]
+        if aug == "auto":
+            aug_ops.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
+        tf_train = transforms.Compose(aug_ops + [
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+        ])
+        tf_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+        ])
+        tr = torchvision.datasets.CIFAR100(data_root, train=True, download=True, transform=tf_train)
+        te = torchvision.datasets.CIFAR100(data_root, train=False, download=True, transform=tf_test)
+    elif name == "tinyimagenet":
+        # No torchvision dataset, so this reads the directory release directly.
+        # Native 64x64: the trunk is resolution-agnostic (see mgn/datasets.py),
+        # so downsampling to 32 would only throw away detail.
+        from mgn.datasets import TinyImageNet
+        aug_ops = [transforms.RandomCrop(64, padding=4),
+                   transforms.RandomHorizontalFlip()]
+        if aug == "auto":
+            aug_ops.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
+        tf_train = transforms.Compose(aug_ops + [
+            transforms.ToTensor(),
+            transforms.Normalize(TINY_IMAGENET_MEAN, TINY_IMAGENET_STD),
+        ])
+        tf_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(TINY_IMAGENET_MEAN, TINY_IMAGENET_STD),
+        ])
+        tr = TinyImageNet(data_root, train=True, transform=tf_train)
+        te = TinyImageNet(data_root, train=False, transform=tf_test)
     else:
-        raise ValueError(name)
+        known = ", ".join(sorted(TASK_SPECS))
+        raise ValueError(f"unknown task {name!r}; known tasks: {known}")
 
     tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                      num_workers=workers, pin_memory=True,
@@ -581,7 +636,7 @@ def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
 def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
              snaps=None, route_tau=None, dom_truth=None, pi_mask=None, amb_topk=0,
              auto_live_thresh=0.0, route_per_task=True, route_truth=None,
-             proto_row_ranges=None):
+             proto_row_ranges=None, n_classes=None):
     """If slots+dom_head given, each batch is routed to its predicted domain's
     stored structure slot. If snaps given as well, the full functional state of
     that domain (vision_encoder, prototype_selector, ENTIRE prototype matrix,
@@ -617,8 +672,18 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     whole batch. When dom_head is None (no routing) this is how the caller
     tells the model which task's rows to use, i.e. it hands over the true
     task id at the read-out. A_live is measured that way and is therefore
-    TASK-AWARE, unlike A_auto; see the protocol note in README 3.1."""
+    TASK-AWARE, unlike A_auto; see the protocol note in README 3.1.
+    n_classes: the loader's task class count. The shared head is
+    `max(n_classes)` wide, but this task only owns the prefix [0, n_classes), so
+    the argmax is taken there. None keeps the original whole-head argmax, which
+    is what every 10-class run used."""
     model.eval()
+    # The head is `num_classes` wide (the max over the sequence) but this
+    # loader's task owns only the prefix [0, n_classes). An argmax over the
+    # whole head would let an untrained class column win.
+    def _hit(o, yb):
+        lg = o[:, :n_classes] if n_classes is not None else o
+        return (lg.argmax(-1) == yb)
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
     bm_res_sum = torch.zeros(model.max_layers, device=device)
@@ -873,7 +938,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 bmf_deg = st_deg.block_mode.float()
                 bm_res_sum += (bmf_deg[:, :, 1] if bmf_deg.shape[-1] >= 2
                                else bmf_deg[:, :, 0]).mean(0)
-                correct += (out_deg.argmax(-1) == y).sum().item()
+                correct += _hit(out_deg, y).sum().item()
                 total += y.numel()
                 pi_ent_sum += -(pi_deg * torch.log(pi_deg.clamp(min=1e-9))).sum(-1).sum().item()
                 n += x.shape[0]
@@ -926,14 +991,14 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             gate_soft_sum += ls_full.mean(0)
             bm_res_sum += bm_wsum / max(wtot, 1)
             gate_list.append(ls_full)
-            correct += (out.argmax(-1) == y).sum().item()
+            correct += _hit(out, y).sum().item()
             total += y.numel()
             pi_ent_sum += -(pi * torch.log(pi.clamp(min=1e-9))).sum(-1).sum().item()
             n += x.shape[0]
         else:
             with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
                 out, struct, pi, diag = model(x, tau=0.1, struct_override=override, pi_mask=pi_mask)
-            correct += (out.argmax(-1) == y).sum().item()
+            correct += _hit(out, y).sum().item()
             total += y.numel()
             ls = diag["layer_soft"].float()
             gate_soft_sum += ls.mean(0)
@@ -990,6 +1055,40 @@ def collect_structure_slot(model, loader, device, amp_dtype=None):
 # ----------------------------------------------------------------------
 # Episodic memory replay buffer (balanced per class, canonical images)
 # ----------------------------------------------------------------------
+def class_range_ce(outputs, targets, sample_n_classes, label_smoothing=0.1):
+    """Cross-entropy where each sample is scored over its own class range.
+
+    The supernet has ONE classifier head of width ``num_classes`` (the max over
+    the sequence), while each task owns only the prefix ``[0, n)`` of it. Tasks
+    can have different ``n``, so a single ``cross_entropy(outputs, y)`` would
+    score every sample against all 200 columns and teach it to suppress classes
+    it has never seen.
+
+    ``sample_n_classes`` is a [B] long tensor on the output's device: the number
+    of valid classes for each sample -- the current task's count for fresh
+    samples, the exemplar's own task for replayed ones.
+
+    When every sample has the same count AND that count is the full head width,
+    this is exactly ``F.cross_entropy(outputs.float(), targets)``: the path
+    every 10-class run took before this existed, kept bit-identical.
+    """
+    n = outputs.shape[1]
+    uniq = torch.unique(sample_n_classes)
+    if uniq.numel() == 1 and int(uniq.item()) == n:
+        return F.cross_entropy(outputs.float(), targets,
+                               label_smoothing=label_smoothing)
+    total = 0.0
+    for u in uniq.tolist():
+        sel = sample_n_classes == u
+        # Slice instead of masking with -inf: label_smoothing spreads a little
+        # mass onto EVERY column, masked ones included, so masking would leak a
+        # constant into the loss of the classes the task must not see.
+        total = total + F.cross_entropy(
+            outputs[sel][:, :u].float(), targets[sel],
+            label_smoothing=label_smoothing, reduction="sum")
+    return total / max(targets.numel(), 1)
+
+
 def build_replay_buffer(dataset, per_class=100, num_classes=10):
     """Balanced exemplar set stored with canonical normalization.
     Vectorized with direct tensor operations for instant execution (<0.02s)."""
@@ -1002,12 +1101,12 @@ def build_replay_buffer(dataset, per_class=100, num_classes=10):
         chosen.append(sel)
     idx = torch.cat(chosen)
 
-    if ds_name == "CIFAR10":
+    if ds_name in ("CIFAR10", "CIFAR100"):
         # dataset.data is numpy [N, 32, 32, 3] uint8
         data_np = dataset.data[idx.numpy()]
         data_t = torch.from_numpy(data_np).permute(0, 3, 1, 2).float() / 255.0
-        mean = torch.tensor(CIFAR_MEAN).view(1, 3, 1, 1)
-        std = torch.tensor(CIFAR_STD).view(1, 3, 1, 1)
+        mean = torch.tensor(CIFAR_MEAN if ds_name == "CIFAR10" else CIFAR100_MEAN).view(1, 3, 1, 1)
+        std = torch.tensor(CIFAR_STD if ds_name == "CIFAR10" else CIFAR100_STD).view(1, 3, 1, 1)
         xs = (data_t - mean) / std
     elif ds_name in ("MNIST", "FashionMNIST"):
         mean_val = 0.1307 if ds_name == "MNIST" else 0.2860
@@ -1016,7 +1115,10 @@ def build_replay_buffer(dataset, per_class=100, num_classes=10):
         data_t = F.interpolate(raw, size=(32, 32), mode='bilinear').repeat(1, 3, 1, 1)
         xs = (data_t - mean_val) / std_val
     else:
-        raise ValueError(ds_name)
+        raise ValueError(
+            f"replay for {ds_name} is not supported: Tiny ImageNet keeps JPEGs "
+            f"on disk rather than an in-memory array. Run it with "
+            f"--replay-per-class 0 (the zero-replay protocol) instead.")
 
     ys = targets[idx]
     return xs, ys
@@ -1287,7 +1389,8 @@ class FisherEWC:
 
 
 def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-4,
-                isolator: ProtoIsolator = None, dom_head=None):
+                isolator: ProtoIsolator = None, dom_head=None,
+                task_class_counts=None):
     """Low-LR pass over the pure replay set after each task: rebalances the
     shared prototypes across ALL seen domains (weights only, arch frozen).
     Also keeps the domain router calibrated on all seen tasks."""
@@ -1302,7 +1405,6 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
     opt_dom = None
     if dom_head is not None and not isinstance(dom_head, TaskCentroidRouter):
         opt_dom = optim.AdamW(dom_head.parameters(), lr=1e-3, weight_decay=0.0)
-    ce = lambda lg, tg: F.cross_entropy(lg.float(), tg, label_smoothing=0.1)
 
     for _ in range(epochs):
         for xb, yb, tb in replay.loader(batch_size=64):
@@ -1314,7 +1416,16 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
             with torch.amp.autocast('cuda', enabled=amp_dtype is not None,
                                     dtype=amp_dtype or torch.bfloat16):
                 out, _, _, diag = model(xb, tau=0.8)
-                loss = ce(out, yb)
+                # Exemplars come from several tasks with different class counts,
+                # so each is scored over its own task's class range.
+                if task_class_counts is not None:
+                    sample_n = torch.tensor(
+                        [task_class_counts[int(t_)] for t_ in tb],
+                        device=device, dtype=torch.long)
+                else:
+                    sample_n = torch.full((xb.size(0),), out.shape[1],
+                                          device=device, dtype=torch.long)
+                loss = class_range_ce(out, yb, sample_n)
                 if opt_dom is not None and "z" in diag:
                     z_norm = F.normalize(diag["z"].float(), dim=1)
                     dom_logits = dom_head(z_norm)
@@ -1344,9 +1455,14 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                isolator: ProtoIsolator = None, dom_head=None, task_idx=0,
                anchor=None, anchor_lam=1e-3, aug="basic", workers=2, steps=0,
                arch_lr=3e-3, depth_cost=0.0, flops_cost=0.0, depth_target=0.0, ewc=None,
-               n_tasks: int = 1):
-    trainloader, _ = get_task_data(name, os.path.join(_ROOT, "data"), workers=workers, aug=aug)
-    _, testloader = get_task_data(name, os.path.join(_ROOT, "data"), workers=workers)
+               n_tasks: int = 1, n_classes=None, task_class_counts=None,
+               data_root=None):
+    if data_root is None:
+        data_root = os.path.join(_ROOT, "data")
+    if n_classes is None:
+        n_classes = getattr(model, "num_classes", None)
+    trainloader, _ = get_task_data(name, data_root, workers=workers, aug=aug)
+    _, testloader = get_task_data(name, data_root, workers=workers)
 
     arch_names = ("structure_prototypes", "block_mode_prototypes", "mode_prototypes")
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
@@ -1366,8 +1482,6 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
     anchor_pairs = None
     if anchor is not None:
         anchor_pairs = [(p, a) for p, a in anchor]
-
-    ce = lambda lg, tg: F.cross_entropy(lg.float(), tg, label_smoothing=0.1)
 
     # The differentiable cost term costs 54 extra CUDA launches per forward, so
     # it is switched on only when something actually consumes it.
@@ -1437,7 +1551,17 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
 
             with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.bfloat16):
                 outputs, struct, pi, diag = model(inputs, tau=0.8, pi_mask=batch_pi_mask)
-                loss = ce(outputs, targets)
+                # One shared head, per-task class ranges: the current task's
+                # count for fresh samples, each exemplar's own task for replays.
+                # Every 10-class run takes the fast path inside class_range_ce
+                # and the loss is bit-identical to the old `ce(outputs, targets)`.
+                sample_n = torch.full((inputs.size(0),), int(n_classes),
+                                      device=device, dtype=torch.long)
+                if task_class_counts is not None and re_t is not None:
+                    sample_n[inputs.size(0) - re_t.numel():] = torch.tensor(
+                        [task_class_counts[int(t_)] for t_ in re_t],
+                        device=device, dtype=torch.long)
+                loss = class_range_ce(outputs, targets, sample_n)
                 if w_pi > 0:
                     pif = pi.float()
                     ent_pi = -(pif * torch.log(pif.clamp(min=1e-9))).sum(-1).mean()
@@ -1536,7 +1660,8 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
         # scheduler-before-optimizer warning).
         if not freeze:
             sch_arch.step()
-        acc, _ = evaluate(model, testloader, device, amp_dtype, pi_mask=task_pi_mask)
+        acc, _ = evaluate(model, testloader, device, amp_dtype, pi_mask=task_pi_mask,
+                          n_classes=n_classes)
         avg_loss = (tot_loss / n_batches).item()
         mode_str = ""
         if hasattr(model, 'block_mode_prototypes') and model.block_mode_prototypes.shape[-1] == 3:
@@ -1608,6 +1733,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "bn is kept only for comparison. Single-task "
                          "measurement - re-check on the full 3-task schedule "
                          "before quoting as final.")
+    ap.add_argument('--data-root', type=str, default=os.path.join(_ROOT, 'data'),
+                    help='dataset root. Defaults to <repo>/data. May be an '
+                         'os.pathsep-separated list (";" on Windows, ":" on '
+                         'POSIX), in which case each task uses the first root '
+                         'that already holds it. On Kaggle point it at the '
+                         'mounted datasets (e.g. '
+                         '"/kaggle/input/cifar100-python:/kaggle/input/tiny-imagenet") '
+                         'so the tensors are read in place instead of being '
+                         're-downloaded into the working directory.')
     ap.add_argument('--workers', type=int, default=2, help='DataLoader workers')
     ap.add_argument('--freeze', type=int, default=2)
     ap.add_argument('--replay-per-class', type=int, default=0,
@@ -1758,19 +1892,32 @@ def main():
         torch.float16 if device.type == 'cuda' else None)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
-    tasks = args.tasks.split(',')
+    tasks = [t.strip() for t in args.tasks.split(',')]
+    for t in tasks:
+        task_spec(t)                 # raises with the known-task list on a typo
     ep_list = [int(e) for e in args.epochs.split(',')]
     assert len(ep_list) == len(tasks)
+    n_classes_per_task = class_counts(tasks)
+    num_classes = num_classes_for(tasks)
+    if len(set(n_classes_per_task)) > 1:
+        print(f"[*] Mixed class counts {dict(zip(tasks, n_classes_per_task))}: one "
+              f"shared head of width {num_classes}; each task trains and is read "
+              f"back on its own class range [0, n).")
 
     if args.model_type == 'hybrid18':
         print("[*] Initializing 18-Layer Hybrid AML Supernet (Plain CNN + ResNet + ViT)...")
         model = ConvAML_18Layer_Hybrid(
-            K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=10,
+            K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=num_classes,
             norm_type=args.norm,
             encoder_tail_act=args.encoder_tail_act,
             arch_prior=args.arch_prior
         ).to(device)
     else:
+        if num_classes != 10:
+            raise SystemExit(
+                f"the legacy ConvAML_CIFAR_TrueDynamic head is fixed at 10 "
+                f"classes but this sequence needs {num_classes}; use "
+                f"--model-type hybrid18 for CIFAR-100 / Tiny ImageNet.")
         print(f"[*] Initializing Legacy ConvAML_CIFAR_TrueDynamic (norm={args.norm})...")
         model = ConvAML_CIFAR_TrueDynamic(K=args.K, max_dim=args.max_dim, max_layers=18,
                                           norm_mode=args.norm).to(device)
@@ -1813,7 +1960,7 @@ def main():
         s, e = isolator.begin_task(i, T, reinit=False)
         print(f"  [proto-isolation] rows [{s}:{e}) owned; rows [0:{s}) frozen", flush=True)
         print(f"  [replay] buffer size: {len(replay)} exemplars", flush=True)
-        tr_loader, _ = get_task_data(name, os.path.join(_ROOT, "data"), workers=args.workers)
+        tr_loader, _ = get_task_data(name, args.data_root, workers=args.workers)
         del tr_loader
         train_task(model, name, ep_list[i],
                    freeze_epochs=(args.freeze if i == 0 else min(args.freeze, 1)),
@@ -1834,10 +1981,13 @@ def main():
                    aug=args.aug,
                    workers=args.workers,
                    steps=args.steps,
-                   n_tasks=T)
+                   n_tasks=T,
+                   n_classes=n_classes_per_task[i],
+                   task_class_counts=n_classes_per_task,
+                   data_root=args.data_root)
 
         # Freeze this domain's structure into its slot & pristine router centroid
-        tl_fit, el_self = get_task_data(name, os.path.join(_ROOT, "data"))
+        tl_fit, el_self = get_task_data(name, args.data_root)
         # The router's centroid and second moment are estimated on the TRAIN
         # split by default. They used to be estimated on `el_self`, the TEST
         # split - i.e. on the very images the router is later asked to route.
@@ -1890,10 +2040,17 @@ def main():
 
         # Store balanced exemplars (with task id) for future tasks
         if use_replay:
-            data_root = os.path.join(_ROOT, "data")
-            ds_name = {"mnist": "MNIST", "fashion": "FashionMNIST", "cifar10": "CIFAR10"}[name]
+            data_root = resolve_task_root(name, args.data_root)
+            ds_name = {"mnist": "MNIST", "fashion": "FashionMNIST",
+                       "cifar10": "CIFAR10", "cifar100": "CIFAR100"}.get(name)
+            if ds_name is None:
+                raise SystemExit(
+                    f"--replay-per-class > 0 is not supported for '{name}': its "
+                    f"images are not an in-memory array. Run it with "
+                    f"--replay-per-class 0 (the zero-replay protocol).")
             ds = getattr(torchvision.datasets, ds_name)(data_root, train=True, download=False)
-            xs, ys = build_replay_buffer(ds, per_class=args.replay_per_class)
+            xs, ys = build_replay_buffer(ds, per_class=args.replay_per_class,
+                                         num_classes=n_classes_per_task[i])
             replay.extend(xs, ys, torch.full((xs.shape[0],), i, dtype=torch.long))
             print(f"  [replay] added {len(xs)} exemplars -> total {len(replay)}")
 
@@ -1902,7 +2059,7 @@ def main():
             t0c = time.time()
             consolidate(model, replay, device, amp_dtype,
                         epochs=args.consolidate_epochs, isolator=isolator,
-                        dom_head=dom_head)
+                        dom_head=dom_head, task_class_counts=n_classes_per_task)
             print(f"  [consolidate] {args.consolidate_epochs} passes over "
                   f"{len(replay)} exemplars ({time.time()-t0c:.0f}s)")
 
@@ -1980,7 +2137,7 @@ def main():
         #   A_auto[i][j] - Domain-IL / Class-IL (autonomous centroid router prediction)
         #   A_live[i][j] - Standard CL (current mutable live weights, no snapshot)
         for j in range(i + 1):
-            _, el = get_task_data(tasks[j], os.path.join(_ROOT, "data"))
+            _, el = get_task_data(tasks[j], args.data_root)
             use_route = all(slots[k] is not None for k in range(i + 1))
             pi_mask_j = None
             if hasattr(model, 'K'):
@@ -1995,7 +2152,8 @@ def main():
                                       slots=(slots[:i + 1] if use_route else None),
                                       snaps=(dom_snaps[:i + 1] if use_route else None),
                                       route_tau=args.route_tau, dom_truth=j,
-                                      pi_mask=pi_mask_j, amb_topk=args.amb_topk)
+                                      pi_mask=pi_mask_j, amb_topk=args.amb_topk,
+                                      n_classes=n_classes_per_task[j])
 
             # Domain-IL (Autonomous routing via Centroid / dom_head without truth)
             acc_auto = acc_oracle
@@ -2025,10 +2183,12 @@ def main():
                     pi_mask=None, amb_topk=args.amb_topk,
                     auto_live_thresh=args.auto_live_thresh,
                     route_per_task=args.route_per_task, route_truth=j,
-                    proto_row_ranges=ranges)
+                    proto_row_ranges=ranges,
+                    n_classes=n_classes_per_task[j])
 
             # Live mutable supernet
-            acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j)
+            acc_live, _ = evaluate(model, el, device, amp_dtype, pi_mask=pi_mask_j,
+                                   n_classes=n_classes_per_task[j])
 
             A[i][j] = acc_oracle
             A_auto[i][j] = acc_auto

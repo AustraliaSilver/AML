@@ -27,7 +27,7 @@ python -m unittest discover tests
 ```
 
 Expected result: everything passes cleanly — `10 passed in ~7s` for the first
-command, `Ran 257 tests in ~59s` / `OK` for the second (the exact counts grow as
+command, `Ran 279 tests in ~62s` / `OK` for the second (the exact counts grow as
 tests are added; zero failures is the contract). GPU-only tests skip on a
 CPU-only machine.
 
@@ -167,6 +167,34 @@ Expected output confirms severe memory erasure in standard static networks vs AM
 | **Vision Transformer (ViT)** | 39.17% | 12.21% \| 19.31% | 17.79% \| 11.48% \| 46.82% | 25.36% | 14.61% |
 | **AML Live Weights** | 72.54% | 41.41% \| 42.44% | 8.89% \| 13.10% \| 75.93% | 32.64% | 46.50% |
 | **AML 18-Layer Hybrid (Ours)** | **92.83%** | **92.83% \| 45.96%** | **92.83% \| 45.96% \| 87.58%** | **75.46%** | **0.00%** |
+
+---
+
+### Option E: Extended sequence — CIFAR-10 → CIFAR-100 → Tiny ImageNet
+
+A harder sequence: three tasks with different class counts (10 / 100 / 200) and a
+resolution change (32x32 → 32x32 → 64x64).
+
+```bash
+python train_continual_aml.py \
+  --tasks cifar10,cifar100,tinyimagenet \
+  --epochs 20,30,10 \
+  --replay-per-class 0 --norm in --encoder-tail-act none \
+  --arch-lr 3e-3 --depth-cost 0.02 \
+  --data-root data
+```
+
+The supernet keeps **one shared classifier head** of width `max(n_classes)` = 200;
+each task trains and is read back on its own class range `[0, n)`, and each task
+keeps its native resolution (its class count and input size come from
+`mgn/datasets.py`). `--data-root` may be an `os.pathsep`-separated list, so the
+datasets can live in separate mounts; a Kaggle 2xT4 walkthrough is in
+`notebooks/kaggle_continual_aml.ipynb`.
+
+> This sequence is **not** part of the paper's protocol and its numbers are not
+> reported anywhere in this repository yet. The matrices in §3 remain the
+> MNIST/CIFAR-10/Fashion run. Tiny ImageNet at 64x64 dominates the runtime
+> (~12.5 s/step on an RTX 3050 Laptop), so budget hours, not minutes.
 
 ---
 

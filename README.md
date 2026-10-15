@@ -110,6 +110,33 @@ shipped default configuration. An earlier version of this block passed
 tables below — it is the EWC ablation, reported (with its caveat) in the
 limitations section at the end of this file.
 
+#### Other task sequences (CIFAR-100, Tiny ImageNet)
+
+`--tasks` accepts any sequence of the registered tasks — `mnist`, `fashion`,
+`cifar10`, `cifar100`, `tinyimagenet` (single source of truth: `mgn/datasets.py`).
+The supernet always has **one shared classifier head** of width `max(n_classes)`
+over the sequence, and each task is trained and read back on its own class range
+`[0, n)`, so a 10-class and a 200-class task can share the model without a
+per-task head width (which would change every offset in the flat prototype
+layout). Each task keeps its native resolution (32×32 for MNIST/CIFAR, 64×64 for
+Tiny ImageNet): the trunk is resolution-agnostic.
+
+```bash
+python train_continual_aml.py --tasks cifar10,cifar100,tinyimagenet \
+  --epochs 20,30,20 --replay-per-class 0 --norm in \
+  --encoder-tail-act none --arch-lr 3e-3 --depth-cost 0.02
+```
+
+The default sequence above is unchanged: MNIST, CIFAR-10 and Fashion all have 10
+classes, `max(10) = 10`, and the §3.1–§3.2 numbers are bit-identical to before
+this option existed. Tiny ImageNet is read from disk (torchvision has no
+downloader for it), and `--data-root` may be an `os.pathsep`-separated list, so
+the datasets can live in separate mounts. For a Kaggle 2×T4 walkthrough see
+[`notebooks/kaggle_continual_aml.ipynb`](notebooks/kaggle_continual_aml.ipynb).
+
+> The CIFAR-100 and Tiny ImageNet cells have **not** been run to convergence for
+> this README. §3.1–§3.2 remain the MNIST/CIFAR-10/Fashion protocol.
+
 Measured on **NVIDIA GeForce RTX 3050 Laptop GPU**, `bfloat16`, `--replay-per-class 0`.
 
 ### 3.1a Full production run (2026-10-15, final)
@@ -556,7 +583,7 @@ Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 
 ```text
 ├── train.py                    # Live 18-layer ConvAML_CIFAR_TrueDynamic trainer (bi-level DARTS loop)
-├── train_continual_aml.py      # 3-task continual pipeline (ProtoIsolator + int8 snapshots + EWC)
+├── train_continual_aml.py      # Multi-task continual pipeline (ProtoIsolator + int8 snapshots + EWC)
 ├── compare_architectures.py    # Static-vs-dynamic architecture comparison
 ├── quickstart_aml.py           # End-to-end demo: supernet -> extraction -> HtS
 ├── quickstart_hts.py           # Minimal HtS-only demo
@@ -579,6 +606,7 @@ Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 │   ├── evaluator.py            #   Candidate scoring
 │   ├── regularization.py       #   Structural regularizers
 │   ├── architecture.py         #   ModelStructure / GeneratedModel dataclasses
+│   ├── datasets.py             #   Per-task registry: class count, native resolution, Tiny ImageNet loader
 │   ├── tests/                  #   Kernel correctness + speed benchmarks (CUDA required)
 │   ├── accel/                  #   Fused CUDA ops (built by build_ext.py into _C*.ext)
 │   └── csrc/                   #   CUDA/C++ sources for the extensions
@@ -598,6 +626,7 @@ Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 │   └── benchmark_hts_baselines.py             # HtS continual-learning baselines
 ├── benchmarks/                 # Standalone comparison + profiling scripts
 ├── probes/                     # Ad-hoc causal probes used during development
+├── notebooks/                  # Kaggle / Colab walkthroughs (kaggle_continual_aml.ipynb)
 ├── tests/                      # Unit/integration suite (CPU-safe, incl. train() smoke)
 ├── paper_and_documents/        # LaTeX paper source + compiled PDF
 └── data/                       # Datasets (gitignored; auto-downloaded by torchvision)
