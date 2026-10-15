@@ -56,6 +56,36 @@ class TestPackageImports(unittest.TestCase):
         self.assertTrue(hasattr(mod, "extract_child_hybrid18"))
         self.assertEqual(pathlib.Path(mod.__file__).parent.name, "AML_Core_Code")
 
+    def test_every_shipped_script_imports(self):
+        """Scripts are the documented entry points and nothing else imports
+        them, so a rename in the library breaks the reproduction commands while
+        every test stays green.
+
+        Importing them is safe because each is guarded by `if __name__ ==
+        "__main__"`; a module that runs work at import raises SystemExit here
+        and fails the test, which is the signal we want.
+        """
+        import importlib.util
+        import sys
+
+        scripts = [
+            "train.py", "train_hybrid_aml.py", "compare_architectures.py",
+            "quickstart_aml.py", "quickstart_hts.py", "verify_env.py",
+            "benchmarks/benchmark_cl_comparison.py",
+            "benchmarks/benchmark_cl_aml_vs_hts.py",
+            "experiments/noreplay_cl.py",
+        ]
+        for rel in scripts:
+            path = ROOT / rel
+            with self.subTest(script=rel):
+                self.assertTrue(path.is_file(), f"{rel} is referenced but missing")
+                if str(path.parent) not in sys.path:
+                    sys.path.insert(0, str(path.parent))
+                spec = importlib.util.spec_from_file_location(
+                    "_probe_" + path.stem, path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)   # SystemExit => work at import
+
 
 if __name__ == "__main__":
     unittest.main()
