@@ -11,9 +11,26 @@ import torch
 import torch.nn.functional as F  # noqa: F401  (kept for parity of imports in traces)
 from torch.autograd import Function
 import torch._dynamo
-import mgn.accel._Cin as _Cin
+
+# Same lazy-import contract as fused_autograd.py: the extension is a build
+# artifact, so the module must import on a CPU-only checkout and fail only at
+# the call that actually needs the kernel.
+try:
+    import mgn.accel._Cin as _Cin
+    _CIN_IMPORT_ERROR = None
+except ImportError as _e:            # pragma: no cover - depends on the host
+    _Cin = None
+    _CIN_IMPORT_ERROR = _e
 
 from .fused_autograd import pipeline_backward
+
+
+def _require_Cin():
+    if _Cin is None:
+        raise ImportError(
+            "the InstanceNorm fused extension (mgn.accel._Cin) is not available; "
+            "build it with `python build_ext.py _Cin` on a CUDA host, or use the "
+            "pure-PyTorch path") from _CIN_IMPORT_ERROR
 
 
 class FusedPipelineFunctionIN(Function):
@@ -38,6 +55,8 @@ class FusedPipelineFunctionIN(Function):
         ctx.b2_offsets = b2_offsets
         ctx.numel_proto_w = [C_outs[i] * C_ins[i] * 9 for i in range(L)]
         ctx.norm_mode = "in"
+
+        _require_Cin()
 
         X_f = X.float().contiguous()
         proto_f = prototypes.float().contiguous()
@@ -66,5 +85,6 @@ class FusedPipelineFunctionIN(Function):
     @staticmethod
     @torch._dynamo.disable
     def backward(ctx, grad_output):
+        _require_Cin()
         return pipeline_backward(ctx, grad_output, _Cin.in_maxpool2x2_bwd,
                                  ctx.norm_mode)

@@ -23,13 +23,34 @@ postmortem: kernels must never write into non-contiguous select() views.
 import torch
 import torch.nn.functional as F
 from torch.autograd import Function
-import mgn.accel._C as _C
+
+# The compiled extension is a build artifact and is absent on a CPU-only
+# checkout (`pip install -e .` without `python build_ext.py`). Importing this
+# module must still work there: mgn/executor.py and train_cv_cifar_18.py both
+# wrap the import in try/except and fall back to the pure-PyTorch path, so a
+# hard ModuleNotFoundError here would make a missing OPTIONAL kernel look like a
+# broken package. The failure is deferred to the call that actually needs it.
+try:
+    import mgn.accel._C as _C
+    _C_IMPORT_ERROR = None
+except ImportError as _e:            # pragma: no cover - depends on the host
+    _C = None
+    _C_IMPORT_ERROR = _e
+
+
+def _require_C():
+    if _C is None:
+        raise ImportError(
+            "the fused CUDA extension (mgn.accel._C) is not available; build it "
+            "with `python build_ext.py` on a CUDA host, or use the pure-PyTorch "
+            "path") from _C_IMPORT_ERROR
+
 
 # v2 fused mix-backward kernels (added 9/15). Optional: an older _C build
 # without them falls back to the ATen-recompute path below, bit-identical
 # to the pre-kernel code.
-_CMIX_A = getattr(_C, "mix_bwd_v2_a", None)
-_CMIX_B = getattr(_C, "mix_bwd_v2_b", None)
+_CMIX_A = getattr(_C, "mix_bwd_v2_a", None) if _C is not None else None
+_CMIX_B = getattr(_C, "mix_bwd_v2_b", None) if _C is not None else None
 
 import torch._dynamo
 
@@ -62,9 +83,9 @@ def _norm_stats(t, norm_mode):
 def _norm_bwd(g, raw, mean, rstd, norm_mode):
     """Fused d(raw) for the weightless norms: native CUDA backward kernel."""
     B, C, H, W = raw.shape
-    if norm_mode == "gn1" and hasattr(_C, "group_norm1_bwd"):
+    if norm_mode == "gn1" and _C is not None and hasattr(_C, "group_norm1_bwd"):
         return _C.group_norm1_bwd(g, raw, mean, rstd, B, C, H, W)
-    elif norm_mode == "in" and hasattr(_C, "instance_norm_bwd"):
+    elif norm_mode == "in" and _C is not None and hasattr(_C, "instance_norm_bwd"):
         return _C.instance_norm_bwd(g, raw, mean, rstd, B, C, H, W)
     gg = torch.ops.aten.native_group_norm_backward(
         g.reshape(B, C * H * W), raw.reshape(B, C * H * W), mean, rstd,
@@ -300,6 +321,8 @@ class FusedPipelineFunction(Function):
         ctx.numel_proto_w = [C_outs[i] * C_ins[i] * 9 for i in range(L)]
         ctx.norm_mode = "gn1"
 
+        _require_C()
+
         X_f = X.float().contiguous()
         proto_f = prototypes.float().contiguous()
         pi_f = pi.float().contiguous()
@@ -327,4 +350,5 @@ class FusedPipelineFunction(Function):
     @staticmethod
     @torch._dynamo.disable
     def backward(ctx, grad_output):
+        _require_C()
         return pipeline_backward(ctx, grad_output, _C.maxpool2x2_bwd, ctx.norm_mode)
