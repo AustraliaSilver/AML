@@ -1624,19 +1624,36 @@ pass of that task's data taken with the encoder in its \emph{final} state:
 \begin{equation}
     \mu_t = \frac{1}{N_t}\sum_{i=1}^{N_t} \tilde{z}_i, \qquad \text{where } \tilde{z} = \frac{\phi(x)}{\|\phi(x)\|_2}
 \end{equation}
-Domain assignment is a Mahalanobis rule rather than a cosine similarity:
+Domain assignment is a tempered Mahalanobis rule rather than a cosine similarity:
 \begin{equation}
-    \hat{t} = \arg\min_{t} \; (\tilde{z}-\mu_t)^\top S_t^{-1} (\tilde{z}-\mu_t),
-    \qquad S_t = (1-\alpha)\,S^{(t)} + \alpha\,S_{\mathrm{pooled}},
+    \hat{t} = \arg\min_{t} \;
+    \Bigl[(\tilde{z}-\mu_t)^\top S_t^{-1} (\tilde{z}-\mu_t)
+    + \beta \log|S_t|\Bigr],
+    \qquad \beta = 0.5,
+    \label{eq:router}
 \end{equation}
-where $S^{(t)}$ is the second moment of task $t$'s own features and
-$S_{\mathrm{pooled}}$ the same quantity summed over all seen tasks
-($\alpha = 0.15$, measured). A query is embedded by \emph{each} candidate's own
-encoder before scoring, because $\mu_t$ lives in the feature space that encoder
-produced; comparing it against a differently-encoded query measures encoder
-drift rather than domain identity. No exemplar is stored: the router keeps $T$
-centroids and $T$ second-moment matrices, i.e.\ $O(T)$ statistics and zero
-images.
+where $S_t = (1-\alpha)\,S^{(t)} + \alpha\,S_{\mathrm{pooled}}$ is the shrunk
+second moment of task $t$'s own features $S^{(t)}$ mixed with the pooled moment
+$S_{\mathrm{pooled}}$ at $\alpha = 0$. A query is embedded by \emph{each}
+candidate's own encoder before scoring, because $\mu_t$ lives in the feature
+space that encoder produced; comparing it against a differently-encoded query
+measures encoder drift rather than domain identity. No exemplar is stored: the
+router keeps $T$ centroids and $T$ second-moment matrices, i.e.\ $O(T)$
+statistics and zero images.
+
+Two coefficients in this rule were changed after being measured, and both
+earlier values are withdrawn. \textbf{(i) $\alpha$: reported as $0.15$ in an
+earlier version of this section, now $0$.} Mixing the pooled moment into each
+task's own was a fix for the wrong diagnosis and made routing \emph{worse}:
+mean routing accuracy over the three domains falls monotonically in $\alpha$,
+from $97.52\%$ at $\alpha=0$ to $85.50\%$, $74.95\%$ and $64.83\%$ at
+$\alpha=0.25,0.5,1.0$. The flag remains because the sweep is the evidence that
+holds it at zero. \textbf{(ii) $\beta$: the log-determinant term is required.}
+Without it a broadly spread domain wins every query ($34.18\%$ with per-task
+covariances alone); at full Gaussian weight it over-corrects ($90.93\%$), and
+$\beta=0.5$ is the measured optimum ($97.52\%$). An earlier version of
+Eq.~\ref{eq:router} omitted the term that the paper's own ablation shows is
+necessary.
 
 Two properties of this rule were established by measurement rather than by
 construction, and both are reported because they are easy to get backwards.
@@ -1710,7 +1727,8 @@ whose domain the router assigned correctly.
 \begin{table}[h]
 \centering
 \caption{\textbf{Full production schedule ($5,28,16$ epochs, zero replay, seed 42).}
-Three protocols on the same run: live mutable weights, task-oracle snapshot
+Three protocols on the same run: live mutable weights (given the true
+task's rows), task-oracle snapshot
 retrieval, and fully autonomous routing. Route accuracy is reported per cell so
 that a loss in $A_{\mathrm{auto}}$ can be attributed to the router rather than
 to the snapshot it retrieves.}
@@ -1720,7 +1738,7 @@ to the snapshot it retrieves.}
 \toprule
 \textbf{Protocol} & \textbf{$A_{\text{avg}}$} & \textbf{BWT} & \textbf{Forgetting} & \textbf{worst route acc} & \textbf{MNIST after task 3} \\
 \midrule
-$A_{\mathrm{live}}$ (mutable weights) & $47.49\%$ & $-58.71\%$ & $58.71\%$ & -- & $23.78\%$ \\
+$A_{\mathrm{live}}$ (mutable, true rows) & $47.49\%$ & $-58.71\%$ & $58.71\%$ & -- & $23.78\%$ \\
 $A_{\mathrm{auto}}$ (autonomous router) & $81.96\%$ & $-6.34\%$ & $6.34\%$ & $89.02\%$ & $88.96\%$ \\
 $A_{\mathrm{oracle}}$ (task id given) & $\mathbf{86.19\%}$ & $\mathbf{+0.00\%}$ & $\mathbf{0.00\%}$ & -- & $\mathbf{98.54\%}$ \\
 \bottomrule
@@ -1738,6 +1756,19 @@ every stage-2 cell and $89.02\%$, $95.00\%$ and $99.97\%$ at stage 3, and
 $A_{\mathrm{auto}}$ rises from $50.31\%$ to $81.96\%$ once the metric and the
 fitting split are corrected. Two corrections were required, and both are
 reported because the first version of each was wrong.
+
+\paragraph{A note on the live baseline.} $A_{\mathrm{live}}$ is
+evaluated with the true task's prototype-row range supplied, so it is
+\emph{task-aware}: like $A_{\mathrm{oracle}}$ it is told which task's
+read-out the image belongs to, and unlike $A_{\mathrm{auto}}$ it is never
+required to infer it. The $38.7$ point gap to $A_{\mathrm{oracle}}$
+therefore measures the cost of discarding the snapshot, not the cost of
+routing, and the $A_{\mathrm{auto}}$--$A_{\mathrm{live}}$ comparison is
+not a like-for-like test of the router. The routing question is answered
+by the $A_{\mathrm{auto}}$--$A_{\mathrm{oracle}}$ gap alone ($4.23$
+points on this run), which holds the task identity fixed.
+
+
 
 \emph{The metric.} Scoring every candidate against one covariance pooled over all
 seen tasks compares three feature spaces that share only a dimension, because a

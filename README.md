@@ -99,10 +99,16 @@ Classifier head: 4 × 4 spatial pooling (768-d) → `LayerNorm` → `Dropout(0.1
 **MNIST → CIFAR-10 → Fashion-MNIST**, no replay exemplars.
 
 ```bash
-python train_continual_aml.py --model-type hybrid18 \
-  --tasks mnist,cifar10,fashion --epochs 5,28,16 \
-  --replay-per-class 0 --router-type centroid --ewc-lambda 100
+python train_continual_aml.py --tasks mnist,cifar10,fashion \
+  --epochs 5,28,16 --replay-per-class 0 --norm in \
+  --encoder-tail-act none --arch-lr 3e-3 --depth-cost 0.02
 ```
+
+This is the command that produced every number in §3.1–§3.2 and it is the
+shipped default configuration. An earlier version of this block passed
+`--ewc-lambda 100`; that is *not* the default and it does not reproduce the
+tables below — it is the EWC ablation, reported (with its caveat) in the
+limitations section at the end of this file.
 
 Measured on **NVIDIA GeForce RTX 3050 Laptop GPU**, `bfloat16`, `--replay-per-class 0`.
 
@@ -129,7 +135,7 @@ Every other setting is the shipped default: `--ewc-lambda 0` (disabled),
 
 **A_avg = 86.19 % · BWT = +0.00 % · Forgetting = 0.00 %**
 
-**`A_live` — standard mutable weights, no snapshot**
+**`A_live` — standard mutable weights, no snapshot, but given the true task's prototype rows (task-aware)**
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
@@ -138,6 +144,15 @@ Every other setting is the shipped default: `--ewc-lambda 0` (disabled),
 | after Fashion | 23.78 % | 26.21 % | 92.47 % |
 
 **A_avg = 47.49 % · BWT = −58.71 % · Forgetting = 58.71 %**
+
+> **Protocol note (added 2026-10-15).** `A_live` is evaluated with
+> `pi_mask` set to the **true** task's prototype-row range, so it is told
+> which task's read-out rows to use. `A_auto` is not told. The two numbers
+> therefore differ in two ways at once — snapshot retention *and* task
+> identity — so the `A_auto`/`A_live` gap is not a like-for-like test of
+> the router. The like-for-like comparisons are `A_auto` vs `A_oracle`
+> (both snapshot-based, both given a task identity; 4.23 points on this
+> run) and `A_live`'s own forgetting under continuous fine-tuning.
 
 **`A_auto` — autonomous router, no task identity**
 
@@ -258,6 +273,18 @@ exemplars**: these are second moments, not images.
 The 2026-10-14 run reached **8.01 %** on MNIST after CIFAR-10 against an oracle
 of 97.94 %; the middle column is the run whose router was fitted on the test
 split, which is not a legitimate protocol (§3.4a). Cite the final column.
+
+> **Caveat added 2026-10-15 (audit B46/B47) — the final column was measured on a
+> pre-fix evaluation path.** Two evaluation defects were found and fixed after
+> this run. (1) The ambiguous-sample retry evaluated a snapshot's weights under
+> the **predicted** domain's structure slot instead of the retried domain's
+> (B46); the branch runs by default (`--route-tau 0.6`, `--amb-topk 0`) and had
+> no test that reached it. (2) The per-sample candidate dispatch dropped the
+> routing weight, so a sample's output depended on which other samples shared
+> its batch (B47). Both are fixed and now tested. `A_auto` 81.96 % / 6.34 % and
+> the `route_acc` figures are therefore **pre-fix** and have not been
+> re-measured; see audit entries B46-B47 and open items 7-9 in
+> `experiments/dynamic_depth_routing_2026-10-14.md`.
 
 > **Two negative results from the 2026-10-14 run, stated plainly.**
 >

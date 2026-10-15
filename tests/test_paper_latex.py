@@ -130,5 +130,46 @@ class TestPaperLatex(unittest.TestCase):
         self.assertIn("single-group normalization", self.text)
 
 
+    def test_router_equation_matches_the_shipped_defaults(self):
+        """The routing equation is a *configuration* claim, and it drifted.
+
+        It was written for a pooled-plus-per-task covariance with
+        ``alpha = 0.15, measured``. That is neither the shipped default nor the
+        measured optimum: mixing the pooled moment into each task's own
+        monotonically degrades routing (97.52 % at alpha = 0 down to 64.83 % at
+        alpha = 1). The equation also omitted the log-determinant term that the
+        paper's own ablation table shows is required (34.18 % without it,
+        97.52 % at beta = 0.5). Both are cross-checked here against the shipped
+        argument parser, so prose and code cannot diverge again.
+        """
+        import pathlib
+        import sys
+        root = pathlib.Path(__file__).resolve().parent.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import train_continual_aml as T
+
+        a = T.build_arg_parser().parse_args([])
+        self.assertEqual(a.router_metric, "mahalanobis-task")
+        self.assertEqual(a.router_cov_alpha, 0.0,
+                         "the paper now states alpha = 0")
+        self.assertEqual(a.router_logdet_weight, 0.5,
+                         "the paper now states beta = 0.5")
+        self.assertIn("\\beta = 0.5", self.text)
+        self.assertIn("\\beta \\log|S_t|", self.text)
+        self.assertNotIn("$\\alpha = 0.15$, measured", self.text)
+        self.assertIn("withdrawn", self.text)
+
+    def test_live_baseline_is_described_as_task_aware(self):
+        """A_live is evaluated with the true task's prototype-row range, so it
+        is task-aware: it is told which task's read-out the image belongs to,
+        which A_auto must infer. Describing it as a plain no-snapshot baseline
+        makes the A_auto/A_live gap look like the cost of routing when part of
+        it is the cost of not being handed the task id."""
+        self.assertIn("A note on the live baseline", self.text)
+        self.assertIn("task-aware", self.text)
+        self.assertIn("mutable, true rows", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()

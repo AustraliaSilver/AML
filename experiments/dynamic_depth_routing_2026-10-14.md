@@ -1377,6 +1377,132 @@ ones — the domain router's one-directional error and the single-seed caveat.
 `8{\times}8` token-pooling claim, and on the paper and the shipped normalisation
 default disagreeing.
 
+**B46 (high) — the ambiguous retry ran one domain's weights under another
+domain's architecture, and it runs by default.**
+
+`evaluate`'s ambiguous path (samples whose router margin is below `route_tau`)
+loads snapshot `d`'s weights and restricts the sample to `d`'s prototype rows --
+but built `struct_override` from `gates_b = g[d_pred]` / `block_b = b[d_pred]`,
+i.e. the structure slot of the router's *argmax*, not of the domain being
+retried. Domain `d`'s weights were therefore evaluated with domain `d_pred`'s
+layer gates and block modes. `slots[d]` is produced by `collect_structure_slot`
+from `d`'s own data with `d`'s own weights, so it describes `d` and nothing
+else; the rows and the weights in that call belong to `d`, so the structure has
+to as well.
+
+This is not a corner case: `route_tau` defaults to `0.6` and `amb_topk` to `0`,
+so every seen domain is retried for every ambiguous sample on every default
+run. Nothing caught it because the existing end-to-end test builds a router
+whose logits are +/-50, giving a margin of ~1.0, which is never ambiguous at
+0.6 -- the branch was structurally untested.
+
+Fixed by building the retry's override from `g[d]` / `b[d]` expanded over the
+ambiguous sub-batch; `test_ambiguous_retry_uses_the_retried_domain_s_slot`
+records the gates actually handed to the model and asserts each retry used its
+own slot (verified to fail on the old code). In the same function, `out` and
+`best_out` were `torch.empty`: a row nothing writes is returned as
+uninitialised memory. Both are `torch.zeros` now. `best_out` only happened to be
+safe because the first snapshot writes every row; `out`'s coverage depends on
+`len(snaps) == len(slots)`, which nothing enforces.
+
+**B47 (medium) — the per-sample candidate dispatch dropped the routing weight,
+so a sample's output depended on its batch neighbours.**
+
+`HybridBlock.forward` has two hard fast paths. The whole-batch one returns
+`cand * mode_weights[:, chosen]`; the per-sample dispatch returned the branch
+output unscaled. `all_hard` is `max > 0.99`, not `== 1.0`, so with weights like
+`(0.001, 0.004, 0.995)` the same input produced `0.995*y` when its batch agreed
+on a mode and `y` when it did not: a ~0.5 % amplitude change that is a function
+of batching, not of the model. Measured max abs difference `2.16e-2` on outputs
+of order `1e1`. Fixed by scaling each gathered row by its own weight, which
+makes the two paths agree. All existing routing tests use exactly one-hot
+weights, where `1.0*y == y` and the defect is invisible;
+`test_per_sample_dispatch_is_batch_composition_invariant` uses 0.995.
+
+**B48 (medium, measurement integrity) — A_live was handed the true task id
+while the README called it the no-task-id baseline.**
+
+`evaluate`'s `pi_mask` is the task's prototype-row range. `A_live` is evaluated
+with `pi_mask_j` (`dom_head` is None, so no routing), i.e. it is *told* which
+task's read-out to use; `A_auto` must infer it. Every "A_auto is below A_live, so
+misrouting costs more than it gains" statement therefore compares a task-aware
+baseline against a task-agnostic one. The number is not wrong -- it is the right
+number for *task-aware* sequential fine-tuning -- the label was. README, the
+paper's table and caption, and `evaluate`'s docstring now say task-aware
+explicitly, and the paper gains a paragraph stating that the like-for-like
+routing comparison is `A_auto` vs `A_oracle`.
+Guarded by `test_live_baseline_is_described_as_task_aware`.
+
+**B49 (medium, measurement coverage) — raising the channel cap made the fused
+backward reachable at the production width, and nothing tested that width.**
+
+The v1 guard `256 % C == 0` was a leftover; the v2 kernel walks channels
+sequentially and needs only `C <= MB_MAX_C`. Relaxing it to `C <= 1024` made the
+fused backward reachable at the shipped `--max-dim 48` for the first time (at 48,
+`256 % 48 == 16`). But `validate_ext_in.py`'s `build_case` defaults to `D=64`,
+and 64 divides 256: every case in the only numeric suite covering the kernel
+satisfied the *old* constraint, so the suite could not have detected a
+C-dependent bug even if one existed, and the production width appeared nowhere in
+it. The kernel turned out to be correct; the gap was in the evidence, and it was
+created by the same change that made the path live. Section `[5]` now gates
+gradient parity at non-divisor widths (asserting `256 % D != 0`) and the forward
+at the production shape. Measured on the RTX 3050:
+
+```
+D= 48 (256 % 48 =  16): fwd=0.00703  worst_grad=0.11178 (noise 0.16759, tol 0.25138)  OK
+D= 40 (256 % 40 =  16): fwd=0.00551  worst_grad=0.09837 (noise 0.11463, tol 0.17194)  OK
+D= 96 (256 % 96 =  64): fwd=0.00542  worst_grad=0.08898 (noise 0.10927, tol 0.16390)  OK
+L=18 D=48 (production) : rel_err 0.18970 (reference noise 0.21123, tol 0.31684)  OK
+```
+
+**B50 (low, precision -- measured, not assumed) — `--snap-q8` defaults to 1 and
+its quantisation step is global.**
+
+Every stored snapshot's prototype matrix is int8 with **one** scale per matrix
+(`scale = max|P| / 127`). On the real checkpoints the maximum is a single element
+in a row that `ProtoIsolator` froze after task 0 (`proto_weights[3, 6718] =
++0.2257`, identical in all three snapshots), so later tasks are quantised at a
+resolution set by task 0's largest weight; the median non-zero element's
+worst-case relative error is 2.6 % and 1.4 % of elements quantise to zero.
+`probes/probe_snapshot_quant.py` evaluates the stored matrices exactly as the
+protocol does, then re-quantises the same values to 16 bits: **accuracy is
+identical for every snapshot** (MNIST 98.59 % / 98.59 %; the Fashion artefact's
+three snapshots 11.65/11.65, 4.31/4.31, 92.51/92.51 on 10 000 test images). So
+the default is defensible, but it was an unstated lossy step inside the headline
+protocol, and now it is measured rather than assumed.
+
+**B51 (low) — `--max-dim` below 16 silently disabled width routing.**
+
+`d_lengths = clamp(sigmoid(...) * max_dim, min=16.0)`, so when `max_dim < 16` the
+clamp binds for every sample: `dim_masks` saturates near 1.0 (every channel
+always active) while `dim_weights = d_lengths / max_dim` exceeds 1.0 and
+over-reports effective width. Shrinking the model looked like it worked. A
+`UserWarning` at construction now says so, and
+`test_max_dim_below_the_width_floor_is_not_silent` asserts both the warning and
+the saturation (`max_dim = 48`, the default, stays quiet).
+
+**B52 (medium, honesty) — the paper's routing equation stated a coefficient the
+code had stopped using and omitted one it needs.**
+
+The equation carried `\alpha = 0.15, measured`. `--router-cov-alpha` defaults to
+0, and the sweep in the trainer shows routing degrades *monotonically* in alpha
+(97.52 / 85.50 / 74.95 / 64.83 % at 0 / 0.25 / 0.5 / 1.0) because the pooled
+moment mixes three feature spaces (B40) -- so 0.15 was a wrong fix for a
+misdiagnosis, presented as measured. The equation also omitted
+`\beta \log|S_t|`, the term the paper's own ablation table shows is required
+(34.18 % without it, 97.52 % at beta = 0.5). Both corrected in place and named as
+withdrawn; the equation is now `\label{eq:router}` with the shipped
+alpha = 0 and beta = 0.5.
+`test_router_equation_matches_the_shipped_defaults` cross-checks the parser.
+
+**B53 (low, docs) — section 3.1's command did not reproduce section 3.1's
+table.**
+
+The block passed `--ewc-lambda 100`; two lines below it the text says the shipped
+default is `--ewc-lambda 0`, and EWC-on is the ablation the limitations section
+reports as *increasing* forgetting. The block now carries the canonical default
+command and names the EWC run as the ablation it is.
+
 ---
 
 ## 11. Open items, stated as open
@@ -1417,3 +1543,21 @@ Written down so that "not done" is not later mistaken for "not noticed".
 6. **Benchmark scripts are not part of CI.** `benchmarks/` and `probes/` are run
    manually; the import smoke test guarantees they at least *import*, but their
    numerics remain unverified by CI.
+7. **The 2026-10-15 production numbers predate B46 and B47, and have not been
+   re-measured.** `A_auto` 81.96 % / 6.34 % was produced while the ambiguous
+   retry used the router's *predicted* domain's structure slot (B46) and while
+   the per-sample dispatch dropped the routing weight (B47). Both touch the
+   evaluation path; neither is expected to move the headline (the retry only
+   fires below a 0.6 margin and routing accuracy is 89--100 %), but "expected to
+   be small" is not a measurement, and the affected direction is not known. The
+   numbers stand as the pre-fix measurement and a re-run is the way to close it.
+8. **A_live is task-aware, and the task-agnostic live number has never been
+   measured (B48).** The honest way to size the task-identity component of the
+   `A_auto`/`A_live` gap is to log a second live variant evaluated with
+   `pi_mask=None`; that variant has not been run, so the gap is still reported as
+   two effects together.
+9. **The corrected ambiguous retry has only a synthetic test.** The branch was
+   wrong for the entire production run, and the fix is pinned by a unit test that
+   forces the branch on a CPU fixture. Nothing exercises it on real checkpoints
+   at scale, so a second defect in the same block would still show up first as a
+   routing number rather than as a test failure.
