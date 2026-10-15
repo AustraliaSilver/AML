@@ -1804,7 +1804,12 @@ def main():
             # offline, which is slow and, repeatedly, wrong.
             ra = fp_auto.get("route_acc") if fp_auto else None
             rt = f" | route_acc {ra*100:.2f}%" if ra is not None else ""
-            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): auto: {acc_auto*100:.2f}% | oracle: {acc_oracle*100:.2f}% | live: {acc_live*100:.2f}%{lf}{rt}", flush=True)
+            # Where the misrouted samples actually went. route_acc alone says
+            # "6% wrong"; the histogram says "6% went to CIFAR", which is the
+            # difference between an overlap problem and a collapsed router.
+            rh = fp_auto.get("route_hist") if fp_auto else None
+            rhs = f" | route_hist [{','.join(str(int(v)) for v in rh)}]" if rh is not None else ""
+            print(f"  A[{i+1},{j+1}] ({tasks[j]}, {tag}): auto: {acc_auto*100:.2f}% | oracle: {acc_oracle*100:.2f}% | live: {acc_live*100:.2f}%{lf}{rt}{rhs}", flush=True)
 
         torch.save(model.state_dict(), os.path.join(_ROOT, f"aml_continual_after_{name}.pth"))
 
