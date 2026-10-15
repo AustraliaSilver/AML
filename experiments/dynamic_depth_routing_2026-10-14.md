@@ -1737,7 +1737,12 @@ indices and the contiguity fix do not move the fused numerics.
   nothing: their exports do not appear in `bindings.cpp`,
   `fused_norm_relu_gate.cu` existed only to satisfy `fused_chain_conv.cu`, and
   even the latter's declared `tiled_conv_fwd_launcher` was never called. Removed
-  from `setup.py` and `build_ext.py` and deleted (486 lines).
+  from `setup.py` and `build_ext.py` and deleted (486 lines). Verified after the
+  removal: the sdist still builds (78 members, the 11 remaining `mgn/csrc` files
+  present, none of the three removed files present), and `publish.yml` looks for
+  `mgn/csrc/bindings.cpp` by name rather than a count, so the release path is
+  unaffected. (B55's "14 csrc files" was accurate when it was written; the count
+  is 11 now.)
 
 **B61 (report triage, part 3) — reported defects examined and deliberately NOT
 changed, so that "not fixed" is not mistaken for "not read".**
