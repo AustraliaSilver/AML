@@ -1865,6 +1865,12 @@ Written down so that "not done" is not later mistaken for "not noticed".
     (owner, repository, workflow `publish.yml`, environment `pypi`) and the
     `v2.0.0` tag must match `pyproject.toml`, which it does. Until that runs,
     "run it on another machine" means installing from TestPyPI, not from PyPI.
+    **Held, on the owner's instruction (2026-10-15):** no `v*` tag exists locally
+    or on the remote and no `pypi` dispatch has been made, so nothing in this
+    repository will publish to pypi.org by itself. `aml-framework` is still
+    absent from pypi.org -- the JSON endpoint 404s -- i.e. the trusted publisher
+    is configured but no release has been created yet, so the first upload will
+    be a fresh, irreversible creation.
 12. **There are no CUDA wheels, by design, and that is a real cost.** A user on a
     CUDA host must compile the sdist themselves, and nothing exercises that path
     end-to-end in CI: `validate_ext_in.py` runs only when the runner already has a
