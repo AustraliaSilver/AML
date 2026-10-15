@@ -950,11 +950,11 @@ All four tables corrected. The count is norm-dependent, because `conv_has_bias`
 and the norm's own affine pair trade against each other, so it is quoted per
 norm rather than as a single number:
 
-| `norm_type` | parameters | fp32 size |
+| `norm_type` | parameters | fp32 size (MB, 10^6 B) |
 |---|---|---|
-| `bn` | 1,874,073 | 7.15 MB |
-| `gn1` | 1,876,761 | 7.16 MB |
-| **`in` (default)** | **1,871,385** | **7.14 MB** |
+| `bn` | 1,874,073 | 7.50 |
+| `gn1` | 1,876,761 | 7.51 |
+| **`in` (default)** | **1,871,385** | **7.49** |
 
 B5 and B6 were both written by the fix for this task and caught by the tests
 written alongside it — which is the argument for keeping
@@ -1038,6 +1038,32 @@ full snapshot and evaluates each task under its own prototype row range.
 **no optimizer and no loss term**, so autonomous routing there was a fixed random
 projection. It now has its own `AdamW`, a `0.3`-weighted cross-entropy against
 the current task id, and its own gradient-norm clip.
+
+**B37 (perf) — `load_state_dict` was the evaluation bottleneck, not the GPU.**
+`evaluate` swaps the encoder, selector, stem, 18 layers and the head LayerNorm
+once per snapshot per batch. `load_state_dict` re-validates every key and shape
+on each call, so the bookkeeping — not the 1.87 M parameter copy — dominated.
+`apply_state()` copies into the live tensors directly and `state_targets()`
+caches the destination dicts once per `evaluate` call instead of rebuilding
+them per swap. CPU measurement of one full 5-module swap at `--max-dim 48`:
+
+| | per full swap |
+|---|---|
+| `load_state_dict` | 8.32 ms |
+| `apply_state` | 2.04 ms |
+| speedup | **4.08×** |
+
+The saving is per *call*, and `evaluate` makes `len(snaps)` of them per batch in
+both the routing pass and the snapshot pass, so it closes the 4.4 s
+"repeated `load_state_dict`" item from the not-yet-addressed list. Correctness
+is pinned by `tests/test_state_swap.py`: value-for-value equality with
+`load_state_dict`, writes into live storage (parameter identity and `data_ptr`
+unchanged, so an optimizer holding a reference keeps training the right tensor),
+dtype/device mismatch handling for the quantised-snapshot path, and — the one
+that actually matters for the continual protocol — that **all weights are
+bit-identical after `evaluate` returns**. A snapshot left loaded would turn the
+"live weights" protocol into a second oracle run and quietly inflate every
+number in the README.
 
 ---
 
