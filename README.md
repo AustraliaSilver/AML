@@ -563,9 +563,12 @@ Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 ├── validate_ext_in.py          # Numeric parity checks for the fused CUDA kernels
 ├── build_ext.py                # Rebuilds both CUDA extensions (_C, _Cin) from source
 ├── verify_env.py               # GPU / compiler / extension diagnostic
-├── pyproject.toml              # pip install -e . ; [tool.ruff] lint config
+├── pyproject.toml              # pip install -e . ; metadata, [tool.ruff], [tool.pytest]
+├── MANIFEST.in                 # sdist contents: ships mgn/csrc, never a compiled binary
+├── RELEASING.md                # PyPI release guide (trusted publishing, no stored token)
 │
 ├── mgn/                        # AML core library
+│   ├── _selfcheck.py           #   `aml-selfcheck` install smoke test (forward + backward)
 │   ├── blocks/                 #   hybrid_18.py, hybrid_router.py, cnn_block.py, vit_block.py
 │   ├── layout.py               #   CANONICAL flat prototype-weight layout (single source of truth)
 │   ├── generator.py            #   ModelGenerator & PrototypeLibrary (reference impl)
@@ -602,7 +605,28 @@ Stage-by-stage evolution, `A[i,j]` after each sequential stage:
 
 ## 5. Quickstart
 
+### Install the library
+
 ```bash
+pip install aml-framework      # library only; pulls the CPU build of torch
+aml-selfcheck                  # checks the install: imports, forward, backward
+```
+
+The PyPI wheel ships the pure-Python library and its two importable packages
+(`mgn`, `hts_lib`). The fused CUDA kernels are deliberately left out — they are
+compiled per platform, CUDA version and Python ABI, so one wheel cannot serve
+Linux and Windows; `aml-selfcheck` reports whether they are present and prints
+that they are optional. [RELEASING.md](RELEASING.md) covers the release process
+and how to build the kernels from source.
+
+### Install from a clone (demos, trainers, datasets)
+
+The published wheel is the library only: `quickstart_aml.py`, the trainers, the
+datasets and the audit log live in the repository.
+
+```bash
+git clone https://github.com/AustraliaSilver/AML.git && cd AML
+
 # 1. Install in editable mode
 pip install -e .
 
@@ -674,9 +698,12 @@ python -m unittest discover tests                 # CPU-safe tests in tests/
 ## 7. Build, installation & training
 
 ```bash
-# Build CUDA extensions - either
+# Library only, from PyPI (no fused kernels; aml-selfcheck confirms it runs)
+pip install aml-framework
+
+# From a source checkout - editable install, then build the CUDA extensions
 pip install -e .
-python build_ext.py
+python build_ext.py               # or: FORCE_CUDA=1 pip install --no-build-isolation .
 ```
 
 > **Verified toolchain (Windows):** Python 3.12, `torch 2.5.1+cu124`,

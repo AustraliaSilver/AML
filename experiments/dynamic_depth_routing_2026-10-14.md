@@ -1526,6 +1526,78 @@ would move reported numbers, and the honest fix is a re-run with a single,
 explicit augmentation policy. It is stated in `get_task_data`'s docstring and in
 open item 10 below.
 
+**B55 (medium, packaging) — the release artifacts had never been built, and both
+were wrong, in opposite directions.**
+
+The PyPI path was added without ever producing an artifact. Building both on the
+committed tree: the wheel (`aml_framework-2.0.0-py3-none-any.whl`, 44 entries)
+carried the repository's own kernel tests and benchmarks
+(`mgn/tests/benchmark_pipeline.py`, `benchmark_speed.py`, `test_backward.py`,
+`test_fused_conv.py`), while the sdist (89 members) carried **no `mgn/csrc` file
+at all** -- and shipped the whole top-level `tests/` tree plus a stale
+`aml_framework.egg-info/` left behind by an editable install. So the wheel is
+larger than the library and the sdist cannot rebuild the library's CUDA kernels;
+the documented `FORCE_CUDA=1 pip install --no-build-isolation
+./aml_framework-2.0.0.tar.gz` dies on a missing `mgn/csrc/bindings.cpp`. Fixed
+with an explicit `MANIFEST.in` (ship the csrc sources and the quickstarts; prune
+`tests`, `data`, the paper, `build/`) and
+`packages.find.exclude = ["mgn.tests*", "mgn.csrc*", "tests*"]` with
+`namespaces = false`. After: wheel 42 entries, no tests; sdist 76 members, all 14
+csrc files present, no tests / paper / checkpoints / datasets. The publish
+workflow now asserts both shapes before any upload.
+
+**B56 (medium, latent, packaging) — `include-package-data` defaults to true under
+`pyproject.toml`, so writing the sdist manifest put the CUDA sources one flag
+away from being inside a `py3-none-any` wheel.**
+
+A `pyproject.toml`-configured setuptools defaults `include-package-data` to
+**true**, and that copies every manifest-listed file *inside a package directory*
+into the wheel. `MANIFEST.in` lists `mgn/csrc/*.cu|*.cpp|*.h|*.cuh`, all under
+`mgn/`, so the default stopped being harmless the moment the manifest existed.
+Measured on a throwaway copy with the flag left at its default and a fake
+`mgn/accel/_C.cp312-win_amd64.pyd` planted in the tree: the wheel goes 42 -> 56
+entries, gaining all 14 `mgn/csrc` sources as package data. The planted `.pyd`
+does **not** enter, in either configuration, because `global-exclude *.pyd` keeps
+it out of the manifest (the pre-fix 44-entry wheel was likewise binary-free). The
+csrc payload is bloat, not breakage -- but the flag is pinned to `false`, guarded
+by `tests/test_packaging.py`, and re-checked against the real artifact by the
+publish workflow before the upload.
+
+**B57 (low, packaging) — a plain `pip install .` skipped the CUDA extensions
+silently.**
+
+`pip install .` builds in an isolated environment with no torch, so `import torch`
+fails in `setup.py` and both extensions are skipped without a word. A GPU user
+doing the obvious thing gets a working-but-slower install and no indication that
+`mgn.accel._C` exists or how to obtain it -- the same silent path the docstring
+reserved for the Docker case, reached by the ordinary case. Measured here: the
+checkout's `_C`/`_Cin` import, and the wheel install reports
+`not built (ModuleNotFoundError) -- optional, using the PyTorch fallback`.
+`setup.py` now prints one line naming what was skipped and the two commands that
+build it, and accepts `AML_BUILD_CUDA=1` alongside `FORCE_CUDA=1`.
+
+**B58 (low, metadata) — the license field was already deprecated, and pairing it
+with a license classifier is now forbidden.**
+
+`license = { file = "LICENSE" }` printed a deprecation banner on every build
+("update your project ... by 2027-Feb-18"), and PEP 639 forbids combining it with
+a `License ::` trove classifier. Replaced with the SPDX string `license = "MIT"`
+plus `license-files = ["LICENSE"]`, with `setuptools>=77` as the build
+requirement that makes both legal. `python -m build` is now warning-free and
+`twine check --strict` passes on both artifacts.
+
+**Verification of the release chain (measured, not asserted).** Artifacts built in
+a clean virtualenv (Python 3.12, setuptools 84.0.0, build 1.6.1);
+`python -m build` exits 0 (the "Exited with code 1" PowerShell reports is a
+stderr/pipeline artifact, reproduced with a command that only writes to stderr).
+The wheel was installed with `--no-deps` into a second venv that has torch but no
+`aml-framework`, and `mgn` / `hts_lib` resolve to the wheel's `site-packages`
+rather than to the checkout; the new `aml-selfcheck` console script exits 0 on the
+GPU (kernels present) and on a CPU-only run (kernels absent, reported as
+optional); `twine check --strict` PASSED on the wheel and the sdist. What is *not*
+measured: nothing has been uploaded, so the OIDC exchange with a real index is
+still untested (open item 11).
+
 ---
 
 ## 11. Open items, stated as open
@@ -1590,3 +1662,15 @@ Written down so that "not done" is not later mistaken for "not noticed".
     consulted only by CIFAR-10. The confound is disclosed in each place it
     matters but not removed; removing it means re-running the sequence under one
     explicit policy, which would change the MNIST and Fashion columns.
+11. **Nothing has been published to PyPI, and the trusted-publisher setup cannot
+    be made from here.** The release chain is built and verified locally
+    (B55--B58), but the OIDC handshake needs a one-time, owner-only configuration
+    on pypi.org and test.pypi.org -- owner, repository, workflow `publish.yml`,
+    environments `pypi` / `testpypi` -- matching `RELEASING.md`. `aml-framework`
+    was unregistered (HTTP 404) when checked, so the name is still available.
+    Until then, "run it on another machine" means cloning and building from
+    source, not installing a wheel that CI produced.
+12. **There are no CUDA wheels, by design, and that is a real cost.** A user on a
+    CUDA host must compile the sdist themselves, and nothing exercises that path
+    end-to-end in CI: `validate_ext_in.py` runs only when the runner already has a
+    GPU, and the release workflow never builds the extensions at all.

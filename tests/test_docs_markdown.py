@@ -1,4 +1,4 @@
-"""Guard against LaTeX leaking back into the Markdown docs.
+r"""Guard against LaTeX leaking back into the Markdown docs.
 
 GitHub only renders $...$ math in some contexts; VS Code preview, PyCharm,
 GitLab and any plain .md viewer print the raw \mathbf{...} instead. The docs
@@ -10,7 +10,7 @@ import re
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOCS = ["README.md", "REPRODUCIBILITY.md", "experiments/README.md"]
+DOCS = ["README.md", "REPRODUCIBILITY.md", "RELEASING.md", "experiments/README.md"]
 
 # \command, $$...$$, or inline $...$ spanning a backslash command
 LATEX_CMDS = re.compile(r"\\(?:mathbf|mathbb|mathrm|text|textbf|frac|Delta|sum|cdot|times|in|approx|mu|Pi|big|Big|left|right|quad|qquad|%|,|;|:)[A-Za-z{]*")
