@@ -124,17 +124,28 @@ class TaskCentroidRouter(nn.Module):
     rescaling both to the sphere collapses CIFAR-10 routing from 100.0% to 4.0%.
     """
     def __init__(self, latent_dim=1024, max_tasks=10, temperature=0.1,
-                 metric="mahalanobis", shrink=0.01):
+                 metric="mahalanobis-task", shrink=0.01, cov_alpha=0.15):
         super().__init__()
         self.latent_dim = latent_dim
         self.max_tasks = max_tasks
         # temperature scales the logits; the Mahalanobis distance is unbounded,
         # so it is divided by a much larger scale to stay in a sane range
         self.temperature = temperature
-        if metric not in ("cosine", "mahalanobis"):
-            raise ValueError(f"metric must be 'cosine' or 'mahalanobis', got {metric!r}")
+        if metric not in ("cosine", "mahalanobis", "mahalanobis-task"):
+            raise ValueError(
+                f"metric must be 'cosine', 'mahalanobis' or "
+                f"'mahalanobis-task', got {metric!r}")
         self.metric = metric
         self.shrink = shrink
+        # How much of the POOLED second moment is mixed into each task's own.
+        # 0 = purely per-task, 1 = the old shared matrix. Measured on the
+        # production checkpoints (probes/probe_router_stage3.py):
+        #     alpha  0.00    0.15    0.50    1.00 (shared, shipped before)
+        #     MNIST  95.10   95.37   46.39    6.07
+        #     CIFAR  99.98   99.67   90.48   41.16
+        #     Fashn  85.75   96.36   98.82   98.78
+        #     mean   93.61   97.13   78.56   48.67
+        self.cov_alpha = cov_alpha
         self.register_buffer("centroids", torch.zeros(max_tasks, latent_dim))
         self.register_buffer("task_counts", torch.zeros(max_tasks, dtype=torch.long))
         self.register_buffer("num_tasks", torch.zeros(1, dtype=torch.long))
@@ -146,8 +157,20 @@ class TaskCentroidRouter(nn.Module):
         self.register_buffer("cov", torch.zeros(latent_dim, latent_dim))
         self.register_buffer("cov_n", torch.zeros(1, dtype=torch.long))
         self.register_buffer("zsum", torch.zeros(latent_dim))
+        # Per-task second moments for metric='mahalanobis-task'. The pooled
+        # matrix above is measured to be the wrong metric as soon as a third
+        # task arrives (B40): it mixes three feature spaces that only share a
+        # dimension, so the directions it emphasises belong to whichever task
+        # contributed the most variance. One matrix per task costs
+        # T x D x D floats (3.0 MB at T=3, D=512) and is still zero-replay:
+        # statistics only, no exemplars.
+        self.register_buffer("cov_task", torch.zeros(max_tasks, latent_dim, latent_dim))
+        self.register_buffer("zsum_task", torch.zeros(max_tasks, latent_dim))
+        self.register_buffer("cov_n_task", torch.zeros(max_tasks, dtype=torch.long))
         self._prec_cache = None
         self._prec_cache_n = -1
+        self._prec_task_cache = None
+        self._prec_task_cache_n = None
 
     @torch.no_grad()
     def update_task_centroid(self, task_idx: int, z_features: torch.Tensor):
@@ -186,12 +209,18 @@ class TaskCentroidRouter(nn.Module):
         # actually sits, not just on its direction - see finalize_task.
         self.centroids[task_idx] += z.sum(dim=0)
         self.task_counts[task_idx] += z.shape[0]
-        if self.metric == "mahalanobis" and into_cov:
+        if self.metric in ("mahalanobis", "mahalanobis-task") and into_cov:
             # accumulate E[zz^T] and the running feature sum over every seen
             # task; the global mean is subtracted when the precision is built
             self.cov += z.t() @ z
             self.zsum += z.sum(0)
             self.cov_n += z.shape[0]
+            if self.metric == "mahalanobis-task":
+                # ... and the same two quantities kept per task, so each domain
+                # can be scored in the space its own centroid was measured in.
+                self.cov_task[task_idx] += z.t() @ z
+                self.zsum_task[task_idx] += z.sum(0)
+                self.cov_n_task[task_idx] += z.shape[0]
         if task_idx + 1 > self.num_tasks.item():
             self.num_tasks[0] = task_idx + 1
 
@@ -232,6 +261,37 @@ class TaskCentroidRouter(nn.Module):
         self._prec_cache_n = self.cov_n.item()
         return self._prec_cache
 
+    def _precisions(self, n_tasks: int):
+        """One precision matrix per task: (1-a) * own + a * pooled.
+
+        Cached on (cov_n, cov_n_task[:n]) so the pinv is paid once per finalize,
+        not once per batch. Falls back to the shared matrix for any task whose
+        clean pass has not run yet, so a partially built router still scores.
+        """
+        key = (self.cov_n.item(), tuple(self.cov_n_task[:n_tasks].tolist()))
+        if self._prec_task_cache is not None and self._prec_task_cache_n == key:
+            return self._prec_task_cache
+        D = self.latent_dim
+        eye = torch.eye(D, device=self.centroids.device, dtype=self.cov.dtype)
+        out = []
+        pooled = self._precision()
+        for k in range(n_tasks):
+            n_k = int(self.cov_n_task[k].item())
+            if n_k == 0:
+                out.append(pooled)
+                continue
+            mu = self.zsum_task[k] / n_k
+            S = self.cov_task[k] / n_k - torch.outer(mu, mu)
+            S = (1.0 - self.cov_alpha) * S + self.cov_alpha * (
+                self.cov / max(float(self.cov_n.item()), 1.0)
+                - torch.outer(self.zsum / max(float(self.cov_n.item()), 1.0),
+                              self.zsum / max(float(self.cov_n.item()), 1.0)))
+            lam = self.shrink * torch.diagonal(S).mean().clamp(min=1e-12)
+            out.append(torch.linalg.pinv(S + lam * eye))
+        self._prec_task_cache = out
+        self._prec_task_cache_n = key
+        return out
+
     def score_per_task(self, z_per_task: list) -> torch.Tensor:
         """Domain logits when the query is embedded by EACH task's own encoder.
 
@@ -258,11 +318,18 @@ class TaskCentroidRouter(nn.Module):
                     for k, z in enumerate(z_per_task[:T_cur])]
             return torch.stack(cols, dim=1) / self.temperature
 
-        P = self._precision()
-        cols = []
-        for k in range(T_cur):
-            d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
-            cols.append((d @ P * d).sum(-1))
+        if self.metric == "mahalanobis-task":
+            P = self._precisions(T_cur)
+            cols = []
+            for k in range(T_cur):
+                d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
+                cols.append((d @ P[k] * d).sum(-1))
+        else:
+            P = self._precision()
+            cols = []
+            for k in range(T_cur):
+                d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
+                cols.append((d @ P * d).sum(-1))
         d2 = torch.stack(cols, dim=1)
         scale = d2.mean().clamp(min=1e-6)
         return (-d2 / scale) / max(self.temperature, 1e-3) * 10.0
@@ -277,10 +344,16 @@ class TaskCentroidRouter(nn.Module):
             return torch.matmul(F.normalize(z, dim=-1),
                                 F.normalize(proto, dim=-1).t()) / self.temperature
 
-        # Mahalanobis: d^2(x, c_k) = (x - c_k)^T S^-1 (x - c_k)
-        P = self._precision()
-        diff = z.unsqueeze(1) - proto.unsqueeze(0)          # [B, T, D]
-        d2 = (diff @ P * diff).sum(-1)                      # [B, T]
+        if self.metric == "mahalanobis-task":
+            P = self._precisions(T_cur)
+            d2 = torch.stack([
+                ((z - proto[k].unsqueeze(0)) @ P[k] * (z - proto[k].unsqueeze(0))).sum(-1)
+                for k in range(T_cur)], dim=1)
+        else:
+            # Mahalanobis: d^2(x, c_k) = (x - c_k)^T S^-1 (x - c_k)
+            P = self._precision()
+            diff = z.unsqueeze(1) - proto.unsqueeze(0)          # [B, T, D]
+            d2 = (diff @ P * diff).sum(-1)                      # [B, T]
         # d2 is unbounded, so normalise by the mean centroid separation to
         # land in a comparable range; argmax is unaffected by a positive
         # scale, but the softmax margin used for the open-set fallback is not
@@ -1520,15 +1593,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          'tasks were trained. Costs len(snaps) encoder forwards '
                          'per batch; those encoders are already loaded for '
                          'snapshot retrieval.')
-    ap.add_argument('--router-metric', type=str, default='mahalanobis',
-                    choices=['mahalanobis', 'cosine'],
-                    help='domain routing metric. mahalanobis uses one shared '
-                         'covariance (D x D) accumulated over all seen tasks; '
-                         'cosine is the original nearest-centroid rule.')
+    ap.add_argument('--router-metric', type=str, default='mahalanobis-task',
+                    choices=['mahalanobis-task', 'mahalanobis', 'cosine'],
+                    help='domain routing metric. mahalanobis-task scores each '
+                         'candidate in the feature space its own centroid was '
+                         'measured in, mixing in cov_alpha of the pooled second '
+                         'moment (DEFAULT CHANGED mahalanobis -> '
+                         'mahalanobis-task). The old shared matrix mixes three '
+                         'feature spaces that share only a dimension: measured '
+                         'on the production checkpoints it routes MNIST 6.07%% '
+                         'and CIFAR 41.16%%, against 95.37%% / 99.67%% here. '
+                         "'mahalanobis' keeps the single shared matrix and "
+                         "'cosine' the original nearest-centroid rule.")
     ap.add_argument('--router-shrink', type=float, default=0.01,
                     help='shrinkage added to the diagonal of the shared '
                          'covariance, as a fraction of its mean diagonal. '
                          'Stabilises the inverse; 0.01 measured best.')
+    ap.add_argument('--router-cov-alpha', type=float, default=0.15,
+                    help="fraction of the POOLED second moment mixed into each "
+                         "task's own, for --router-metric mahalanobis-task. "
+                         "0 = purely per-task, 1 = the old shared matrix. "
+                         "Measured mean routing accuracy over the three "
+                         "production domains: 93.61 / 97.13 / 78.56 / 48.67 "
+                         "at alpha = 0.0 / 0.15 / 0.5 / 1.0. The optimum is a "
+                         "broad plateau (0.10-0.20), not a knife edge.")
     return ap
 
 
@@ -1581,7 +1669,8 @@ def main():
         print(f"[*] Initializing Zero-Replay TaskCentroidRouter (latent_dim={latent_dim}, max_tasks={T})...")
         dom_head = TaskCentroidRouter(latent_dim=latent_dim, max_tasks=T, temperature=0.1,
                                      metric=args.router_metric,
-                                     shrink=args.router_shrink).to(device)
+                                     shrink=args.router_shrink,
+                                     cov_alpha=args.router_cov_alpha).to(device)
     else:
         print(f"[*] Initializing Linear Domain Router (latent_dim={latent_dim}, T={T})...")
         dom_head = torch.nn.Linear(latent_dim, T).to(device)

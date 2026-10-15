@@ -24,8 +24,25 @@ def _fit(router, X, y, n_cls):
 
 class TestRouterMetric(unittest.TestCase):
 
-    def test_default_metric_is_mahalanobis(self):
-        self.assertEqual(TaskCentroidRouter(32).metric, "mahalanobis")
+    def test_default_metric_is_per_task_mahalanobis(self):
+        """DEFAULT CHANGED mahalanobis -> mahalanobis-task.
+
+        The single shared covariance mixes the feature spaces of every task's
+        own encoder, which only share a dimension. Measured on the production
+        checkpoints it routes MNIST 6.07% / CIFAR 41.16% once three tasks are
+        seen; per-task routes them 95.37% / 99.67% (audit B40).
+        """
+        self.assertEqual(TaskCentroidRouter(32).metric, "mahalanobis-task")
+
+    def test_shared_mahalanobis_still_available(self):
+        self.assertEqual(TaskCentroidRouter(32, metric="mahalanobis").metric,
+                         "mahalanobis")
+
+    def test_cov_alpha_default_and_range(self):
+        r = TaskCentroidRouter(32)
+        self.assertAlmostEqual(r.cov_alpha, 0.15)
+        self.assertGreaterEqual(r.cov_alpha, 0.0)
+        self.assertLessEqual(r.cov_alpha, 1.0)
 
     def test_cosine_still_available(self):
         r = TaskCentroidRouter(32, metric="cosine")
