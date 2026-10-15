@@ -1842,6 +1842,64 @@ the paper's numbers remain the MNIST/CIFAR-10/Fashion protocol.
 
 ---
 
+**B64 (measurement) — the per-task snapshot is 81 % a copy of the 18-layer
+trunk, while the framework already holds a ~0.5 KB/task structural
+fingerprint.**
+
+Read off the artifacts already on disk (`aml_continual_after_*.pth`,
+`routing_state_after_*.pt`) by a CPU probe; no training was run.
+
+Per-task snapshot, production 10-class configuration, key by key:
+
+| key | MB |
+|---|---|
+| `enc` | 0.401 |
+| `layers` | 5.854 |
+| `ln` | 0.006 |
+| `protos` | 0.092 |
+| `sel` | 0.805 |
+| `stem` | 0.005 |
+| `struct_heads` | 0.045 |
+| **total** | **7.209** |
+
+So **81.2 %** (5.854 / 7.209) of the per-task snapshot is a full copy of the
+18-layer trunk. The router buffers add 4.209 MB **once** -- they are
+preallocated and do not grow with the task count: `routing_state_after_mnist.pt`
+11.536 MB, `after_fashion` 25.84 MB (26.18 MB on disk), `after_cifar100`
+22.368 MB, `after_tinyimagenet` 31.450 MB.
+
+The counter-number sits in the same artifact. `slots[i]`, returned by
+`collect_structure_slot`, is only `gate[max_layers]`, `bm_res[max_layers]` and
+optionally `bm_mode[max_layers, 3]` -- about 90 float32, i.e. **~0.4 KB of
+tensors**, measured at 0.001-0.002 MB per task in the saved state. The framework
+therefore already stores a per-task *structural* fingerprint roughly four orders
+of magnitude smaller than the weights it stores next to it.
+
+Three consequences, stated plainly:
+
+1. **The "parameter caching" criticism is factually correct for the default
+   configuration.** `A_oracle` is documented as "Full 18-layer snapshot retrieval
+   with task identity", so its zero forgetting is bought by caching weights, not
+   by structure selection. The `--shared-backbone 1` mitigation (3A) removes the
+   trunk copy and drops per-task state to 1.355 MB, but it is lossy and has only
+   been measured at `--steps 50` on a single seed.
+2. **The cost is O(T) twice over.** Storage is `4.209 MB + T * 7.209 MB` (76.3 MB
+   at T = 10), and evaluation is also linear: `--amb-topk 0` "loads ~1.5M params
+   per domain per batch", and `--route-per-task 1` costs `len(snaps)` encoder
+   forwards per batch.
+3. **The question worth asking is not "how do we drop the snapshot" but "can a
+   task be served from `slots[t]` alone (~0.5 KB) on a shared trunk held by an
+   O(1) mechanism?"** That is a ~5000x cut and would retire the criticism
+   entirely. Whether it survives is empirical and, at the full schedule, still
+   unmeasured.
+
+`REPRODUCIBILITY.md` (3A) and `experiments/README.md` already record the
+7.2 MB -> 1.2 MB change; this entry adds the key-level breakdown that shows
+*where* the bytes are, and the slot number that shows what the bytes are not
+buying.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".
