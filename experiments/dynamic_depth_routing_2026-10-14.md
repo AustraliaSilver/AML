@@ -1215,10 +1215,14 @@ Written down so that "not done" is not later mistaken for "not noticed".
    production scale" verdict was produced by the broken accumulator. The maths is
    now right and tested; the *measurement* is stale. Until it is re-run the
    honest statement is "that implementation did not help".
-3. **Everything is single-seed.** Every number in this log and in the README
-   comes from seed 42. BatchNorm was already shown not to reproduce (two runs of
-   the same config differing by 14.3 points), so the InstanceNorm numbers need a
-   multi-seed check before being quoted as precise.
+3. **Everything is single-seed, and the run is not bit-reproducible even at a
+   fixed seed.** `torch.backends.cudnn.benchmark = True` lets cuDNN pick
+   convolution algorithms by *timing*, so the choice depends on machine load.
+   Measured: two runs of the identical production command at seed 42 gave
+   `A[1,1]` = 98.65 % and 98.91 %. That is a 0.26-point spread on the same seed,
+   which is small compared with the effects under study but large enough that a
+   single run cannot support a claim finer than about half a point. BatchNorm
+   was already shown not to reproduce (two runs 14.3 points apart).
 4. **CUDA shared-memory tiling (point 5) not started.** The fused mix kernels are
    elementwise and already bandwidth-bound; the remaining candidates are the
    grouped-convolution path in `fused_dynamic_conv2d` and the two-convolution
