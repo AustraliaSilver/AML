@@ -387,6 +387,26 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
 # ----------------------------------------------------------------------
 # Eval: returns acc plus structure fingerprint
 # ----------------------------------------------------------------------
+def snapshot_bytes(snap: dict) -> int:
+    """Bytes actually held by one snapshot, including the int8 scale.
+
+    The headline storage claim ("+7.5 MB per task") is about the whole
+    snapshot, not the prototype matrix. Counting only `protos` understated it
+    by two orders of magnitude and printed as "0 MB".
+    """
+
+    def walk(v):
+        if torch.is_tensor(v):
+            return v.numel() * v.element_size()
+        if isinstance(v, dict):
+            return sum(walk(x) for x in v.values())
+        if isinstance(v, (list, tuple)):
+            return sum(walk(x) for x in v)
+        return 0
+
+    return walk(snap)
+
+
 def state_targets(module: nn.Module) -> dict:
     """Live parameter/buffer tensors of `module`, keyed like its state_dict.
 
@@ -1675,10 +1695,17 @@ def main():
             scale = pw.abs().max().clamp(min=1e-12) / 127.0
             dom_snaps[i]["protos"] = {"q": torch.round(pw / scale).to(torch.int8).cpu(),
                                       "scale": scale.cpu()}
-            mb = dom_snaps[i]["protos"]["q"].numel() / 1e6
             tag = "enc+sel+struct+prototypes" if shared_backbone else \
                   "enc+sel+stem+layers+ln+struct+prototypes"
-            print(f"  [snap] stored {tag}(int8, {mb:.0f} MB-elems) for '{name}'")
+            # Report the WHOLE snapshot, not just the int8 prototype block: in
+            # the 18-layer hybrid the prototype library is 92 k elements (~90 KB),
+            # so printing its size in whole MB rounds to "0 MB" and reads as if
+            # nothing had been stored, while the snapshot is dominated by the
+            # fp32 encoder + trunk (7.49 MB at the default --norm in).
+            proto_kb = dom_snaps[i]["protos"]["q"].numel() / 1024
+            total_mb = snapshot_bytes(dom_snaps[i]) / 1e6
+            print(f"  [snap] stored {tag}(int8, prototypes {proto_kb:.0f} KB; "
+                  f"snapshot {total_mb:.2f} MB) for '{name}'")
         else:
             dom_snaps[i]["protos"] = pw.to("cpu", torch.float32).clone()
             print(f"  [snap] stored enc+sel+struct+prototypes(fp32) for '{name}'")

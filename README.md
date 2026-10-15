@@ -69,8 +69,8 @@ Classifier head: 4 × 4 spatial pooling (768-d) → `LayerNorm` → `Dropout(0.1
 | Component | What it is |
 | :-- | :-- |
 | **Zero-Replay Task Isolation** (`ProtoIsolator`) | Partitions parameter space across tasks with **no** exemplar buffer (`--replay-per-class 0`). |
-| **Full-State Supernet Snapshots** | Captures `W_stem`, `W_layers[1..18]`, `W_ln`, `W_protos` for zero-forgetting test-time retrieval. **7.2 MB per task.** |
-| **Fisher EWC** | One diagonal-Fisher vector over the shared trunk — O(1) in task count instead of O(T) snapshots. |
+| **Full-State Supernet Snapshots** | Captures `W_stem`, `W_layers[1..18]`, `W_ln`, `W_protos` for zero-forgetting test-time retrieval. **7.49 MB per task** at the default `--norm in`. |
+| **Fisher EWC** | Two accumulators over the shared trunk — A = Σ F⁽ᵗ⁾ and B = Σ F⁽ᵗ⁾θ★⁽ᵗ⁾ — so the exact multi-task quadratic is kept in O(1) task count instead of O(T) snapshots. Disabled by default (`--ewc-lambda 0`); see §3.4. |
 | **TaskCentroidRouter** | Zero-replay domain routing via normalized feature centroids μₜ ∈ ℝᴰ. |
 | **Academic Evaluator** (`hts_lib.evaluation.ContinualEvaluator`) | Accuracy matrices `A_oracle` / `A_auto` / `A_live`, backward transfer (BWT), forgetting. |
 
@@ -219,7 +219,7 @@ unknown values.
 | :-- | :-- | :-- |
 | **P2 depth short-circuit** | A closed gate branches *around* the block at inference instead of computing it and multiplying by 0 | exact-equality test vs a full-compute reference, incl. per-sample skips |
 | **P3 per-sample MoE dispatch** | Runs each candidate block only on the sub-batch that selected it | numerical equivalence for one-hot routing + non-zero architecture gradient test |
-| **P4 Fisher EWC** | One diagonal-Fisher vector over the shared trunk, so forgetting is bounded without a 7.2 MB snapshot per task | test that the Fisher *accumulates* across tasks |
+| **P4 Fisher EWC** | Two diagonal-Fisher accumulators over the shared trunk, so the exact multi-task penalty is O(1) in task count instead of a 7.49 MB snapshot per task | gradient checked against a brute-force one-copy-per-task reference, and the minimum must be the Fisher-weighted mean of every task's optimum, not the last one |
 
 ```bash
 python -m unittest tests.test_dynamic_depth_routing    # CI-enforced regression guards
@@ -275,12 +275,9 @@ Full investigation log with every measurement:
 `--shared-backbone 1` stores no per-task copy of the trunk and leaves EWC solely
 responsible for retention. Same schedule, same seed, only that flag differs:
 
-`--shared-backbone 1` stores no per-task copy of the trunk and leaves EWC solely
-responsible for retention. Same schedule, same seed, only that flag differs:
-
 | | per-task snapshot | shared backbone |
 | :-- | --: | --: |
-| per-task state | 7.2 MB | **≈ 1.2 MB** |
+| per-task state | 7.49 MB | **≈ 1.2 MB** |
 | `A_live` forgetting | 23.05 % | **13.91 %** |
 | `A_auto` forgetting | 9.84 % | 9.23 % |
 | `A_oracle` forgetting | **0.00 %** | 9.00 % |
