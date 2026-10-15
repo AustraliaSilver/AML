@@ -312,6 +312,20 @@ class TestScorePerTask(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (32, 2))
         self.assertTrue(torch.isfinite(out).all())
 
+    def test_shorter_z_list_than_num_tasks_does_not_index_error(self):
+        """Regression: the mahalanobis branches looped `for k in range(T_cur)`
+        and indexed z_per_task[k]. num_tasks is a monotonic task counter while
+        z_per_task has one entry per stored snapshot, so the two can disagree
+        and the loop raised IndexError. The cosine branch already used the
+        min() bound."""
+        self._setup()
+        r = self._fit_router()
+        x = self.data[0][:8]
+        out = r.score_per_task([self._features(self.enc[0], x)])   # 1 z, 2 tasks
+        self.assertEqual(out.shape[0], 8)
+        self.assertEqual(out.shape[1], 1)
+        self.assertTrue(torch.isfinite(out).all())
+
     def test_survives_encoder_drift_that_breaks_the_single_encoder_router(self):
         """The regression this method exists for.
 

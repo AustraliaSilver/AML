@@ -473,6 +473,35 @@ class TestAmbiguousRetryBudget(unittest.TestCase):
         self.assertEqual(ambiguous_candidate_mask(pd, amb, 3, 99).tolist(),
                          [True, True, True])
 
+    def test_topk_cannot_scatter_past_the_snapshot_count(self):
+        """Regression: pd indexes STRUCTURE SLOTS and the scatter destination
+        indexes SNAPSHOTS. With more slots than snapshots a top-k column
+        >= n_domains was an out-of-bounds scatter_ (RuntimeError on CPU, and a
+        device-side assert that kills the CUDA context on GPU)."""
+        from train_continual_aml import ambiguous_candidate_mask
+        pd = torch.tensor([[0.05, 0.05, 0.4, 0.5]])          # 4 slots
+        amb = torch.tensor([True])
+        # only 2 snapshots exist -> the two best slots (3,2) have no snapshot
+        m = ambiguous_candidate_mask(pd, amb, 2, 2)
+        self.assertEqual(m.shape, torch.Size([2]))
+        self.assertEqual(m.tolist(), [True, True])           # best VALID slots
+        # a single snapshot with a decisive slot-0 preference
+        pd2 = torch.tensor([[0.5, 0.3, 0.15, 0.05]])
+        self.assertEqual(ambiguous_candidate_mask(pd2, amb, 2, 1).tolist(),
+                         [True, False])
+        # n_domains == 0 must not raise either
+        self.assertEqual(ambiguous_candidate_mask(pd, amb, 0, 2).tolist(), [])
+
+    def test_data_cache_key_includes_the_dataset_root(self):
+        """Regression: _DATA_CACHE was keyed on the dataset name alone, so a
+        second get_task_data() for the same name with a different data_root in
+        the same process silently returned the first root's tensors."""
+        import inspect
+        import train_continual_aml as tca
+        src = inspect.getsource(tca.get_task_data)
+        self.assertIn("os.path.abspath(data_root)", src)
+        self.assertNotIn("_DATA_CACHE[name]", src)
+
 
 class TestNormalizationChoices(unittest.TestCase):
     """--norm previously advertised bn/gn1/in but only ever built two of them."""

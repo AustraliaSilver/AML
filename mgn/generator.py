@@ -349,5 +349,9 @@ class ModelGenerator(nn.Module):
         return GeneratedModel(structure=struct, weights=W, pi_logits=pi_logits,
                               embedding=z, pi=pi,
                               prototypes=(self.prototype_lib.proto_weights
-                                          if self.use_conv else None))
+                                          if self.use_conv else None),
+                              # Tells TaskNetwork._fusable that .weights carries
+                              # a w_hts term the fused pipeline cannot represent.
+                              has_hts_adapters=bool(self.use_conv
+                                                    and hasattr(self, "hts_adapters")))
 

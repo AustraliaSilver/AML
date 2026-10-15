@@ -44,9 +44,13 @@ def contrastive_architecture_loss(
     task_ids: torch.Tensor,
 ) -> torch.Tensor:
     n = len(models)
+    # Conv models (use_conv=True) have no "fc1.weight" key -- their weights are
+    # c1..cN/out -- so looking it up raised KeyError the moment
+    # lambda_contrastive > 0 was enabled for a CNN. The structure (which every
+    # GeneratedModel carries) has the device regardless of branch.
+    device = models[0].structure.layer_gates.device
     if n < 2:
-        return torch.tensor(0.0, device=models[0].weights["fc1.weight"].device)
-    device = models[0].weights["fc1.weight"].device
+        return torch.tensor(0.0, device=device)
     sum_same = torch.tensor(0.0, device=device)
     sum_diff = torch.tensor(0.0, device=device)
     count_same = 0

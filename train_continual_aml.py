@@ -334,8 +334,13 @@ class TaskCentroidRouter(nn.Module):
         if self.metric == "mahalanobis-task":
             P, logdets = self._precisions(T_cur)
             cols = []
-            for k in range(T_cur):
-                d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
+            # Iterate the z's that actually exist (same bound as the cosine
+            # branch above). num_tasks can exceed len(z_per_task) -- it is a
+            # monotonic task counter, z_per_task is one entry per stored
+            # snapshot -- and indexing z_per_task[k] for k in range(T_cur)
+            # raised IndexError.
+            for k, z in enumerate(z_per_task[:T_cur]):
+                d = z.float().flatten(1) - proto[k].unsqueeze(0)
                 # Per-task Gaussian NLL, tempered: the log|S_k| term stops a
                 # broadly spread domain from winning every query, and halving
                 # its weight stops it from over-correcting.
@@ -343,8 +348,8 @@ class TaskCentroidRouter(nn.Module):
         else:
             P = self._precision()
             cols = []
-            for k in range(T_cur):
-                d = z_per_task[k].float().flatten(1) - proto[k].unsqueeze(0)
+            for k, z in enumerate(z_per_task[:T_cur]):
+                d = z.float().flatten(1) - proto[k].unsqueeze(0)
                 cols.append((d @ P * d).sum(-1))
         d2 = torch.stack(cols, dim=1)
         scale = d2.mean().clamp(min=1e-6)
@@ -393,8 +398,9 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
     identically, and reproducing with `fast_cache=False` will not match the
     MNIST/Fashion columns. Disclosed as B54 in the audit log.
     """
-    if fast_cache and name in _DATA_CACHE:
-        tr, te = _DATA_CACHE[name]
+    cache_key = (name, os.path.abspath(data_root))
+    if fast_cache and cache_key in _DATA_CACHE:
+        tr, te = _DATA_CACHE[cache_key]
         tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                          num_workers=0, pin_memory=False, drop_last=True)
         el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
@@ -412,7 +418,7 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             x_te = (x_te - 0.1307) / 0.3081
             tr = torch.utils.data.TensorDataset(x_tr, raw_tr.targets)
             te = torch.utils.data.TensorDataset(x_te, raw_te.targets)
-            _DATA_CACHE[name] = (tr, te)
+            _DATA_CACHE[cache_key] = (tr, te)
             tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                              num_workers=0, pin_memory=False, drop_last=True)
             el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
@@ -440,7 +446,7 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             x_te = (x_te - 0.2860) / 0.3530
             tr = torch.utils.data.TensorDataset(x_tr, raw_tr.targets)
             te = torch.utils.data.TensorDataset(x_te, raw_te.targets)
-            _DATA_CACHE[name] = (tr, te)
+            _DATA_CACHE[cache_key] = (tr, te)
             tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                              num_workers=0, pin_memory=False, drop_last=True)
             el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
@@ -553,8 +559,19 @@ def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
     """
     if amb_topk <= 0 or not bool(amb_mask.any()):
         return torch.ones(n_domains, dtype=torch.bool, device=pd.device)
-    k = min(amb_topk, pd.shape[1])
-    topk_d = pd.topk(k, dim=-1).indices                      # [B, k]
+    # pd is over STRUCTURE SLOTS; the destination is over stored SNAPSHOTS, and
+    # nothing enforces len(slots) == len(snaps). A top-k index >= n_domains made
+    # scatter_ write past the [B, n_domains] tensor (CUDA device-side assert /
+    # "index out of bounds"), so mask the slots that have no snapshot to -inf
+    # before the top-k and cap k to n_domains: every returned index is then a
+    # real snapshot.
+    k = min(amb_topk, n_domains)
+    if k <= 0:
+        return torch.zeros(n_domains, dtype=torch.bool, device=pd.device)
+    pdc = pd if pd.shape[1] <= n_domains else pd.clone()
+    if pd.shape[1] > n_domains:
+        pdc[:, n_domains:] = float("-inf")
+    topk_d = pdc.topk(k, dim=-1).indices                      # [B, k]
     allow = torch.zeros(pd.shape[0], n_domains, dtype=torch.bool, device=pd.device)
     allow.scatter_(1, topk_d, True)
     return allow[amb_mask].any(dim=0)
@@ -611,7 +628,11 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     n_live_fallback = 0
     route_hist = torch.zeros(max(len(slots) if slots else 1, 1), device=device)
     use_route = dom_head is not None and slots is not None
-    use_snaps = use_route and snaps is not None
+    # `snaps=[]` is not None, so the old `snaps is not None` test enabled the
+    # snapshot path over an empty list: the per-snapshot loop did nothing and
+    # `ref_o` stayed None -> AttributeError on ref_o.shape[1]. An empty list
+    # means "no snapshots", which is exactly the snaps=None behaviour.
+    use_snaps = use_route and snaps is not None and len(snaps) > 0
     cur_stem = cur_layers = cur_ln = None
     # Cached live-tensor targets for the in-place snapshot swap. Rebuilt per
     # evaluate() call, reused for every batch and every snapshot.
@@ -835,6 +856,28 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 elif hasattr(model, "structure_delta"):
                     apply_state(dst_sdelta, cur_sdelta)
                     apply_state(dst_bhead, cur_bhead)
+            if not outs_conf and best_out is None:
+                # No snapshot produced any output for this batch: `snaps` was
+                # non-empty but every row routed to a domain with no snapshot
+                # (d_pred >= len(snaps)) and none was retried. Falling through
+                # would read ref_o.shape[1] on None (AttributeError). Score
+                # with the live weights -- what use_snaps=False does, and the
+                # same fallback the open-set branch below takes.
+                with torch.amp.autocast('cuda', **ac):
+                    out_deg, st_deg, pi_deg, dg_deg = model(x, tau=0.1, pi_mask=pi_mask)
+                out_deg = out_deg.float()
+                pi_deg = pi_deg.float()
+                ls_deg = dg_deg["layer_soft"].float()
+                gate_soft_sum += ls_deg.mean(0)
+                gate_list.append(ls_deg)
+                bmf_deg = st_deg.block_mode.float()
+                bm_res_sum += (bmf_deg[:, :, 1] if bmf_deg.shape[-1] >= 2
+                               else bmf_deg[:, :, 0]).mean(0)
+                correct += (out_deg.argmax(-1) == y).sum().item()
+                total += y.numel()
+                pi_ent_sum += -(pi_deg * torch.log(pi_deg.clamp(min=1e-9))).sum(-1).sum().item()
+                n += x.shape[0]
+                continue
             ref_o = outs_conf[0][1] if outs_conf else best_out
             # zeros, not empty: every row below is written in the normal case,
             # but the normal case depends on len(snaps) == len(slots), which
@@ -866,9 +909,14 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 lowc = conf_all < auto_live_thresh
                 if bool(lowc.any()):
                     with torch.amp.autocast('cuda', **ac):
+                        # Run the LIVE model under its OWN structure. This used
+                        # to pass g[d_pred]/b[d_pred], forcing the current
+                        # weights to execute the rejected domain's gate and
+                        # block-mode slot: architecture from one model, weights
+                        # from another, so the result was neither A_live nor
+                        # that domain's prediction. (Same defect class the
+                        # ambiguous retry was fixed for in B46.)
                         o_live, st_l, p_l, dg_l = model(x[lowc], tau=0.1,
-                                                        struct_override=(override[0][lowc],
-                                                                         override[1][lowc]),
                                                         pi_mask=pi_mask)
                     out[lowc] = o_live
                     pi[lowc] = p_l.float()

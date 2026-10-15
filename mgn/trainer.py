@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+from dataclasses import replace
 from torch.utils.data import DataLoader, TensorDataset
 
 from .generator import ModelGenerator
 from .executor import TaskNetwork
 from .losses import MetaLoss
 from .evaluator import ModelEvaluator
-from .architecture import ModelStructure, GeneratedModel
+from .architecture import GeneratedModel
 from .regularization import arch_distance
 
 
@@ -112,7 +113,17 @@ class MetaTrainer:
         try:
             self.generator.train()
             self.executor.train()
-            x = torch.randn(batch_size, in_dim, device=device)
+            # VisionModelGenerator (and any generator wrapping a conv stem)
+            # consumes a 4D image, not the flat vector the base ModelGenerator
+            # accepts. Feeding it 2D used to raise inside the dry run, which the
+            # caller caught as "torch.compile failed" -- i.e. --compile quietly
+            # never compiled anything.
+            in_channels = getattr(self.generator, "in_channels", 1)
+            if getattr(self.generator, "vision_encoder", None) is not None:
+                side = int(round((in_dim / max(in_channels, 1)) ** 0.5)) or 32
+                x = torch.randn(batch_size, in_channels, side, side, device=device)
+            else:
+                x = torch.randn(batch_size, in_dim, device=device)
             model = self.generator(x, tau=1.0)
             logits = self.executor(x, model)
             logits.sum().backward()
@@ -214,21 +225,25 @@ class MetaTrainer:
             if use_stability and (self._prev_model is None
                                   or self._train_step % self.stability_interval == 0):
                 with torch.no_grad():
+                    # Copy the WHOLE structure (dataclasses.replace) rather than
+                    # re-listing fields: the hand-written ModelStructure(...) here
+                    # silently dropped use_conv/in_channels (they reset to the
+                    # 2D/MLP defaults), so a conv model's stability snapshot
+                    # described a different kind of model than the one training.
                     self._prev_model = GeneratedModel(
-                    structure=ModelStructure(
-                        layer_gates=model.structure.layer_gates.clone(),
-                        dim_weights=model.structure.dim_weights.clone(),
-                        residual=model.structure.residual.clone(),
-                        dim_masks=model.structure.dim_masks.clone() if model.structure.dim_masks is not None else None,
-                        block_mode=model.structure.block_mode.clone() if model.structure.block_mode is not None else None,
-                        input_dim=model.structure.input_dim,
-                        output_dim=model.structure.output_dim,
-                        max_dim=model.structure.max_dim,
-                        max_layers=model.structure.max_layers,
-                        dim_choices=model.structure.dim_choices,
-                    ),
-                    weights={k: v.clone() for k, v in model.weights.items()},
-                )
+                        structure=replace(
+                            model.structure,
+                            layer_gates=model.structure.layer_gates.clone(),
+                            dim_weights=model.structure.dim_weights.clone(),
+                            residual=model.structure.residual.clone(),
+                            dim_masks=(model.structure.dim_masks.clone()
+                                       if model.structure.dim_masks is not None else None),
+                            block_mode=(model.structure.block_mode.clone()
+                                        if model.structure.block_mode is not None else None),
+                        ),
+                        weights={k: v.clone() for k, v in model.weights.items()},
+                        has_hts_adapters=getattr(model, "has_hts_adapters", False),
+                    )
 
             preds = logits_train.argmax(dim=-1)
             acc = (preds == y_train).float().mean()

@@ -43,8 +43,13 @@ class TaskNetwork(nn.Module):
     def _fusable(self, x, model, S, W, L_max, batch):
         if not self.fused or not x.is_cuda or batch <= 0:
             return None
-        # Fused pipeline ignores HtS adapters; must fallback to eager if present
-        if hasattr(model, 'hts_adapters') or hasattr(model, 'hts_adapters2'):
+        # The fused pipeline re-mixes conv weights from (prototypes, pi) and
+        # has no term for the HtS low-rank adapter weights the generator folds
+        # into .weights, so it must fall back to eager when they are present.
+        # The flag lives on GeneratedModel; the generator's own `hts_adapters`
+        # attribute is not reachable from here, which is why the old check on
+        # `model` was always False and the fused path silently dropped them.
+        if getattr(model, "has_hts_adapters", False):
             return None
         pipeline = _load_fused_pipeline()
         if pipeline is None:

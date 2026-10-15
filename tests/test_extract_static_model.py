@@ -141,5 +141,63 @@ class TestStaticHybridExtraction(unittest.TestCase):
         self.assertTrue(blk.is_active, "layer 0 must run even with a closed gate")
 
 
+class TestStaticLayerNormalisation(unittest.TestCase):
+    """StaticLayer hardcoded nn.GroupNorm(1, C) regardless of the mother's
+    norm_mode, so a child extracted from an InstanceNorm ("in") mother
+    normalised its activations differently from the model it came from."""
+
+    def _layer(self, norm_mode):
+        from AML_Core_Code.extract_static_model import StaticLayer
+        return StaticLayer(
+            torch.randn(8, 3, 3, 3), torch.randn(8),
+            torch.randn(8, 8, 3, 3), torch.randn(8),
+            torch.tensor([1.0]), torch.ones(8, 1, 1),
+            torch.tensor([1.0]), torch.tensor([0.0]), norm_mode=norm_mode)
+
+    def test_in_mother_yields_instance_norm(self):
+        import torch.nn as nn
+        from AML_Core_Code.extract_static_model import _norm_layer
+        self.assertIsInstance(_norm_layer("in", 8), nn.InstanceNorm2d)
+        self.assertIsInstance(_norm_layer("gn1", 8), nn.GroupNorm)
+        lay = self._layer("in")
+        self.assertIsInstance(lay.norm, nn.InstanceNorm2d)
+        self.assertIsInstance(lay.norm2, nn.InstanceNorm2d)
+        self.assertFalse(lay.norm.affine, "the mother's F.instance_norm is weightless")
+
+    def test_default_gn1_is_unchanged(self):
+        import torch.nn as nn
+        lay = self._layer("gn1")
+        self.assertIsInstance(lay.norm, nn.GroupNorm)
+        self.assertEqual(lay.norm.num_groups, 1)
+
+
+class TestTrueDynamicExtractionRouting(unittest.TestCase):
+    """extract_child_truedynamic read pi from ood_router.get_pi, but the mother
+    routes with prototype_selector; get_pi additionally mis-partitioned the
+    K=12 rows against rows_per_task=24, so the child was unrelated to the
+    function the mother computes."""
+
+    def test_extractor_uses_the_models_actual_router(self):
+        from AML_Core_Code.extract_static_model import extract_child_truedynamic
+        src = inspect.getsource(extract_child_truedynamic)
+        self.assertIn("prototype_selector", src)
+        self.assertNotIn("ood_router.get_pi", src)
+
+    def test_get_pi_partitions_the_rows_exactly(self):
+        from train import TaskCentroidOOD
+        r = TaskCentroidOOD(feature_dim=8, max_tasks=4, K=12)
+        r.task_counts[0] = 1.0
+        z = torch.randn(5, 8)
+        pi1 = r.get_pi(z, 24)                 # the mother's K/rows mismatch
+        self.assertEqual(tuple(pi1.shape), (5, 12))
+        self.assertTrue(torch.allclose(pi1.sum(-1), torch.ones(5), atol=1e-5),
+                        "the row distribution must be a probability vector")
+        r.task_counts[1] = 1.0
+        pi2 = r.get_pi(z, 24)
+        self.assertTrue(torch.allclose(pi2.sum(-1), torch.ones(5), atol=1e-5))
+        self.assertTrue(bool((pi2[:, 6:].sum(-1) > 0).all()),
+                        "the second task's rows must carry probability mass too")
+
+
 if __name__ == "__main__":
     unittest.main()

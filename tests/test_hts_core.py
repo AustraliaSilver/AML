@@ -157,6 +157,85 @@ class TestHtSCore(unittest.TestCase):
         # Test snapshot restoration
         isolator.restore()
 
+    def test_residual_block_accepts_widths_that_do_not_divide(self):
+        """Regression: HtSResidualBlock used GroupNorm(min(8, out_d // 4), out_d),
+        which raised 'num_channels must be divisible by num_groups' for
+        out_d=30 (7 groups) and built GroupNorm(0, out_d) for out_d < 4."""
+        from hts_lib.models.blocks import HtSResidualBlock, _norm_groups
+        # widths that already worked keep exactly the old group counts
+        self.assertEqual(_norm_groups(24), 6)
+        self.assertEqual(_norm_groups(48), 8)
+        self.assertEqual(_norm_groups(96), 8)
+        # widths that used to crash now pick a true divisor
+        for d in (5, 7, 12, 25, 30, 100):
+            b = HtSResidualBlock(d, d)
+            self.assertEqual(b.gn2.num_channels, d)
+            self.assertEqual(d % b.gn2.num_groups, 0)
+            self.assertGreaterEqual(b.gn2.num_groups, 1)
+        # and the block actually runs a forward at such a width
+        b = HtSResidualBlock(30, 30).eval()
+        x = torch.randn(2, 30, 8, 8)
+        k = torch.randn(2, 30, 30, 3, 3)
+        with torch.no_grad():
+            self.assertEqual(tuple(b(x, k).shape), (2, 30, 8, 8))
+
+    def test_gn1_keeps_the_fixed_four_group_convention(self):
+        """gn1 (and the native stems) were built with a constant GroupNorm(4, C),
+        NOT with the `min(8, C // 4)` used for gn2. A shared helper that
+        preferred `min(cap, C // 4)` would silently rewrite C=8/12 from 4 groups
+        to 2/3 and move every HtS number. All default widths (24/48/96) are
+        divisible by 4, so 4 must be preserved there."""
+        from hts_lib.models.blocks import HtSResidualBlock, _stem_groups
+        for d in (8, 12, 24, 48, 96):
+            self.assertEqual(_stem_groups(d), 4)
+            b = HtSResidualBlock(d, d)
+            self.assertEqual(b.gn1.num_groups, 4)
+        # a width 4 does not divide still gets a valid divisor
+        for d in (6, 30):
+            self.assertEqual(d % _stem_groups(d), 0)
+            self.assertEqual(HtSResidualBlock(d, d).gn1.num_groups, _stem_groups(d))
+
+    def test_residual_shortcut_widths_are_safe_too(self):
+        from hts_lib.models.blocks import HtSResidualBlock
+        b = HtSResidualBlock(12, 30, stride=2)
+        for m in b.shortcut.modules():
+            if isinstance(m, torch.nn.GroupNorm):
+                self.assertEqual(30 % m.num_groups, 0)
+
+    def test_memory_selection_is_reproducible_under_the_library_seed(self):
+        """The report flagged the mixed torch.randperm / random.shuffle in
+        EpisodicMemoryBuffer as unreproducible. It is not: hts_lib.utils.set_seed
+        (and train.set_seed) seed BOTH RNGs, and hts_lib's buffer is only reached
+        through them (experiments/benchmark_hts_baselines.py imports
+        hts_lib.utils.set_seed). Rewriting the shuffle to the torch RNG therefore
+        bought no reproducibility and would have moved the HtS baseline numbers.
+        This pins the actual contract: a run reset by the shipped helper picks the
+        same exemplars."""
+        from hts_lib.data.memory import EpisodicMemoryBuffer
+        from hts_lib.utils import set_seed
+
+        class D(torch.utils.data.Dataset):
+            def __init__(self):
+                self.targets = [i % 4 for i in range(200)]
+
+            def __len__(self):
+                return 200
+
+            def __getitem__(self, i):
+                return torch.tensor(float(i)), self.targets[i]
+
+        def picked():
+            set_seed(0)
+            mem = EpisodicMemoryBuffer(max_total_samples=40)
+            mem.update_with_dataset("t", D())
+            return mem.task_memories["t"]["targets"].tolist()
+
+        a, b = picked(), picked()
+        self.assertEqual(len(a), 40)
+        self.assertEqual(a, b,
+                         "exemplar selection is not reproducible under "
+                         "hts_lib.utils.set_seed")
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -23,6 +23,15 @@ class VisionTransformerBlock(BaseDynamicBlock):
     ):
         super().__init__(in_channels, out_channels)
         self.num_heads = num_heads
+        # self.qkv maps C -> 3*C and forward() reshapes that into
+        # [B, N, 3, num_heads, C // num_heads]. Nothing upstream guarantees the
+        # user's --max-dim is a multiple of num_heads, and an indivisible pair
+        # used to fail deep inside forward() with an opaque
+        # "shape ... is invalid for input of size ...". Fail here instead.
+        if out_channels % num_heads != 0:
+            raise ValueError(
+                f"out_channels ({out_channels}) must be divisible by "
+                f"num_heads ({num_heads}) for the multi-head attention reshape")
         self.mlp_ratio = mlp_ratio
         # Tokens are pooled to at most this many pixels per side before the
         # attention, bounding attention cost at O(64^2) regardless of input

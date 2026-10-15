@@ -80,13 +80,37 @@ def _norm_stats(t, norm_mode):
     return y.view_as(t), mean, rstd
 
 
+def _in_norm_bwd_mod():
+    """The extension that can actually serve `instance_norm_bwd`.
+
+    _C exports it, but a build that compiled only _Cin
+    (`python build_ext.py _Cin`) has the kernel in _Cin and _C is None; the
+    old code looked in _C alone, so that configuration silently fell back to
+    the ATen path even though _Cin.instance_norm_bwd was right there (and
+    never referenced anywhere else). The import is lazy to avoid the
+    fused_autograd <-> fused_autograd_in module cycle at import time.
+    """
+    if _C is not None and hasattr(_C, "instance_norm_bwd"):
+        return _C
+    try:
+        from . import fused_autograd_in
+        cin = getattr(fused_autograd_in, "_Cin", None)
+        if cin is not None and hasattr(cin, "instance_norm_bwd"):
+            return cin
+    except Exception:
+        pass
+    return None
+
+
 def _norm_bwd(g, raw, mean, rstd, norm_mode):
     """Fused d(raw) for the weightless norms: native CUDA backward kernel."""
     B, C, H, W = raw.shape
     if norm_mode == "gn1" and _C is not None and hasattr(_C, "group_norm1_bwd"):
         return _C.group_norm1_bwd(g, raw, mean, rstd, B, C, H, W)
-    elif norm_mode == "in" and _C is not None and hasattr(_C, "instance_norm_bwd"):
-        return _C.instance_norm_bwd(g, raw, mean, rstd, B, C, H, W)
+    elif norm_mode == "in":
+        mod = _in_norm_bwd_mod()
+        if mod is not None:
+            return mod.instance_norm_bwd(g, raw, mean, rstd, B, C, H, W)
     gg = torch.ops.aten.native_group_norm_backward(
         g.reshape(B, C * H * W), raw.reshape(B, C * H * W), mean, rstd,
         None, B, C, H * W, _norm_groups(C, norm_mode),

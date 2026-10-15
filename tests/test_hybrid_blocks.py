@@ -146,3 +146,16 @@ def test_hybrid_channel_downsampling():
     x = torch.randn(B, C_in, H, W)
     out = block(x)
     assert out.shape == (B, C_out, H, W)
+
+
+def test_vit_rejects_indivisible_num_heads():
+    """Regression: --max-dim is a free CLI value and nothing reconciled it with
+    num_heads. An indivisible pair used to fail deep inside forward() with
+    "shape '[B, N, 3, 4, C // 4]' is invalid for input of size ..."; it must
+    fail at construction with a message that names the two numbers."""
+    try:
+        VisionTransformerBlock(in_channels=32, out_channels=30, num_heads=4)
+    except ValueError as e:
+        assert "divisible by num_heads" in str(e), str(e)
+        return
+    raise AssertionError("indivisible num_heads must be rejected at build time")

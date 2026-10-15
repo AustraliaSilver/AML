@@ -131,6 +131,13 @@ class GeneratedModel:
     # fused pipeline re-mixes per-layer weights from (prototypes, pi); the
     # sliced per-sample tensors in .weights are kept for the eager path.
     prototypes: Optional[torch.Tensor] = None
+    # True when the generator folded HtS low-rank adapter weights into
+    # .weights. The fused CUDA pipeline recomputes conv weights from
+    # (prototypes, pi) and has no term for that contribution, so it must not
+    # run. The old guard in TaskNetwork._fusable tested
+    # `hasattr(model, "hts_adapters")` on THIS dataclass (never True) instead
+    # of on the generator, so the fused path silently dropped the adapters.
+    has_hts_adapters: bool = False
 
     def to(self, device):
         self.structure.layer_gates = self.structure.layer_gates.to(device)

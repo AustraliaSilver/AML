@@ -415,5 +415,68 @@ class TestFusedExecutorParity(unittest.TestCase):
         self.assertEqual(out.shape, (4, 5))
 
 
+def _conv_generator(seed):
+    torch.manual_seed(seed)
+    gen = ModelGenerator(input_dim=784, output_dim=10, max_layers=3,
+                         max_dim=16, dim_choices=(16,), latent_dim=32,
+                         noise_dim=32, num_prototypes=4,
+                         use_conv=True, in_channels=1)
+    return gen, gen(torch.randn(2, 784))
+
+
+class TestContrastiveArchitectureLoss(unittest.TestCase):
+    """contrastive_architecture_loss hardcoded weights["fc1.weight"] for its
+    device. Conv models (use_conv=True) key their weights c1../out., so
+    enabling lambda_contrastive on a CNN raised KeyError immediately."""
+
+    def test_conv_models_have_no_fc1_weight_key(self):
+        from mgn.regularization import contrastive_architecture_loss
+        _, m1 = _conv_generator(0)
+        _, m2 = _conv_generator(1)
+        self.assertIn("c1.weight", m1.weights)
+        self.assertNotIn("fc1.weight", m1.weights)
+        loss = contrastive_architecture_loss([m2], torch.tensor([1]))
+        self.assertEqual(loss.item(), 0.0)
+        loss2 = contrastive_architecture_loss(
+            [m2, m2], torch.tensor([0, 1]))
+        self.assertEqual(loss2.device, m2.structure.layer_gates.device)
+
+    def test_single_conv_model_returns_zero_on_the_right_device(self):
+        from mgn.regularization import contrastive_architecture_loss
+        _, m = _conv_generator(0)
+        loss = contrastive_architecture_loss([m], torch.tensor([0]))
+        self.assertEqual(loss.item(), 0.0)
+        self.assertEqual(loss.device, m.structure.layer_gates.device)
+
+
+class TestFusedExecutorRefusesHtSAdapters(unittest.TestCase):
+    """The fused pipeline re-mixes conv weights from (prototypes, pi) and has
+    no term for the HtS low-rank adapters the generator folds into .weights.
+    _fusable tested hasattr(model, "hts_adapters") on the GeneratedModel
+    (which never has it), so the fused path ran anyway and silently dropped
+    the adapter contribution."""
+
+    class _FakeCudaTensor:
+        is_cuda = True
+
+    def test_flag_is_set_and_fusable_refuses(self):
+        gen, m = _conv_generator(0)
+        if not hasattr(gen, "hts_adapters"):
+            self.skipTest("hts_lib not importable; no adapters to drop")
+        self.assertTrue(m.has_hts_adapters,
+                        "the generator folded w_hts into .weights but the "
+                        "model does not advertise it")
+        ex = TaskNetwork(fused=True)
+        self.assertIsNone(
+            ex._fusable(self._FakeCudaTensor(), m, m.structure, m.weights,
+                        m.structure.max_layers, 2),
+            "fused path must fall back to eager when HtS adapters are present")
+
+    def test_flag_absent_for_mlp_models(self):
+        gen = _mlp_generator()
+        m = gen(torch.randn(2, 12))
+        self.assertFalse(m.has_hts_adapters)
+
+
 if __name__ == "__main__":
     unittest.main()

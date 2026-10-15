@@ -1,6 +1,43 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def _valid_groups(num_channels: int, preferred: int, cap: int) -> int:
+    """`preferred` if it divides `num_channels`, else the largest divisor <= cap.
+
+    GroupNorm requires num_channels % num_groups == 0. `min(8, out_d // 4)`
+    returned 7 for out_d=30 (30 % 7 != 0 -> "num_channels must be divisible by
+    num_groups") and 0 for out_d < 4.
+    """
+    if preferred >= 1 and num_channels % preferred == 0:
+        return preferred
+    for g in range(min(cap, num_channels), 0, -1):
+        if num_channels % g == 0:
+            return g
+    return 1  # unreachable: 1 always divides
+
+
+def _norm_groups(num_channels: int, cap: int = 8) -> int:
+    """GroupNorm groups for the stage blocks (gn2 and the 1x1 shortcut).
+
+    Keeps the historical `min(cap, C // 4)` whenever it divides, so every
+    default width is unchanged (24/48/96 -> 6/8/8).
+    """
+    return _valid_groups(num_channels, min(cap, num_channels // 4), cap)
+
+
+def _stem_groups(num_channels: int, cap: int = 4) -> int:
+    """GroupNorm groups matching gn1 and the native stems.
+
+    Both `HtSResidualBlock.gn1` and `HtSContinualModel`'s stems were built with
+    a fixed `GroupNorm(4, C)`. Keep exactly that while 4 divides C (the default
+    widths 24/48/96 all do) and fall back to a divisor otherwise. Preferring
+    `min(4, C // 4)` -- the pattern used for gn2 -- would silently change C=8/12
+    from 4 groups to 2/3.
+    """
+    return _valid_groups(num_channels, cap, cap)
+
+
 class HtSResidualBlock(nn.Module):
     """
     Lightweight Child Residual Block receiving dynamic kernels synthesized on-the-fly.
@@ -16,13 +53,13 @@ class HtSResidualBlock(nn.Module):
         self.in_d = in_d
         self.out_d = out_d
         
-        self.gn1 = nn.GroupNorm(4, in_d)
-        self.gn2 = nn.GroupNorm(min(8, out_d // 4), out_d)
+        self.gn1 = nn.GroupNorm(_stem_groups(in_d), in_d)
+        self.gn2 = nn.GroupNorm(_norm_groups(out_d), out_d)
         
         if stride != 1 or in_d != out_d:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_d, out_d, 1, stride=stride, bias=False),
-                nn.GroupNorm(min(8, out_d // 4), out_d)
+                nn.GroupNorm(_norm_groups(out_d), out_d)
             )
         else:
             self.shortcut = nn.Identity()

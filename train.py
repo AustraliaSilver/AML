@@ -33,24 +33,36 @@ class TaskCentroidOOD(nn.Module):
         self.centroids[self.current_task_id] = (self.centroids[self.current_task_id] * curr_count + z_mean) / new_count
         self.task_counts[self.current_task_id] = new_count
         
-    def get_pi(self, z, active_rows_per_task):
+    def get_pi(self, z, active_rows_per_task=None):
+        """Task-probability mass spread over the K prototype rows.
+
+        `active_rows_per_task` is accepted for backwards compatibility but not
+        used: the correct partition is derived from K and the number of active
+        tasks. The old code used the caller's stride (train.py sets
+        rows_per_task=24 while K=12), so with one active task the slice
+        pi[:, 0:24] clamped to 12 columns each holding 1/24 -> row sum 0.5, and
+        every task after the first wrote into an empty slice and had its whole
+        probability mass silently dropped (pi row = 0).
+        """
         active_tasks = int((self.task_counts > 0).sum().item())
         if active_tasks == 0:
             pi = torch.ones(z.shape[0], self.K, device=z.device) / self.K
             return pi
-            
+
         c = self.centroids[:active_tasks]
         z_norm = F.normalize(z, dim=-1)
         c_norm = F.normalize(c, dim=-1)
         sim = z_norm @ c_norm.T
         task_probs = torch.softmax(sim * 1000.0, dim=-1)
-        
+
+        # Exact partition of [0, K) across the active tasks.
+        bounds = [round(t * self.K / active_tasks) for t in range(active_tasks + 1)]
         pi = torch.zeros(z.shape[0], self.K, device=z.device)
         for t in range(active_tasks):
-            start = t * active_rows_per_task
-            end = start + active_rows_per_task
-            pi[:, start:end] = (task_probs[:, t:t+1] / active_rows_per_task)
-            
+            start, end = bounds[t], bounds[t + 1]
+            if end > start:
+                pi[:, start:end] = (task_probs[:, t:t + 1] / (end - start))
+
         return pi
 
 class ConvAML_CIFAR_TrueDynamic(nn.Module):

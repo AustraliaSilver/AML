@@ -28,11 +28,27 @@ sys.path.insert(0, _ROOT)
 from train_cv_cifar_18 import get_prototype_layout, get_second_conv_layout
 
 
+def _norm_layer(norm_mode, channels, groups=1):
+    """Weightless normalisation matching the mother's per-layer op.
+
+    The mother applies `F.group_norm(x, 1)` for 'gn1' and `F.instance_norm(x)`
+    for 'in' (train_cv_cifar_18.py:248-265). StaticLayer hardcoded
+    `nn.GroupNorm(1, C)` regardless of norm_mode, so a child extracted from an
+    'in' (InstanceNorm) mother normalised its activations differently from the
+    model it was distilled from. `nn.GroupNorm(1, C)` with its default affine
+    init is exactly F.group_norm(..., 1); nn.InstanceNorm2d(C, affine=False) is
+    exactly F.instance_norm(...).
+    """
+    if str(norm_mode).lower() in ("in", "instance"):
+        return nn.InstanceNorm2d(channels, affine=False)
+    return nn.GroupNorm(groups, channels)
+
+
 class StaticLayer(nn.Module):
     """Static replica of one 2-conv AML block (plain + residual mix)."""
 
     def __init__(self, conv_w, conv_b, conv2_w, conv2_b, gate_c, dim_mask,
-                 g_plain, g_resnet, is_first_layer=False):
+                 g_plain, g_resnet, is_first_layer=False, norm_mode="gn1"):
         super().__init__()
         self.is_first_layer = is_first_layer
         self.conv = nn.Conv2d(conv_w.shape[1], conv_w.shape[0], 3, padding=1)
@@ -42,8 +58,8 @@ class StaticLayer(nn.Module):
         self.conv2.weight.data = conv2_w
         self.conv2.bias.data = conv2_b
 
-        self.norm = nn.GroupNorm(1, conv_w.shape[0])
-        self.norm2 = nn.GroupNorm(1, conv2_w.shape[0])
+        self.norm = _norm_layer(norm_mode, conv_w.shape[0])
+        self.norm2 = _norm_layer(norm_mode, conv2_w.shape[0])
 
         self.register_buffer('gate_c', gate_c)
         self.register_buffer('dim_mask', dim_mask)
@@ -162,7 +178,7 @@ class StaticChildModel(nn.Module):
 
 def _build_child(prototypes, pi, layer_gates, dim_masks, block_probs,
                  max_layers, max_dim, num_classes, pool_after, device,
-                 layout_fn=get_prototype_layout):
+                 layout_fn=get_prototype_layout, norm_mode="gn1"):
     """Generic child builder from averaged structure tensors."""
     total_dim, offsets, layer_info, wo_offset, bo_offset = layout_fn(
         max_layers, max_dim, num_classes)
@@ -195,7 +211,8 @@ def _build_child(prototypes, pi, layer_gates, dim_masks, block_probs,
             g_resnet = torch.tensor([0.0], device=device)
 
         layers.append(StaticLayer(w_mix, b_mix, w2_mix, b2_mix, gate_c, mask,
-                                  g_plain, g_resnet, is_first_layer=(i == 0)))
+                                  g_plain, g_resnet, is_first_layer=(i == 0),
+                                  norm_mode=norm_mode))
 
     w_out = (pi @ prototypes[:, wo_offset:bo_offset]).view(num_classes, 16 * max_dim)
     b_out = (pi @ prototypes[:, bo_offset:bo_offset + num_classes]).view(num_classes)
@@ -215,7 +232,12 @@ def extract_child_truedynamic(mother_model, x_dummy):
     # Deterministic structure: no Gumbel noise, batch-mean conditioning.
     z = mother_model.vision_encoder(x_dummy)
 
-    pi = mother_model.ood_router.get_pi(z, mother_model.rows_per_task).mean(dim=0, keepdim=True)
+    # The mother routes with its prototype_selector (see
+    # ConvAML_CIFAR_TrueDynamic.forward), not with ood_router: ood_router is a
+    # centroid OOD detector whose get_pi also mis-partitioned the K rows against
+    # rows_per_task=24. Extracting pi from it produced a child unrelated to the
+    # function the mother computes. Match forward()'s eval-time routing instead.
+    pi = F.softmax(mother_model.prototype_selector(z), dim=-1).mean(dim=0, keepdim=True)
 
     delta = pi @ mother_model.structure_prototypes
     layer_soft = torch.sigmoid(delta[:, :L] + 2.0)
@@ -232,7 +254,8 @@ def extract_child_truedynamic(mother_model, x_dummy):
 
     return _build_child(
         mother_model.proto_weights, pi, layer_gates, dim_masks, block_probs,
-        max_layers=L, max_dim=D, num_classes=10, pool_after=(5, 11), device=device)
+        max_layers=L, max_dim=D, num_classes=10, pool_after=(5, 11), device=device,
+        norm_mode=getattr(getattr(mother_model, "exec_", None), "norm_mode", "gn1"))
 
 
 @torch.no_grad()

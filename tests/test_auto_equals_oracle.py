@@ -180,6 +180,31 @@ class TestAutoMatchesOracle(unittest.TestCase):
         self.assertNotEqual(acc_right, acc_wrong,
                             "routing must actually influence the result")
 
+    def test_empty_snaps_scores_with_the_live_weights(self):
+        """Regression: `snaps=[]` is not None, so the old `snaps is not None`
+        test enabled the snapshot path over an empty list. The per-snapshot loop
+        did nothing, outs_conf/best_out stayed empty and `ref_o.shape[1]` raised
+        AttributeError on None. An empty list means "no snapshots", which is the
+        snaps=None behaviour."""
+        m, loaders, snaps, slots, head, ranges = self._fixture()
+        dev = torch.device("cpu")
+        head.set_answer(0)
+        acc, fp = evaluate(m, loaders[0], dev, dom_head=head, slots=slots,
+                           snaps=[], route_tau=0.6, pi_mask=None)
+        self.assertTrue(0.0 <= acc <= 1.0)
+        self.assertIn("gate", fp)
+
+    def test_rows_routed_to_a_missing_snapshot_fall_back_to_live(self):
+        """A batch whose every row is routed to a domain that has no snapshot
+        must not read ref_o on None either. Here the router answers domain 1 but
+        only domain 0 has a snapshot."""
+        m, loaders, snaps, slots, head, ranges = self._fixture()
+        dev = torch.device("cpu")
+        head.set_answer(1)                       # every row -> domain 1
+        acc, _ = evaluate(m, loaders[0], dev, dom_head=head, slots=slots,
+                          snaps=snaps[:1], route_tau=0.6, pi_mask=None)
+        self.assertTrue(0.0 <= acc <= 1.0)
+
 
     def test_ambiguous_retry_uses_the_retried_domain_s_slot(self):
         """A sample retried under snapshot d must use d's STRUCTURE, not d's rival's.
