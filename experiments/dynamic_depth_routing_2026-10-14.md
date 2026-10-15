@@ -21,7 +21,7 @@ bf16 autocast). Nothing is quoted from the original write-up unless marked
 | 5 | `VisionTransformerBlock.compute_flops` overstated ViT cost by **76×** | Any FLOPs-based loss would penalise the wrong mode |
 | 6 | Neutral (zero) prior collapses all 18 layers to PlainConv via argmax tie-break | The proposed "33/33/33" init is not reachable |
 | 7 | Neutral prior costs **79 accuracy points** vs the staged prior at equal budget | Removing the inductive bias is harmful at this training budget |
-| 8 | Full snapshot is **7.2 MB/task**, not "tens of MB" | Overstated ~3× in the proposal |
+| 8 | Full snapshot is **7.12 MB/task** at the default `--norm in`, not "tens of MB" | Overstated ~3× in the proposal |
 | 9 | `A_live` collapses 98.05 → 3.52 → 28.99; `--anchor-lam` defaults to **0.0** | There was no working anti-forgetting mechanism at all |
 | 10 | Stale non-editable `mgn` copy in site-packages shadowed the repo | Scripts run from subdirectories silently imported old code |
 | 11 | Cost term ran unconditionally | +16 % inference latency, introduced by this work; found only by benchmarking against a baseline worktree |
@@ -1100,3 +1100,33 @@ Baseline comparison used a detached worktree at `7a9b920`:
 git worktree add $env:TEMP\aml_base HEAD
 python $env:TEMP\aml_base\ab_base.py --steps 60 --freeze 1
 ```
+
+---
+
+## 11. Open items, stated as open
+
+Written down so that "not done" is not later mistaken for "not noticed".
+
+1. **The structure slot is collected without a prototype-row mask.**
+   `collect_structure_slot` runs `model(x, tau=0.1)` with `pi_mask=None`, so the
+   stored `gate` / `bm_mode` describe the structure implied by **all K**
+   prototype rows, while the oracle protocol evaluates the same task under
+   `pi_mask_j` (its own rows only). The slot is therefore slightly mismatched
+   with the weights it is meant to describe. This is left as-is: changing it
+   mid-experiment would invalidate the production numbers being measured, and the
+   correct comparison is a full re-run, not a patch.
+2. **EWC has not been re-measured since B30.** The "EWC does not help at
+   production scale" verdict was produced by the broken accumulator. The maths is
+   now right and tested; the *measurement* is stale. Until it is re-run the
+   honest statement is "that implementation did not help".
+3. **Everything is single-seed.** Every number in this log and in the README
+   comes from seed 42. BatchNorm was already shown not to reproduce (two runs of
+   the same config differing by 14.3 points), so the InstanceNorm numbers need a
+   multi-seed check before being quoted as precise.
+4. **CUDA shared-memory tiling (point 5) not started.** The fused mix kernels are
+   elementwise and already bandwidth-bound; the remaining candidates are the
+   grouped-convolution path in `fused_dynamic_conv2d` and the two-convolution
+   residual chain. No attempt has been made, so no claim is made.
+5. **Benchmark scripts are not part of CI.** `benchmarks/` and `probes/` are run
+   manually; the import smoke test guarantees they at least *import*, but their
+   numerics remain unverified by CI.
