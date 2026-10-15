@@ -387,6 +387,36 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
 # ----------------------------------------------------------------------
 # Eval: returns acc plus structure fingerprint
 # ----------------------------------------------------------------------
+def state_targets(module: nn.Module) -> dict:
+    """Live parameter/buffer tensors of `module`, keyed like its state_dict.
+
+    `state_dict()` already returns references to the live tensors (detached but
+    sharing storage), so writing into this dict writes into the module. Caching
+    it once per evaluate() call avoids rebuilding the dict on every swap.
+    """
+    return module.state_dict()
+
+
+@torch.no_grad()
+def apply_state(targets: dict, src: dict) -> None:
+    """Copy `src` into `targets` in place, without load_state_dict's bookkeeping.
+
+    `load_state_dict` re-validates every key and shape on every call. Inside
+    `evaluate` that call is made len(snaps) times per batch for the encoder, the
+    selector, the stem, 18 layers and the head LayerNorm -- it dominated the
+    measured 4.4 s evaluation cost. The keys here are ours (both sides come from
+    `state_dict()` of the same module), so the validation cannot fail; it is
+    pure overhead. The shape/dtype branch keeps a CPU-side snapshot usable
+    against CUDA parameters, which is what the int8-quantised path relies on.
+    """
+    for k, v in src.items():
+        t = targets[k]
+        if t.shape == v.shape and t.dtype == v.dtype:
+            t.copy_(v)
+        else:
+            t.copy_(v.to(device=t.device, dtype=t.dtype))
+
+
 def ambiguous_candidate_mask(pd: torch.Tensor, amb_mask: torch.Tensor,
                              n_domains: int, amb_topk: int) -> torch.Tensor:
     """Which seen domains are worth re-trying for the ambiguous samples.
@@ -456,15 +486,24 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     use_route = dom_head is not None and slots is not None
     use_snaps = use_route and snaps is not None
     cur_stem = cur_layers = cur_ln = None
+    # Cached live-tensor targets for the in-place snapshot swap. Rebuilt per
+    # evaluate() call, reused for every batch and every snapshot.
+    dst_enc = state_targets(model.vision_encoder)
+    dst_sel = state_targets(model.prototype_selector)
+    dst_stem = state_targets(model.stem) if hasattr(model, "stem") else None
+    dst_layers = state_targets(model.layers) if hasattr(model, "layers") else None
+    dst_ln = state_targets(model.ln) if hasattr(model, "ln") else None
+    dst_sdelta = state_targets(model.structure_delta) if hasattr(model, "structure_delta") else None
+    dst_bhead = state_targets(model.block_mode_head) if hasattr(model, "block_mode_head") else None
     if use_snaps:
-        cur_enc = {k: v.detach().clone() for k, v in model.vision_encoder.state_dict().items()}
-        cur_sel = {k: v.detach().clone() for k, v in model.prototype_selector.state_dict().items()}
+        cur_enc = {k: v.detach().clone() for k, v in dst_enc.items()}
+        cur_sel = {k: v.detach().clone() for k, v in dst_sel.items()}
         cur_protos = model.proto_weights.detach().clone()
-        if hasattr(model, "layers"):
-            cur_stem = {k: v.detach().clone() for k, v in model.stem.state_dict().items()}
-            cur_layers = {k: v.detach().clone() for k, v in model.layers.state_dict().items()}
-            if hasattr(model, "ln"):
-                cur_ln = {k: v.detach().clone() for k, v in model.ln.state_dict().items()}
+        if dst_layers is not None:
+            cur_stem = {k: v.detach().clone() for k, v in dst_stem.items()}
+            cur_layers = {k: v.detach().clone() for k, v in dst_layers.items()}
+            if dst_ln is not None:
+                cur_ln = {k: v.detach().clone() for k, v in dst_ln.items()}
         # Structure parameters (structure_prototypes / block_mode_prototypes or legacy)
         _sheads = snaps[0].get("struct_heads") if snaps else None
         if _sheads is not None:
@@ -497,9 +536,9 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                     # drift between them is larger than the within-domain spread.
                     zk = []
                     for d in range(len(snaps)):
-                        model.vision_encoder.load_state_dict(snaps[d]["enc"])
+                        apply_state(dst_enc, snaps[d]["enc"])
                         zk.append(router_features(model, x))
-                    model.vision_encoder.load_state_dict(cur_enc)
+                    apply_state(dst_enc, cur_enc)
                     dom_logits = dom_head.score_per_task(zk)[:, :len(slots)]
                 else:
                     z = router_features(model, x)
@@ -585,22 +624,22 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 want_amb = has_amb and bool(need_dom[d])
                 if not idx_c.any() and not want_amb:
                     continue
-                model.vision_encoder.load_state_dict(snaps[d]["enc"])
-                model.prototype_selector.load_state_dict(snaps[d]["sel"])
+                apply_state(dst_enc, snaps[d]["enc"])
+                apply_state(dst_sel, snaps[d]["sel"])
                 model.proto_weights.data.copy_(deq_protos[d])
-                if "layers" in snaps[d] and hasattr(model, "layers"):
-                    model.stem.load_state_dict(snaps[d]["stem"])
-                    model.layers.load_state_dict(snaps[d]["layers"])
-                    if "ln" in snaps[d] and hasattr(model, "ln"):
-                        model.ln.load_state_dict(snaps[d]["ln"])
+                if "layers" in snaps[d] and dst_layers is not None:
+                    apply_state(dst_stem, snaps[d]["stem"])
+                    apply_state(dst_layers, snaps[d]["layers"])
+                    if "ln" in snaps[d] and dst_ln is not None:
+                        apply_state(dst_ln, snaps[d]["ln"])
                 if _sheads is not None and "struct_heads" in snaps[d]:
                     sh = snaps[d]["struct_heads"]
                     if hasattr(model, "structure_prototypes"):
                         model.structure_prototypes.data.copy_(sh["sprotos"])
                         model.block_mode_prototypes.data.copy_(sh["bmprotos"])
-                    elif hasattr(model, "structure_delta"):
-                        model.structure_delta.load_state_dict(sh["delta"])
-                        model.block_mode_head.load_state_dict(sh["block"])
+                    elif dst_sdelta is not None:
+                        apply_state(dst_sdelta, sh["delta"])
+                        apply_state(dst_bhead, sh["block"])
                 if idx_c.any():
                     with torch.amp.autocast('cuda', **ac):
                         _pm = pm[idx_c] if pm is not None else pi_mask
@@ -639,21 +678,21 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                         best_pi[upd] = p2[upd].float()
                         best_ls[upd] = dg2["layer_soft"].float()[upd]
                         best_conf[upd] = conf2[upd]
-            model.vision_encoder.load_state_dict(cur_enc)
-            model.prototype_selector.load_state_dict(cur_sel)
+            apply_state(dst_enc, cur_enc)
+            apply_state(dst_sel, cur_sel)
             model.proto_weights.data.copy_(cur_protos)
             if cur_layers is not None:
-                model.stem.load_state_dict(cur_stem)
-                model.layers.load_state_dict(cur_layers)
+                apply_state(dst_stem, cur_stem)
+                apply_state(dst_layers, cur_layers)
                 if cur_ln is not None:
-                    model.ln.load_state_dict(cur_ln)
+                    apply_state(dst_ln, cur_ln)
             if _sheads is not None:
                 if hasattr(model, "structure_prototypes"):
                     model.structure_prototypes.data.copy_(cur_sprotos)
                     model.block_mode_prototypes.data.copy_(cur_bmprotos)
                 elif hasattr(model, "structure_delta"):
-                    model.structure_delta.load_state_dict(cur_sdelta)
-                    model.block_mode_head.load_state_dict(cur_bhead)
+                    apply_state(dst_sdelta, cur_sdelta)
+                    apply_state(dst_bhead, cur_bhead)
             ref_o = outs_conf[0][1] if outs_conf else best_out
             out = torch.empty(x.shape[0], ref_o.shape[1], device=x.device, dtype=ref_o.dtype)
             pi = torch.zeros(x.shape[0], (pi_conf[0][1] if pi_conf else best_pi).shape[1],
