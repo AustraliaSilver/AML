@@ -1033,6 +1033,12 @@ against all K prototype rows, including rows never trained for that domain (the
 same defect as B14, one layer down). Both fixed: the benchmark now swaps the
 full snapshot and evaluates each task under its own prototype row range.
 
+The same function had two more silent omissions, both of which made the measured
+gap *smaller* than reality: `vision_encoder` and `prototype_selector` were not in
+the optimiser (so the routing path never trained while the trunk did), and
+`isolator.begin_task()` was called while `mask_grad()` / `restore()` never were,
+so the isolation window was opened and then ignored.
+
 **B36 (medium) — the AML-vs-HtS benchmark never trained its router.**
 `dom_head = nn.Linear(1024, T)` was created, used at evaluation, and put in
 **no optimizer and no loss term**, so autonomous routing there was a fixed random
