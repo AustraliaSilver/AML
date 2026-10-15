@@ -180,6 +180,12 @@ torch::Tensor in_maxpool2x2_bwd(
     /* zeros_like: with odd H/W the edge row/column is covered by no pooling
      * window; with empty_like it would keep uninitialized memory. */
     auto dh_in = torch::zeros_like(h_in);
+    /* The GN variant (bindings.cpp:maxpool2x2_bwd) normalises both inputs;
+     * this one read data_ptr() straight off tensors that come from upstream
+     * autograd and may be non-contiguous views (e.g. a sliced grad), which
+     * would index the wrong memory. Match the GN variant. */
+    dh_out = dh_out.contiguous();
+    h_in = h_in.contiguous();
     in_maxpool2x2_bwd_launcher(
         dh_out.data_ptr<float>(), h_in.data_ptr<float>(), dh_in.data_ptr<float>(),
         B, C, H, W_

@@ -44,7 +44,9 @@ __global__ void in_maxpool2x2_bwd_kernel(
     int c = cb % C;
 
     int h0 = h2 * 2, w0 = w2 * 2;
-    int base = ((b * C + c) * H + h0) * W_;
+    /* 64-bit: per-image pixel offset, ~4x the flat `idx` bound (see
+     * kernels/fused_backward.cu). */
+    long base = (((long)b * C + c) * H + h0) * W_;
 
     float v00 = h_in[base + w0];
     float v01 = h_in[base + w0 + 1];

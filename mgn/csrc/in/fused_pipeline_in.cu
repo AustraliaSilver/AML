@@ -77,9 +77,9 @@ __global__ void in_fused_post_conv_kernel(
     int c = bc % C;
     if (b >= B) return;
 
-    int base = (b * C + c) * spatial;
+    /* 64-bit: per-image channel offset (B*C*spatial can exceed INT_MAX). */
+    long base = ((long)b * C + c) * spatial;
     float count = (float)spatial;
-
     float g_p = block_mode[b * 2];
     float g_r = block_mode[b * 2 + 1];
     float l_g = layer_gate[b];
@@ -132,7 +132,7 @@ __global__ void in_fused_post_conv_kernel(
 
     /* ---- Normalize + ReLU + dim_mask + mode/gate mixing (same math as GN1) ---- */
     for (int i = threadIdx.x; i < spatial; i += IN_THREADS) {
-        int idx = base + i;
+        long idx = base + i;
         float normed = (h_conv[idx] - mean) * inv_std;
         float hp = fmaxf(normed, 0.0f) * dm;
         float he = is_layer0 ? hp : h_prev[idx] * dm;

@@ -38,10 +38,7 @@ EXTENSIONS = {
         os.path.join(CSRC, "kernels", "custom_dynamic_ops.cu"),
         os.path.join(CSRC, "kernels", "fused_pipeline.cu"),
         os.path.join(CSRC, "kernels", "fused_backward.cu"),
-        os.path.join(CSRC, "kernels", "fused_chain_conv.cu"),
         os.path.join(CSRC, "kernels", "batched_hyper_linear.cu"),
-        os.path.join(CSRC, "kernels", "fused_post_conv.cu"),
-        os.path.join(CSRC, "kernels", "fused_norm_relu_gate.cu"),
     ],
     "_Cin": [
         os.path.join(CSRC, "in", "bindings_in.cpp"),

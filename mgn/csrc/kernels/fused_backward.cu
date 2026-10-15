@@ -48,7 +48,10 @@ __global__ void maxpool2x2_bwd_kernel(
     int c = cb % C;
 
     int h0 = h2 * 2, w0 = w2 * 2;
-    int base = ((b * C + c) * H + h0) * W_;
+    /* 64-bit: this is a per-IMAGE pixel offset, so it runs ~4x the flat output
+     * index `idx` (idx < B*C*(H/2)*(W/2)). A 32-bit base can overflow before
+     * total does. */
+    long base = (((long)b * C + c) * H + h0) * W_;
 
     float v00 = h_in[base + w0];
     float v01 = h_in[base + w0 + 1];

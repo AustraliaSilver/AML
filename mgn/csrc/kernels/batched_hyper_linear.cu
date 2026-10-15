@@ -12,6 +12,7 @@
 
 #include "common.h"
 #include "cuda_utils.cuh"
+#include <c10/cuda/CUDAStream.h>
 #include <mma.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -184,11 +185,24 @@ void batched_hyper_linear_launcher(
     float* C,
     int batch, int M, int K, int N
 ) {
+    /* gridDim.z is capped at 65535. Every caller passes a small batch, but an
+     * oversize one used to launch a kernel that silently covered only the first
+     * 65535 batch elements. Fail loudly instead. */
+    if (batch > 65535) {
+        throw std::runtime_error(
+            "batched_hyper_linear: batch exceeds the gridDim.z limit (65535)");
+    }
     dim3 block(TILE_N, TILE_M);
     dim3 grid(div_up(N, TILE_N), div_up(M, TILE_M), batch);
-    batched_hyper_linear_kernel<<<grid, block>>>(
+    /* Launch on the CURRENT torch stream, not the legacy default stream. With
+     * any other current stream the implicit serialisation the default stream
+     * provides does not apply, so the kernel can race the surrounding ops (and
+     * this is exactly what breaks under CUDA graph capture). */
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    batched_hyper_linear_kernel<<<grid, block, 0, stream>>>(
         A, B, bias, C, batch, M, K, N
     );
+    AML_CUDA_CHECK(cudaGetLastError());
 }
 
 void batched_hyper_linear_wmma_fp16_launcher(
@@ -198,11 +212,17 @@ void batched_hyper_linear_wmma_fp16_launcher(
     float* C,
     int batch, int M, int K, int N
 ) {
+    if (batch > 65535) {
+        throw std::runtime_error(
+            "batched_hyper_linear_wmma_fp16: batch exceeds the gridDim.z limit (65535)");
+    }
     dim3 block(32, WARPS_PER_BLOCK);
     dim3 grid(div_up(N, WMMA_N), div_up(div_up(M, WMMA_M), WARPS_PER_BLOCK), batch);
-    batched_hyper_linear_wmma_kernel<half><<<grid, block>>>(
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    batched_hyper_linear_wmma_kernel<half><<<grid, block, 0, stream>>>(
         A, B, bias, C, batch, M, K, N
     );
+    AML_CUDA_CHECK(cudaGetLastError());
 }
 
 void batched_hyper_linear_wmma_bf16_launcher(
@@ -212,9 +232,15 @@ void batched_hyper_linear_wmma_bf16_launcher(
     float* C,
     int batch, int M, int K, int N
 ) {
+    if (batch > 65535) {
+        throw std::runtime_error(
+            "batched_hyper_linear_wmma_bf16: batch exceeds the gridDim.z limit (65535)");
+    }
     dim3 block(32, WARPS_PER_BLOCK);
     dim3 grid(div_up(N, WMMA_N), div_up(div_up(M, WMMA_M), WARPS_PER_BLOCK), batch);
-    batched_hyper_linear_wmma_kernel<__nv_bfloat16><<<grid, block>>>(
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    batched_hyper_linear_wmma_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
         A, B, bias, C, batch, M, K, N
     );
+    AML_CUDA_CHECK(cudaGetLastError());
 }

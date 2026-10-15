@@ -87,7 +87,9 @@ __global__ void maxpool2x2_kernel(
     int c = cb % C;
 
     int h0 = h2 * 2, w0 = w2 * 2;
-    int base = ((b * C + c) * H + h0) * W_;
+    /* 64-bit: per-image pixel offset, ~4x the flat `idx` bound (see
+     * fused_backward.cu). */
+    long base = (((long)b * C + c) * H + h0) * W_;
     Y[idx] = fmaxf(fmaxf(X[base + w0], X[base + w0 + 1]),
                     fmaxf(X[base + W_ + w0], X[base + W_ + w0 + 1]));
 }

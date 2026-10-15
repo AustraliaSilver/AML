@@ -311,8 +311,13 @@ std::vector<torch::Tensor> mix_bwd_v2_b(
     torch::Tensor d_hp, torch::Tensor d_he, torch::Tensor xhat1, torch::Tensor hpv,
     torch::Tensor dim_mask, int D, int is_layer0
 ) {
+    TORCH_CHECK(d_hp.is_cuda() && d_hp.is_contiguous() && d_he.is_contiguous()
+        && xhat1.is_contiguous() && hpv.is_contiguous() && dim_mask.is_contiguous(),
+        "mix_bwd_v2_b: all inputs must be contiguous CUDA");
     int B = d_hp.size(0), C = d_hp.size(1);
     int spatial = (int)(d_hp.numel() / ((long)B * C));
+    TORCH_CHECK(C <= 1024,
+        "mix_bwd_v2_b: C must not exceed MB_MAX_C (1024)");
     auto opts = d_hp.options();
     auto dn1 = torch::empty_like(d_hp);
     auto dh_skip = torch::empty_like(d_hp);
