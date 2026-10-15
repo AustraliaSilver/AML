@@ -565,6 +565,41 @@ class TestNormalizationChoices(unittest.TestCase):
         self.assertIsInstance(hb.plain.norm, nn.InstanceNorm2d)
         self.assertIsInstance(hb.resnet.norm1, nn.InstanceNorm2d)
 
+    def test_max_dim_below_the_width_floor_is_not_silent(self):
+        """Depth gating has `gate_skip_eps`; width gating has a floor of 16.
+
+        That floor is a clamp on `d_lengths = clamp(sigmoid(...) * max_dim,
+        min=16.0)`, so when `max_dim < 16` the clamp binds for every sample and
+        `dim_masks` saturates at ~1.0: the width gate does nothing at all. The
+        library tests build `max_dim=8` models, and neither they nor a user
+        passing a smaller `--max-dim` got any signal that one of the three
+        routing dimensions had become inert.
+        """
+        import warnings
+        import torch
+        from mgn.blocks.hybrid_18 import ConvAML_18Layer_Hybrid
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = ConvAML_18Layer_Hybrid(K=4, max_layers=2, max_dim=8,
+                                       num_classes=10).eval()
+        self.assertTrue(any("width gate is inert" in str(w.message) for w in caught),
+                        "a max_dim under the width floor must say so")
+
+        with torch.no_grad():
+            _, struct, _, _ = m(torch.randn(2, 3, 32, 32), tau=0.1)
+        dm = struct.dim_masks
+        self.assertTrue(bool((dm > 0.999).all()),
+                        "the width mask is saturated, so width routing is inert")
+        # and dim_weights, which reports effective width, exceeds 1
+        self.assertGreater(float(struct.dim_weights.max()), 1.0)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ConvAML_18Layer_Hybrid(K=4, max_layers=2, max_dim=48, num_classes=10)
+        self.assertFalse(any("width gate is inert" in str(w.message) for w in caught),
+                         "the shipped max_dim must stay quiet")
+
     def test_train_hybrid_norm_matches_the_cli_default(self):
         """Two scripts, one architecture. `train_hybrid_aml.py` constructed
         `HybridBlock(in, in, num_heads)` without `norm_type` and hard-coded

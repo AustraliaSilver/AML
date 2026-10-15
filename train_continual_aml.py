@@ -583,7 +583,12 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
     proto_row_ranges: [(lo, hi), ...] per seen task, the prototype rows that task
     owns. When given, each sample may only use the rows of the task the ROUTER
     chose. This is derived from the router's own decision, never from the true
-    task id, so it leaks nothing."""
+    task id, so it leaks nothing.
+    pi_mask: prototype rows the model may read out from, applied to the
+    whole batch. When dom_head is None (no routing) this is how the caller
+    tells the model which task's rows to use, i.e. it hands over the true
+    task id at the read-out. A_live is measured that way and is therefore
+    TASK-AWARE, unlike A_auto; see the protocol note in README 3.1."""
     model.eval()
     correct, total = 0, 0
     gate_soft_sum = torch.zeros(model.max_layers, device=device)
@@ -690,15 +695,15 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 amb if amb is not None else torch.zeros_like(d_pred, dtype=torch.bool),
                 len(snaps), amb_topk)
             g = torch.stack([slots[d]["gate"].to(device) for d in range(len(slots))])   # [T,L]
-            gates_b = g[d_pred]                                                           # [B,L]
             if "bm_mode" in slots[0]:
                 b = torch.stack([slots[d]["bm_mode"].to(device) for d in range(len(slots))]) # [T,L,3]
-                block_b = b[d_pred]                                                           # [B,L,3]
             else:
                 b = torch.stack([slots[d]["bm_res"].to(device) for d in range(len(slots))]) # [T,L]
-                res_b = b[d_pred]                                                             # [B,L]
-                block_b = torch.stack([1.0 - res_b, res_b], dim=-1)                           # [B,L,2]
-            override = (gates_b, block_b)
+                b = torch.stack([1.0 - b, b], dim=-1)                                     # [T,L,3]
+            # Structure slot of the domain the ROUTER chose, for the confident
+            # samples. The ambiguous retry below must NOT reuse this: it loads
+            # snapshot d's weights, so it needs d's slot (see there).
+            override = (g[d_pred], b[d_pred])
 
             # Per-sample prototype mask, built from the ROUTER's own choice.
             # The prototype selector is shared across tasks, and each task only
@@ -773,13 +778,28 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                             _pma = torch.zeros(int(amb_t.sum()), model.K,
                                                dtype=torch.bool, device=device)
                             _pma[:, _lo:_hi] = True
+                        # ... and for the same reason its STRUCTURE slot must be
+                        # this snapshot's. The weights loaded above are d's and
+                        # the rows just selected are d's, so taking the gates and
+                        # block modes from d_pred (as this used to) evaluated
+                        # domain d's weights under another domain's architecture:
+                        # `slots[d]` was collected from d's own data and weights,
+                        # so it describes d and nothing else. Live by default:
+                        # route_tau = 0.6 and amb_topk = 0 retry every seen
+                        # domain, so this path runs on every default run.
+                        _n_amb = int(amb_t.sum())
+                        _ov = (g[d].unsqueeze(0).expand(_n_amb, -1),
+                               b[d].unsqueeze(0).expand(_n_amb, -1, -1))
                         o2, _, p2, dg2 = model(x[amb_t], tau=0.1,
-                                               struct_override=(override[0][amb_t], override[1][amb_t]),
+                                               struct_override=_ov,
                                                pi_mask=_pma)
                     conf2 = o2.float().softmax(-1).max(-1).values
                     upd = conf2 > best_conf
                     if best_out is None:
-                        best_out = torch.empty(amb_t.sum().item(), o2.shape[1],
+                        # zeros, not empty: a row whose confidence never
+                        # beats the initial -1 would otherwise be read back as
+                        # uninitialised memory rather than as "not better".
+                        best_out = torch.zeros(amb_t.sum().item(), o2.shape[1],
                                                device=device, dtype=torch.float32)
                         best_pi = torch.zeros(amb_t.sum().item(), p2.shape[1], device=device)
                         best_ls = torch.zeros(amb_t.sum().item(), model.max_layers, device=device)
@@ -804,7 +824,14 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                     apply_state(dst_sdelta, cur_sdelta)
                     apply_state(dst_bhead, cur_bhead)
             ref_o = outs_conf[0][1] if outs_conf else best_out
-            out = torch.empty(x.shape[0], ref_o.shape[1], device=x.device, dtype=ref_o.dtype)
+            # zeros, not empty: every row below is written in the normal case,
+            # but the normal case depends on len(snaps) == len(slots), which
+            # nothing enforces. A shorter `snaps` leaves the rows whose d_pred
+            # has no snapshot reading uninitialised memory instead of failing.
+            # (Same defect class as the scatter destination fixed in
+            # hybrid_18.forward - "gate == 0 makes the blend the identity, it
+            # does not write anything".)
+            out = torch.zeros(x.shape[0], ref_o.shape[1], device=x.device, dtype=ref_o.dtype)
             pi = torch.zeros(x.shape[0], (pi_conf[0][1] if pi_conf else best_pi).shape[1],
                              device=device)
             for m_, o_ in outs_conf:

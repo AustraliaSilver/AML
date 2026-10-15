@@ -97,10 +97,16 @@ class HybridBlock(BaseDynamicBlock):
                         # buffer dtype has to follow the promoted result or
                         # index_put_ raises a dtype mismatch.
                         if out is None:
-                            out = torch.empty(x.shape, dtype=y.dtype, device=x.device)
-                        out[mask] = y
+                            out = torch.zeros(x.shape, dtype=y.dtype, device=x.device)
+                        # Scale by the sample's OWN weight for its chosen branch,
+                        # exactly as the whole-batch fast path above does.
+                        # `all_hard` is `max > 0.99`, not `== 1.0`, so skipping
+                        # the multiplication made a sample's output depend on
+                        # which other samples happened to occupy its batch.
+                        w = mode_weights[mask, m].to(y.dtype).view(-1, 1, 1, 1)
+                        out[mask] = y * w
                 if out is None:                      # no sample matched (impossible)
-                    out = torch.empty_like(x)
+                    out = torch.zeros_like(x)
                 return out
 
 

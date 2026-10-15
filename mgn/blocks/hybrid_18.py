@@ -16,6 +16,7 @@ Features:
 """
 
 import math
+import warnings
 from typing import Optional, Tuple, Dict, Any, NamedTuple
 import torch
 import torch.nn as nn
@@ -63,6 +64,18 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         self.latent_dim = latent_dim
         self.max_layers = max_layers
         self.max_dim = max_dim
+        if max_dim < 16:
+            # d_lengths is clamped at a floor of 16.0 (the minimum active width,
+            # see forward). Below that floor the clamp binds for every sample, so
+            # dim_masks saturates at ~1.0 for every channel: the width gate is
+            # inert and dim_weights = d_lengths / max_dim exceeds 1.0, which
+            # over-reports effective width to anything that reads it. Silent
+            # before this warning: shrinking --max-dim looked like it worked.
+            warnings.warn(
+                f"max_dim={max_dim} is below the minimum active width (16.0), so "
+                f"the width gate is inert (every channel is always active) and "
+                f"dim_weights exceeds 1.0. Width routing is effectively disabled "
+                f"at this dimension.", stacklevel=2)
         self.num_classes = num_classes
         self.num_heads = num_heads
 

@@ -181,5 +181,59 @@ class TestAutoMatchesOracle(unittest.TestCase):
                             "routing must actually influence the result")
 
 
+    def test_ambiguous_retry_uses_the_retried_domain_s_slot(self):
+        """A sample retried under snapshot d must use d's STRUCTURE, not d's rival's.
+
+        The ambiguous path loads snapshot d's weights, selects d's prototype
+        rows... and used to take the layer gates and block modes from
+        `d_pred`, the router's argmax. That evaluates domain d's weights under
+        another domain's architecture. `slots[d]` is collected from d's own data
+        with d's own weights (collect_structure_slot), so it describes d and
+        nothing else.
+
+        This is not a corner case: `route_tau` defaults to 0.6 and `amb_topk` to
+        0, so every seen domain is retried for every ambiguous sample on every
+        default run. Nothing tested it, because the fixture's router is a
+        +/-50-logit head whose margin is ~1.0, i.e. never ambiguous at 0.6. The
+        test therefore forces the branch with `route_tau=1.1`, which no softmax
+        margin can exceed.
+
+        The two slots are made distinguishable (closed vs open gates) and the
+        gates actually handed to the model are recorded, so the assertion is on
+        what was executed rather than on what the code reads like.
+        """
+        m, loaders, snaps, slots, head, ranges = self._fixture()
+        dev = torch.device("cpu")
+        L = m.max_layers
+        slots[0]["gate"] = torch.zeros(L)   # domain 0: every layer closed
+        slots[1]["gate"] = torch.ones(L)    # domain 1: every layer open
+
+        seen = []
+        real_forward = m.forward
+
+        def spy(*a, **kw):
+            so = kw.get("struct_override", None)
+            seen.append(None if so is None else so[0].detach().clone())
+            return real_forward(*a, **kw)
+
+        m.forward = spy
+        try:
+            head.set_answer(0)              # the router is certain it is domain 0
+            evaluate(m, loaders[0], dev, dom_head=head, slots=slots, snaps=snaps,
+                     route_tau=1.1, dom_truth=None, pi_mask=None, route_truth=0,
+                     proto_row_ranges=ranges)
+        finally:
+            m.forward = real_forward
+
+        self.assertEqual(len(seen), len(snaps),
+                         "every seen domain must have been retried")
+        self.assertFalse(torch.allclose(seen[0], seen[1]),
+                         "both retries ran with the same gate slot: the slot came "
+                         "from d_pred instead of from the domain being retried")
+        for d, g in enumerate(seen):
+            self.assertTrue(torch.allclose(g, slots[d]["gate"].expand_as(g)),
+                            f"the retry under snapshot {d} used the wrong gate slot")
+
+
 if __name__ == "__main__":
     unittest.main()
