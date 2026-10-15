@@ -1553,12 +1553,37 @@ Rather than caching past exemplar images (which violates strict zero-replay cons
 \end{equation}
 During inference on historical domains, the corresponding state $\mathcal{S}_t$ is restored in constant time $\mathcal{O}(1)$.
 
-\paragraph{TaskCentroidRouter on Unit Hypersphere.}
-To route unlabeled test instances without knowledge of the task index, AML maintains pristine feature centroids $\mu_t \in \mathbb{S}^{D-1}$ computed over clean validation splits of each task:
+\paragraph{TaskCentroidRouter.}
+To route unlabeled test instances without knowledge of the task index, AML
+maintains one pristine feature centroid $\mu_t$ per task, computed over a clean
+pass of that task's data taken with the encoder in its \emph{final} state:
 \begin{equation}
-    \mu_t = \frac{\sum_{i=1}^{N_t} \tilde{z}_i}{\|\sum_{i=1}^{N_t} \tilde{z}_i\|_2}, \qquad \text{where } \tilde{z} = \frac{\phi(x)}{\|\phi(x)\|_2}
+    \mu_t = \frac{1}{N_t}\sum_{i=1}^{N_t} \tilde{z}_i, \qquad \text{where } \tilde{z} = \frac{\phi(x)}{\|\phi(x)\|_2}
 \end{equation}
-Test-time domain assignment is derived via cosine similarity logits scaled by temperature $\tau_{\text{ood}}$: $\hat{t} = \arg\max_t (\tilde{z} \cdot \mu_t^\top / \tau_{\text{ood}})$.
+Domain assignment is a Mahalanobis rule rather than a cosine similarity:
+\begin{equation}
+    \hat{t} = \arg\min_{t} \; (\tilde{z}-\mu_t)^\top S_t^{-1} (\tilde{z}-\mu_t),
+    \qquad S_t = (1-\alpha)\,S^{(t)} + \alpha\,S_{\mathrm{pooled}},
+\end{equation}
+where $S^{(t)}$ is the second moment of task $t$'s own features and
+$S_{\mathrm{pooled}}$ the same quantity summed over all seen tasks
+($\alpha = 0.15$, measured). A query is embedded by \emph{each} candidate's own
+encoder before scoring, because $\mu_t$ lives in the feature space that encoder
+produced; comparing it against a differently-encoded query measures encoder
+drift rather than domain identity. No exemplar is stored: the router keeps $T$
+centroids and $T$ second-moment matrices, i.e.\ $O(T)$ statistics and zero
+images.
+
+Two properties of this rule were established by measurement rather than by
+construction, and both are reported because they are easy to get backwards.
+First, $\mu_t$ must be the \emph{true mean}: a broadly spread domain has a
+smaller $\|\mu_t\|$ than a tightly clustered one (measured $0.695$ vs $0.929$),
+and rescaling every centroid to the unit sphere collapses CIFAR-10 routing from
+$100.0\%$ to $4.0\%$. Second, a single pooled matrix cannot replace the per-task
+ones: with three tasks it mixes three feature spaces that share only a
+dimension, and routing accuracy measured on the production checkpoints falls to
+$6.07\%$ (MNIST) and $41.16\%$ (CIFAR-10), against $95.37\%$ / $99.67\%$ for
+the per-task matrices.
 
 \subsection{Empirical Validation on MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST}
 We evaluated the 18-layer Hybrid Supernet against standard static deep architectures (Plain 18-layer CNN, Standard ResNet-18, and Vision Transformer ViT) across the sequence MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST under strict zero-replay constraints ($\text{replay}=0$). Table~\ref{tab:cl_results} reports the resulting continual learning metrics, parameters, and memory footprints.
@@ -1607,6 +1632,53 @@ We evaluated the 18-layer Hybrid Supernet against standard static deep architect
 As demonstrated in Tables~\ref{tab:cl_results} and \ref{tab:cl_progression}, standard static architectures suffer catastrophic representation erasure: Plain CNN and ResNet-18 forget more than $54\%$ of previously acquired task knowledge, causing MNIST accuracy to collapse from over $94\%$ to approximately $8.5\%$--$10.8\%$. While Vision Transformer (ViT) experiences less proportional degradation due to distributed self-attention representations, its overall task accuracy remains constrained under zero-replay training.
 
 In contrast, the AML Full-State Functional Snapshot mechanism completely circumvents parameter overwrite, achieving mathematically exact \textbf{Zero-Forgetting ($BWT = +0.00\%$, Forgetting $= 0.00\%$)}. By compressing historical functional states to 8-bit quantized weights, AML preserves pristine historical accuracy across all seen domains with an ultra-compact incremental storage cost of only $\sim 1.3$ MB per task, eliminating episodic replay entirely.
+
+\paragraph{Full-schedule production run.}
+Tables~\ref{tab:cl_results}--\ref{tab:cl_progression} use a short schedule so
+that the baselines fit next to ours. We therefore also report the full
+$\text{epochs}=5,28,16$ schedule (seed 42, zero replay, bf16, single GPU), with
+every other default shipped in the repository. \texttt{A\textsubscript{avg}} is
+the mean of the final row of each accuracy matrix, BWT and forgetting follow the
+standard definitions, and \emph{route accuracy} is the fraction of test images
+whose domain the router assigned correctly.
+
+\begin{table}[h]
+\centering
+\caption{\textbf{Full production schedule ($5,28,16$ epochs, zero replay, seed 42).}
+Three protocols on the same run: live mutable weights, task-oracle snapshot
+retrieval, and fully autonomous routing. Route accuracy is reported per cell so
+that a loss in $A_{\mathrm{auto}}$ can be attributed to the router rather than
+to the snapshot it retrieves.}
+\label{tab:cl_production}
+\small
+\begin{tabular}{l r r r r r}
+\toprule
+\textbf{Protocol} & \textbf{$A_{\text{avg}}$} & \textbf{BWT} & \textbf{Forgetting} & \textbf{worst route acc} & \textbf{MNIST after task 3} \\
+\midrule
+$A_{\mathrm{live}}$ (mutable weights) & $48.61\%$ & $-57.80\%$ & $57.80\%$ & -- & $22.95\%$ \\
+$A_{\mathrm{auto}}$ (autonomous router) & $50.31\%$ & $-54.43\%$ & $54.43\%$ & $5.94\%$ & $16.09\%$ \\
+$A_{\mathrm{oracle}}$ (task id given) & $\mathbf{86.73\%}$ & $\mathbf{+0.00\%}$ & $\mathbf{0.00\%}$ & -- & $\mathbf{98.65\%}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two conclusions, one positive and one negative, are reported as measured.
+\textbf{(i) The storage argument holds at full scale.} With no exemplars, the
+snapshot protocol reaches $86.73\%$ average accuracy with \emph{exactly} zero
+backward transfer and zero forgetting, against $48.61\%$ for the same network
+under ordinary sequential fine-tuning: the $38$ point gap is entirely attributable
+to retaining one functional state per task. \textbf{(ii) The autonomous router is
+not yet close to the oracle.} Routing accuracy is $100.00\%$ / $93.96\%$ /
+$100.00\%$ after one and two tasks, then collapses to $5.94\%$ on MNIST and
+$50.01\%$ on CIFAR-10 once the third task has been learned --- far below the
+$33.3\%$ chance level, so the failure is systematic rather than noisy. The cause
+is that a single covariance pooled over three tasks mixes three feature spaces
+that share only a dimension, while each centroid necessarily lives in the space
+of its own encoder; scoring against per-task second moments measured on the same
+checkpoints raises routing accuracy from $6.07\%$ / $41.16\%$ to $95.37\%$ /
+$99.67\%$ on MNIST / CIFAR-10. We report the collapse rather than only the fix,
+because a two-task result cannot distinguish a solved router from one that
+happens not to have been stressed.
 
 \section{Conclusion}
 %======================================================================
