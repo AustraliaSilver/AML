@@ -198,7 +198,7 @@ The final prediction is computed via global average pooling followed by a linear
 \end{equation}
 
 \subsection{Prototype Library and Weight Sharing}
-A key innovation of AML is the Prototype Library $\mathcal{P} = \{(K_1^{(l)}, K_2^{(l)})\}_{l=1}^{L_{\max}}$, where each layer carries \emph{two} maximum-capacity kernels ($K_i^{(l)} \in \mathbb{R}^{D_{\max} \times D_{\max} \times k \times k$, with $K_1^{(1)}$ accepting the raw input channels) flattened into one canonical row layout shared byte-for-byte by the generator, both executors, the static extractor, and the CUDA kernels. When the generator selects $D_{\text{eff}} < D_{\max}$, the executor simply slices the first $D_{\text{eff}}$ channels:
+A key innovation of AML is the Prototype Library $\mathcal{P} = \{(K_1^{(l)}, K_2^{(l)})\}_{l=1}^{L_{\max}}$, where each layer carries \emph{two} maximum-capacity kernels ($K_i^{(l)} \in \mathbb{R}^{D_{\max} \times D_{\max} \times k \times k}$, with $K_1^{(1)}$ accepting the raw input channels) flattened into one canonical row layout shared byte-for-byte by the generator, both executors, the static extractor, and the CUDA kernels. When the generator selects $D_{\text{eff}} < D_{\max}$, the executor simply slices the first $D_{\text{eff}}$ channels:
 \begin{equation}
     W_{\text{active},i}^{(l)} = K_i^{(l)}[:D_{\text{eff}}, :D_{\text{eff}}, :, :] \odot \text{dim\_mask}(D_{\text{eff}})
 \end{equation}
@@ -1477,14 +1477,34 @@ continual trainer was an $L_2$-SP anchor on the encoder and prototype selector,
 defaulting to $\lambda = 0.0$, i.e.\ \emph{disabled}; measured $A_{\text{live}}$
 decays $98.05\% \rightarrow 3.52\% \rightarrow 28.99\%$ across the three tasks.
 We therefore add diagonal-Fisher Elastic Weight Consolidation over the shared
-trunk, which requires one Fisher vector and one $\boldsymbol{\theta}^{\star}$ for
-\emph{all} tasks rather than a full weight copy per task. Two subtleties are
-asserted by tests: the Fisher must be \emph{accumulated} across tasks (overwriting
-it silently disables EWC from the second task onward), and parameters receiving
-no gradient in a step must be skipped rather than recorded with zero Fisher.
+trunk. The penalty is the exact multi-task quadratic
+$L_{\mathrm{EWC}} = \tfrac{\lambda}{2}\sum_t \sum_i F_i^{(t)}\bigl(\theta_i -
+\theta^{\star\,(t)}_i\bigr)^2$, which naively wants one
+$\boldsymbol{\theta}^{\star}$ per task. The obvious $\mathcal{O}(1)$ shortcut ---
+keep a running sum of Fisher and re-pin a single $\boldsymbol{\theta}^{\star}$ to
+the most recent task --- is \emph{not} equivalent: after task $2$ it scores task
+$1$'s Fisher against weights that have already forgotten task $1$, so it anchors
+the model to the wrong point. Expanding the sum gives
+\begin{equation}
+\sum_t F^{(t)}\bigl(\theta - \theta^{\star(t)}\bigr)^2
+ = \underbrace{\Bigl(\sum_t F^{(t)}\Bigr)}_{A}\,\theta^2
+ - 2\underbrace{\Bigl(\sum_t F^{(t)}\theta^{\star(t)}\Bigr)}_{B}\,\theta
+ + c,
+\end{equation}
+where $c$ does not depend on $\theta$ and therefore never enters the gradient.
+Two accumulators are thus both exact and the same size as the $(F,
+\theta^{\star})$ pair they replace, and the penalty is evaluated as the
+completed square $\tfrac{\lambda}{2}\sum A\bigl(\theta - B/A\bigr)^2$, which stays
+non-negative and is minimised at the Fisher-weighted mean of \emph{every} task's
+optimum rather than at the latest one. Three subtleties are asserted by tests:
+the Fisher must be accumulated across tasks (overwriting it silently disables
+EWC from the second task onward); parameters receiving no gradient in a step must
+be skipped rather than recorded with zero Fisher; and the gradient of the
+$\mathcal{O}(1)$ form is checked against a brute-force one-copy-per-task
+reference.
 
 Storage is $\mathcal{O}(1)$ in the number of tasks, measured at
-$3.54$M values ($1.71$M Fisher $+\ 1.71$M $\boldsymbol{\theta}^{\star}$, i.e.\
+$3.54$M values ($1.71$M for $A$ $+\ 1.71$M for $B$, i.e.\
 $13.7$ MB fp32) held once, against $7.2$ MB \emph{per task} of full snapshots.
 
 \paragraph{End-to-end effect of the depth audit.}
