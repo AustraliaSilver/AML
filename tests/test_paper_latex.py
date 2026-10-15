@@ -91,6 +91,44 @@ class TestPaperLatex(unittest.TestCase):
         proofing."""
         self.assertNotRegex(self.text, r"Section~[^~\\]")
 
+    def test_no_stale_two_mode_claims(self):
+        """The shipped executor is tri-modal.
+
+        The paper was written against the legacy two-mode supernet and kept
+        claiming it everywhere -- including a limitation bullet that said the
+        system "supports only PlainConv and ResNet blocks", directly
+        contradicting its own Section 3 description of a tri-modal vocabulary
+        and its continual-learning section on CNN+ResNet+ViT. A reader
+        cross-checking the paper against the code would find the code right
+        and the paper wrong.
+        """
+        for phrase in ("supports only PlainConv and ResNet",
+                       "supports only PlainConv",
+                       "only PlainConv and ResNet blocks"):
+            self.assertNotIn(phrase, self.text)
+
+    def test_no_stale_cpu_only_claim(self):
+        """Training runs on CUDA through fused kernels validated against an
+        eager reference; the old "all experiments were conducted on CPU"
+        limitation was left over from the pre-GPU pilot."""
+        self.assertNotIn("all experiments were conducted on CPU", self.text)
+
+    def test_token_pooling_constant_matches_the_code(self):
+        """The paper's claim that the ViT block pools tokens to at most 8x8
+        before attending is a *cost-model* claim: if the constant moves, the
+        claim about ViT being the cheapest mode at high resolution silently
+        stops being true. Check it against the shipped block instead of
+        trusting the prose."""
+        from mgn.blocks.vit_block import VisionTransformerBlock
+        side = VisionTransformerBlock(4, 4).max_tokens_side
+        self.assertIn("%d{\\times}%d" % (side, side), self.text)
+
+    def test_normalization_default_is_stated_as_instance_norm(self):
+        """`--norm` defaults to InstanceNorm and the paper says so; the legacy
+        GroupNorm formulation is kept but labelled as such."""
+        self.assertIn("InstanceNorm", self.text)
+        self.assertIn("single-group normalization", self.text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -183,6 +183,44 @@ The overall ModelGenerator pipeline is illustrated in Figure~\ref{fig:supernet}.
 
 \subsection{TaskNetwork Executor}
 
+\paragraph{Scope, and the two instantiations in the repository.}
+The equations in this subsection describe the \emph{legacy} supernet
+(ConvAML\_CIFAR\_TrueDynamic, two block modes, single-group normalization),
+which is the object of study for the efficiency analysis and the ablations of
+Section~\ref{sec:phi_cost}. The continual-learning experiments of
+Section~\ref{sec:continual_learning} use a second instantiation, the 18-layer hybrid
+(ConvAML\_18Layer\_Hybrid), which differs from it in three specific and measured
+ways. We state them here because the two are easy to confuse and the
+normalization in particular is not a cosmetic choice.
+
+\begin{enumerate}
+    \item \textbf{Three block modes, not two.} The hybrid admits a
+    PlainConv, a ResNet and a \emph{VisionTransformer} block per layer. The
+    transformer block pools tokens to at most $8{\times}8$ before attending,
+    which makes it the \emph{cheapest} mode at $32{\times}32$ and
+    $16{\times}16$---the opposite of the intuition that convolution is cheaper
+    near the input. Any statement about mode cost in this paper must therefore
+    be read as mode-\emph{relative}, and Section~\ref{sec:depth_audit} reports
+    the measured correction.
+    \item \textbf{Selectable normalization, defaulting to InstanceNorm.} The
+    post-convolution norm is chosen by a flag. GroupNorm is the legacy default
+    and is retained for comparability; the shipped default for the continual
+    runs is InstanceNorm, because GroupNorm shares statistics across the batch
+    while InstanceNorm does not, and in a supernet whose candidate branches each
+    update their own statistics a stale branch statistic is unrecoverable. On
+    MNIST with the same budget, $A[1,1]$ measured $84.75\%$ under BatchNorm and
+    $98.03\%$ under InstanceNorm, and BatchNorm additionally failed to reproduce
+    (two runs of one configuration differing by $14.3$ points). BatchNorm's
+    running statistics are also the reason the fused kernels are validated
+    against an eager reference rather than against a stored baseline.
+    \item \textbf{Depth gating is executed, not merely reported.} A gate at or
+    below $\varepsilon$ is an exact identity, so the hybrid branches \emph{around}
+    the block at inference instead of multiplying the result by zero; a gate in
+    $(0,1)$ blends as $g\,h_{\text{cand}} + (1-g)h$ and cannot be short-circuited.
+    The static extractor reproduces the same rule, so an extracted child is the
+    same function as the routed parent rather than a full-depth approximation.
+\end{enumerate}
+
 The TaskNetwork $T_W$ is a universal computational graph parameterized by a \textbf{Prototype Library} $\mathcal{P}$---a set of shared convolutional kernels of maximum size. During execution, the kernels are dynamically sliced and masked according to the generator's gates.
 
 For each active layer $l$ (determined by the soft depth gate), the executor first forms the shared first-convolution activation and then mixes the two block modes:
@@ -190,7 +228,7 @@ For each active layer $l$ (determined by the soft depth gate), the executor firs
     a^{(l)} &= \text{ReLU}\big(\text{GN}(W_1^{(l)} * h^{(l)})\big) \odot m^{(l)} \label{eq:plainpath} \\
     h^{(l+1)} &= \underbrace{g_0^{(l)} \cdot a^{(l)}}_{\text{PlainConv path}} + \underbrace{g_1^{(l)} \cdot \text{ReLU}\big(\text{GN}(W_2^{(l)} * a^{(l)}) + h_{\text{skip}}^{(l)}\big) \odot m^{(l)}}_{\text{ResNet path (second convolution, residual add)}}
 \end{align}
-where $W_1^{(l)}, W_2^{(l)}$ are the dynamically sliced $3{\times}3$ kernels of the layer's two prototype slots, $m^{(l)}$ is the channel width mask, $\text{GN}(\cdot)$ is single-group normalization, and $h_{\text{skip}}^{(l)}$ is the identity skip (for $l=1$ the plain path $a^{(1)}$ is used as the skip source so no channel projection is needed). Crucially, the ResNet path is a \emph{genuine two-convolution block}: it consumes a second independent kernel $W_2^{(l)}$, so residual-mode layers are strictly more expensive than plain-mode layers in both parameters and FLOPs, and the resource model (Section~\ref{sec:phi_cost}) charges them apart.
+where $W_1^{(l)}, W_2^{(l)}$ are the dynamically sliced $3{\times}3$ kernels of the layer's two prototype slots, $m^{(l)}$ is the channel width mask, $\text{GN}(\cdot)$ is single-group normalization (replaceable by InstanceNorm in the hybrid instantiation, see above), and $h_{\text{skip}}^{(l)}$ is the identity skip (for $l=1$ the plain path $a^{(1)}$ is used as the skip source so no channel projection is needed). Crucially, the ResNet path is a \emph{genuine two-convolution block}: it consumes a second independent kernel $W_2^{(l)}$, so residual-mode layers are strictly more expensive than plain-mode layers in both parameters and FLOPs, and the resource model (Section~\ref{sec:phi_cost}) charges them apart.
 
 The final prediction is computed via global average pooling followed by a linear classifier:
 \begin{equation}
@@ -1042,10 +1080,36 @@ ConvAML's training time is $3$--$8\times$ slower than the fastest baseline due t
 \subsection{Limitations}
 Our current study has several limitations that suggest directions for future work:
 \begin{enumerate}
-    \item \textbf{Under-sampled regime only.} We intentionally tested with 1,200 samples to demonstrate data-aware routing. Full-scale experiments (50K+ samples) may reveal different routing patterns, including activation of ResNet blocks.
-    \item \textbf{Limited block vocabulary.} The current system supports only PlainConv and ResNet blocks. Extending to Transformer blocks, depthwise-separable convolutions, and attention mechanisms would vastly expand the routing space.
-    \item \textbf{Per-task routing.} AML currently generates a single architecture for the entire batch. Per-sample routing (different architectures for different images within a batch) would enable finer-grained conditional computation.
-    \item \textbf{CPU-only evaluation.} Due to hardware constraints, all experiments were conducted on CPU. GPU-accelerated training with larger datasets and longer schedules would likely yield stronger results.
+    \item \textbf{Under-sampled regime for the efficiency study.} The routing and
+    cost-model experiments of Sections~\ref{sec:experiments}--\ref{sec:ablation}
+    are run at 1{,}200 samples to demonstrate data-aware routing at a tractable
+    scale. The continual experiments of Section~\ref{sec:continual_learning} do use
+    the full 50{,}000-sample training sets, and they activate ResNet and ViT
+    branches that the small regime suppresses; the routing percentages of those
+    sections should not be read as properties of the under-sampled regime.
+    \item \textbf{Fixed block vocabulary.} The system supports PlainConv, ResNet
+    and ViT-Attention blocks, and nothing beyond them. Depthwise-separable
+    convolutions, dilated variants, and any mode learned from scratch rather
+    than enumerated would expand the routing space further. Note that mode
+    \emph{cost} is not monotone in resolution: the ViT block pools tokens before
+    attending, so it is the cheapest mode at $32{\times}32$ and $16{\times}16$
+    (Section~\ref{sec:depth_audit}), which inverts the usual convolutional
+    intuition and is a property of this implementation, not of attention in
+    general.
+    \item \textbf{Streaming assumption in the domain router.} The router scores a
+    sample against per-task statistics and assumes each task's data arrives as a
+    contiguous stream of known domain order. In the three-task production run it
+    is perfect on the first two tasks ($100/100$) and $89.02\%$, $95.00\%$,
+    $99.97\%$ on the third, and the residual error is
+    \emph{one-directional}: every misrouted sample moves forward to
+    Fashion-MNIST ($10.98\%$ of MNIST, $5.00\%$ of CIFAR-10) and none moves
+    backward. The router therefore cannot yet be claimed to be symmetric in the
+    tasks, and a class-incremental setting that interleaves domains would expose
+    the failure it hides here.
+    \item \textbf{Single seed.} Each reported configuration was run once at seed
+    42. Non-deterministic CUDA kernel selection alone moves a repeat of one
+    configuration by $\approx 0.3$ points, so differences smaller than that
+    should not be interpreted. Multi-seed error bars are left to future work.
 \end{enumerate}
 
 %======================================================================
