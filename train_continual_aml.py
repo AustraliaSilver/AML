@@ -1447,6 +1447,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          'domain snapshots and the most confident prediction wins')
     ap.add_argument('--snap-q8', type=int, default=1,
                     help='store prototype snapshots int8-quantized (1) or fp32 (0)')
+    ap.add_argument('--save-routing', type=int, default=1,
+                    help='persist the router buffers and per-task snapshots next '
+                         'to the model checkpoints (routing_state_after_*.pt). '
+                         'Without this the router cannot be re-examined after '
+                         'the run, because its centroids and covariance exist '
+                         'only in memory.')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--aug', type=str, default='basic', choices=['basic', 'auto'],
                     help='CIFAR train augmentation: basic (crop+flip) or auto (+AutoAugment)')
@@ -1728,6 +1734,22 @@ def main():
         else:
             dom_snaps[i]["protos"] = pw.to("cpu", torch.float32).clone()
             print(f"  [snap] stored enc+sel+struct+prototypes(fp32) for '{name}'")
+
+        # Persist the routing state. Without this the router's centroids,
+        # covariance and the snapshots that define their feature spaces exist
+        # only in memory, so a routing result cannot be re-examined after the
+        # run: every offline attempt has to retrain, and retraining does not
+        # reproduce. This is the artefact that makes "which metric" a question
+        # that can be answered from a measurement instead of a guess.
+        if args.save_routing and isinstance(dom_head, TaskCentroidRouter):
+            torch.save(
+                {"router": dom_head.state_dict(), "snaps": dom_snaps[:i + 1],
+                 "slots": slots[:i + 1], "task": name, "stage": i,
+                 "args": vars(args)},
+                os.path.join(_ROOT, f"routing_state_after_{name}.pt"))
+            print(f"  [routing] saved routing_state_after_{name}.pt "
+                  f"({snapshot_bytes({'protos': dom_snaps[i]['protos']}) / 1e6:.2f} MB "
+                  f"of prototypes + router buffers)")
 
         # Snapshot the shared encoder/router for next-task anchoring
         anchor_names = ("vision_encoder", "prototype_selector")
