@@ -1503,6 +1503,29 @@ default is `--ewc-lambda 0`, and EWC-on is the ablation the limitations section
 reports as *increasing* forgetting. The block now carries the canonical default
 command and names the EWC run as the ablation it is.
 
+**B54 (medium-low, disclosed protocol asymmetry) — two of the three tasks are
+trained without augmentation, because the speed flag also switches it off.**
+
+`get_task_data` takes `aug="basic"` and `fast_cache=True`, and the cached path
+for MNIST/FashionMNIST resizes and normalises once and then reuses the tensors
+unchanged. `aug` is read only by the CIFAR-10 branch. So in the default
+configuration of the production run:
+
+* MNIST (task 1): `RandomCrop`/`RandomHorizontalFlip` never applied;
+* CIFAR-10 (task 2): `RandomCrop(32, padding=4) + RandomHorizontalFlip` always;
+* Fashion-MNIST (task 3): same as MNIST.
+
+The `aug` argument therefore looks like it controls augmentation for the whole
+loader and in fact controls it for one of three datasets, and the flag that turns
+the augmentation off is documented as a *performance* option. The non-cached
+MNIST/Fashion branches do apply `RandomCrop(32, padding=2)`, so
+`fast_cache=False` changes the data the model sees, not only its speed -- which
+means the MNIST and Fashion columns of any run are not comparable to a
+non-cached reproduction of "the same command". This is not changed here: it
+would move reported numbers, and the honest fix is a re-run with a single,
+explicit augmentation policy. It is stated in `get_task_data`'s docstring and in
+open item 10 below.
+
 ---
 
 ## 11. Open items, stated as open
@@ -1561,3 +1584,9 @@ Written down so that "not done" is not later mistaken for "not noticed".
    forces the branch on a CPU fixture. Nothing exercises it on real checkpoints
    at scale, so a second defect in the same block would still show up first as a
    routing number rather than as a test failure.
+10. **The three tasks in the production sequence are not trained identically
+    (B54).** With the default `fast_cache=True`, MNIST and Fashion-MNIST are
+    trained with no augmentation while CIFAR-10 gets crop+flip, and `aug` is
+    consulted only by CIFAR-10. The confound is disclosed in each place it
+    matters but not removed; removing it means re-running the sequence under one
+    explicit policy, which would change the MNIST and Fashion columns.

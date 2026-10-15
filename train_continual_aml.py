@@ -380,7 +380,19 @@ class TaskCentroidRouter(nn.Module):
 
 def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batch_size=256):
     """Ultra-fast data loader pipeline: In-memory pre-processed tensors for MNIST
-    and FashionMNIST eliminate PIL resize bottlenecks on Windows, running epochs in ~30s."""
+    and FashionMNIST eliminate PIL resize bottlenecks on Windows, running epochs in ~30s.
+
+    That speed has a cost, and the cost is silent, so it is stated here: the
+    cached path applies **no augmentation**. `fast_cache` defaults to True, and
+    `aug` is consulted by the CIFAR-10 branch only (`AutoAugment` when
+    aug == "auto"). So in the default configuration MNIST and FashionMNIST are
+    resized and normalised once and then reused unchanged, while CIFAR-10 always
+    gets `RandomCrop(32, padding=4) + RandomHorizontalFlip`. The non-cached
+    MNIST/Fashion branches apply `RandomCrop(32, padding=2)` and are not the
+    default. The three tasks in one reported sequence are therefore not treated
+    identically, and reproducing with `fast_cache=False` will not match the
+    MNIST/Fashion columns. Disclosed as B54 in the audit log.
+    """
     if fast_cache and name in _DATA_CACHE:
         tr, te = _DATA_CACHE[name]
         tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,

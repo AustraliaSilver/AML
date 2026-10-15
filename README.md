@@ -125,6 +125,15 @@ Every other setting is the shipped default: `--ewc-lambda 0` (disabled),
 `--router-logdet-weight 0.5`, `--router-fit-split train`, `--route-tau 0.6`,
 `--route-per-task 1`, seed 42, bf16, RTX 3050 Laptop GPU. Single seed.
 
+> **One further default worth stating (audit B54).** MNIST and Fashion-MNIST are
+> trained with **no augmentation** in this run, while CIFAR-10 gets
+> `RandomCrop(32, padding=4) + RandomHorizontalFlip`. The default
+> `fast_cache=True` caches the two grayscale datasets as plain tensors for speed,
+> and the `aug` flag is read only by the CIFAR-10 branch. The three tasks are
+> therefore not treated identically, and a reproduction with `fast_cache=False`
+> will not match the MNIST and Fashion columns (that path applies
+> `RandomCrop(32, padding=2)`).
+
 **`A_oracle` — task-oracle snapshot retrieval**
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
