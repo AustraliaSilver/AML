@@ -1045,6 +1045,36 @@ so the isolation window was opened and then ignored.
 projection. It now has its own `AdamW`, a `0.3`-weighted cross-entropy against
 the current task id, and its own gradient-norm clip.
 
+**B39 (high, measurement) — the CUDA parity gate failed a correct kernel.**
+`validate_ext_in.py` reports `IN forward` and `grad L=2,3,4` as FAIL
+(5–17 % relative error), and CI runs it whenever the runner has a GPU — but
+`ubuntu-latest` has none, so it has been failing unseen. The first instinct is
+"the InstanceNorm kernel is wrong". Measurement says otherwise: the eager
+reference convolves in bf16, so **it disagrees with itself** (bf16 vs fp32) by
+more than the kernel's entire deviation from it, at every depth:
+
+| L | fused vs reference | reference vs itself (bf16 vs fp32) |
+|---|---|---|
+| 1 | 0.042 | 0.061 |
+| 2 | 0.084 | 0.107 |
+| 3 | 0.116 | 0.177 |
+| 4 | 0.146 | 0.279 |
+| 18 (forward) | 0.147 | 0.169 |
+
+The kernel is *closer to the fp32 answer than the reference is to itself*. The
+fixed `1e-2` gradient tolerance and `5e-2` forward tolerance were unsatisfiable
+by construction — they would also have passed a broken kernel that merely tracked
+the reference's rounding. The gate is now `max(tol, 1.5 x measured noise floor)`
+and prints the floor next to every number. A real bug still exceeds it; a
+correct kernel no longer fails. The individual pieces check out exactly:
+`_C.instance_norm_bwd` vs autograd through the op it differentiates is
+`rel_err 0.000000`.
+
+This is the same failure mode as the router investigation, in a different place:
+a number that looked damning turned out to be a property of the measuring
+instrument. The rule that caught it is the one already in this repo — compare
+against the reference's own spread, not against a constant someone picked.
+
 **B38 (high, honesty) — the default run was not the documented run.**
 `--replay-per-class` defaulted to **400**, so a bare
 `python train_continual_aml.py` stored 4 000 exemplars and ran a consolidation
