@@ -209,6 +209,11 @@ def train_aml_continual(tasks, data_root, epochs_per_task=1, batch_cap=40, eval_
         opt = torch.optim.AdamW([
             {"params": model.stem.parameters(), "lr": 1e-3},
             {"params": model.layers.parameters(), "lr": 1e-3},
+            # The encoder and the selector decide WHICH prototype rows are used,
+            # so leaving them out of the optimiser kept the whole routing path
+            # frozen at initialisation while the trunk kept moving.
+            {"params": model.vision_encoder.parameters(), "lr": 1e-3},
+            {"params": model.prototype_selector.parameters(), "lr": 1e-3},
             {"params": [model.proto_weights, model.structure_prototypes, model.block_mode_prototypes], "lr": 2e-3},
         ], weight_decay=1e-4)
 
@@ -225,7 +230,14 @@ def train_aml_continual(tasks, data_root, epochs_per_task=1, batch_cap=40, eval_
                 out, struct, pi, diag = model(x, tau=0.8, pi_mask=pi_mask)
                 loss = F.cross_entropy(out, y)
                 loss.backward()
+                # begin_task() above only OPENS the isolation window. Without
+                # mask_grad()/restore(), the previous tasks' prototype rows were
+                # overwritten anyway, so this benchmark was measuring plain
+                # finetuning with extra bookkeeping.
+                isolator.mask_grad()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 opt.step()
+                isolator.restore()
 
         # Save snapshot for this task
         dom_snaps[task_idx] = {
