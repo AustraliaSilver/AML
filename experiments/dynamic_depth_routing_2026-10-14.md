@@ -1772,6 +1772,26 @@ unreachable. The report's severity labels are quoted, not endorsed.
   `fused_backward.cu` to its source list — a build-shape change — so it is open
   item 14, not silently done.
 
+**B62 (release, verified against a real index) — the trusted publisher works:
+`aml-framework 2.0.0` is on TestPyPI and installs.**
+
+`publish.yml` was dispatched with `target=testpypi` (run 38734470869 on this
+commit): `verify` (suite) -> `build` -> `publish-testpypi` all passed and
+`publish-pypi` was skipped as intended, so the OIDC exchange with a real index --
+the one step B55--B58 could not test -- is now exercised. TestPyPI serves
+`aml-framework 2.0.0` with `aml_framework-2.0.0-py3-none-any.whl` and
+`aml_framework-2.0.0.tar.gz`. Installed from the index into a venv that has torch
+but is not the checkout (`pip install --no-deps -i
+https://test.pypi.org/simple/ aml-framework==2.0.0`): `mgn`/`hts_lib` resolve to
+`site-packages`, `mgn.accel._C` is reported optional and absent, the supernet
+forwards and backprops, `hts_lib` forwards, and `aml-selfcheck` exits 0. The
+artifact gates and the console-script entry point are therefore proven against a
+real index, not just locally.
+
+What is still **not** exercised: the pypi.org publish itself -- a `v2.0.0` tag, or
+`workflow_dispatch target=pypi` -- which uses the same workflow and needs the
+like-named trusted publisher on pypi.org (open item 11).
+
 ---
 
 ## 11. Open items, stated as open
@@ -1836,14 +1856,15 @@ Written down so that "not done" is not later mistaken for "not noticed".
     consulted only by CIFAR-10. The confound is disclosed in each place it
     matters but not removed; removing it means re-running the sequence under one
     explicit policy, which would change the MNIST and Fashion columns.
-11. **Nothing has been published to PyPI, and the trusted-publisher setup cannot
-    be made from here.** The release chain is built and verified locally
-    (B55--B58), but the OIDC handshake needs a one-time, owner-only configuration
-    on pypi.org and test.pypi.org -- owner, repository, workflow `publish.yml`,
-    environments `pypi` / `testpypi` -- matching `RELEASING.md`. `aml-framework`
-    was unregistered (HTTP 404) when checked, so the name is still available.
-    Until then, "run it on another machine" means cloning and building from
-    source, not installing a wheel that CI produced.
+11. **TestPyPI is done; the real PyPI publish is the only release step left.**
+    The trusted publisher works end to end (B62): `aml-framework 2.0.0` is on
+    test.pypi.org and installs into a clean venv with `aml-selfcheck` exiting 0.
+    What remains is the pypi.org publish -- a `v2.0.0` tag pushed to `main`, or
+    `workflow_dispatch target=pypi` -- which is immutable once it lands, so it is
+    left to the owner. It needs the like-named trusted publisher on pypi.org
+    (owner, repository, workflow `publish.yml`, environment `pypi`) and the
+    `v2.0.0` tag must match `pyproject.toml`, which it does. Until that runs,
+    "run it on another machine" means installing from TestPyPI, not from PyPI.
 12. **There are no CUDA wheels, by design, and that is a real cost.** A user on a
     CUDA host must compile the sdist themselves, and nothing exercises that path
     end-to-end in CI: `validate_ext_in.py` runs only when the runner already has a
