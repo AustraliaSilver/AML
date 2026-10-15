@@ -1253,6 +1253,27 @@ and on two tasks: 51.74 / **99.97** / 99.25 at β = 0 / 0.5 / 1. Mixing the
 pooled matrix back in only hurts (α = 0 → 97.52, α = 0.5 → 74.95, α = 1 → 64.83),
 so the shipped defaults are now `cov_alpha = 0`, `logdet_weight = 0.5`.
 
+**End-to-end confirmation.** Same command, same schedule, same seed, one default
+changed (`--router-metric mahalanobis-task --router-logdet-weight 0.5
+--router-fit-split train`):
+
+| cell | before (`route_acc`) | after (`route_acc`) |
+|---|---|---|
+| A[1,1] | 100.00 % | 100.00 % |
+| A[2,1] | 93.96 % | **100.00 %** |
+| A[2,2] | 100.00 % | 100.00 % |
+| A[3,1] | 5.94 % | **89.02 %** |
+| A[3,2] | 50.01 % | **95.00 %** |
+| A[3,3] | 99.39 % | 99.97 % |
+| `A_auto` `A_avg` | 50.31 % | **81.96 %** |
+| `A_auto` forgetting | 54.43 % | **6.34 %** |
+| `A_oracle` `A_avg` | 86.73 % | 86.19 % |
+
+`A_auto` is now **4.23 points** below the oracle instead of 36.42, and every
+stage-2 cell is exactly equal to it. The residual has a direction: after task 3,
+10.98 % of MNIST and 5.00 % of CIFAR-10 are routed *forward* to Fashion, never
+backward to an older domain. That is the next thing to work on.
+
 The lesson is worth stating as a rule rather than an anecdote: **an offline
 probe built on saved checkpoints is only as trustworthy as the data path it
 shares with the trainer.** Two of the three probes built here were wrong, and
@@ -1275,11 +1296,18 @@ Written down so that "not done" is not later mistaken for "not noticed".
    with the weights it is meant to describe. This is left as-is: changing it
    mid-experiment would invalidate the production numbers being measured, and the
    correct comparison is a full re-run, not a patch.
-2. **EWC has not been re-measured since B30.** The "EWC does not help at
+2. **All stage-3 misrouting goes forward.** 10.98 % of MNIST and 5.00 % of
+   CIFAR-10 are routed to Fashion after the third task, and nothing is ever
+   routed backwards. The newest encoder's feature space is the one the router
+   finds most accommodating, which points at an asymmetry between "just
+   trained" and "long since trained" spaces rather than at the metric. The
+   obvious first experiment — re-fitting the most recent centroid when a new
+   task arrives, or down-weighting it — has not been tried.
+3. **EWC has not been re-measured since B30.** The "EWC does not help at
    production scale" verdict was produced by the broken accumulator. The maths is
    now right and tested; the *measurement* is stale. Until it is re-run the
    honest statement is "that implementation did not help".
-3. **Everything is single-seed, and the run is not bit-reproducible even at a
+4. **Everything is single-seed, and the run is not bit-reproducible even at a
    fixed seed.** `torch.backends.cudnn.benchmark = True` lets cuDNN pick
    convolution algorithms by *timing*, so the choice depends on machine load.
    Measured: two runs of the identical production command at seed 42 gave
@@ -1287,10 +1315,10 @@ Written down so that "not done" is not later mistaken for "not noticed".
    which is small compared with the effects under study but large enough that a
    single run cannot support a claim finer than about half a point. BatchNorm
    was already shown not to reproduce (two runs 14.3 points apart).
-4. **CUDA shared-memory tiling (point 5) not started.** The fused mix kernels are
+5. **CUDA shared-memory tiling (point 5) not started.** The fused mix kernels are
    elementwise and already bandwidth-bound; the remaining candidates are the
    grouped-convolution path in `fused_dynamic_conv2d` and the two-convolution
    residual chain. No attempt has been made, so no claim is made.
-5. **Benchmark scripts are not part of CI.** `benchmarks/` and `probes/` are run
+6. **Benchmark scripts are not part of CI.** `benchmarks/` and `probes/` are run
    manually; the import smoke test guarantees they at least *import*, but their
    numerics remain unverified by CI.
