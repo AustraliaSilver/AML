@@ -22,7 +22,7 @@ Tóm tắt những gì đo được:
 | Mô hình FLOPs của ViT sai | 239.08M (phân tích) so với 3.15M (runtime thật), sai số **76×** |
 | Zero-init không cho 33/33/33 | `argmax` hòa → index 0 → toàn bộ 18 layer về PlainConv |
 | Neutral prior tốn accuracy | MNIST 4×60 step: staged **89.9%**, neutral **11.4%** |
-| Snapshot thực tế | **7.2 MB/task** (không phải "hàng chục MB"); T=3 → 21.6 MB |
+| Snapshot thực tế | **7.12 MB/task** ở mặc định `--norm in` (không phải "hàng chục MB"); T=3 → 21.4 MB |
 | Chống quên trước đây | `--anchor-lam` mặc định **0.0**, EWC/Fisher **không tồn tại** trong repo |
 
 Tám lỗi ẩn được phát hiện trong lúc hiện thực hoá (ghi tại mục 8 của tài liệu đó), trong đó
@@ -142,7 +142,8 @@ A[2,2] cifar10: auto 33.55% | oracle 33.55% | route_acc 100.00%
 > (xem README.md mục 3.1a và B21 trong
 > `experiments/dynamic_depth_routing_2026-10-14.md`). Số tham số đã được đo lại
 > trực tiếp từ `ConvAML_18Layer_Hybrid`: **1,871,385 tham số = 7.49 MB** ở mặc định
-> `--norm in`, và mỗi task lưu khoảng **7.5 MB** snapshot. Con số
+> `--norm in`, và mỗi task lưu **7.12 MB** snapshot (encoder + selector + stem +
+> 18 layer + ln + structure head). Con số
 > `12,759,873 / 48.7 MB / +1.3 MB INT8` từng ghi ở đây là của bản mô hình cũ và
 > **không còn đúng** — đã sửa tại đây. Số tham số phụ thuộc `--norm`; bảng đầy đủ
 > nằm trong README.md.
