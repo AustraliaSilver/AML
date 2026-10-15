@@ -91,6 +91,7 @@ Các tệp này ghi lại quá trình thực nghiệm chuỗi 3 task Continual L
 - **Ma trận `A_method` (Snapshot Prototype Retained)**:
   - Giữ vững độ chính xác của Task 0 ở mức **97.63 %**, chứng minh tính vượt trội của việc lưu trữ snapshot cấu trúc/prototype thay vì chỉ dùng phạt EWC weight-space.
 - **`route_acc`**: Độ chính xác phân loại task của Router đại diện miền không gian z.
+- Log thô của 4 lần chạy pilot nằm ở [`artifacts/`](artifacts/README.md).
 
 ### 3.2. Dữ liệu ConvAML Phase 2 (`conv_aml_*.json`)
 - Lưu trữ kết quả so khớp giữa ConvAML và các baseline:

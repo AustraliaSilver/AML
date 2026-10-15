@@ -129,13 +129,20 @@ differentiably expected cost of the selected structure.
 #### Regression tests
 
 ```bash
-python -m pytest tests/test_dynamic_depth_routing.py -q     # 18 tests
-python scratch/test_p2_p3.py                                 # equivalence + gradient guards
+python -m pytest tests -q                                  # everything, CPU-safe
+python -m pytest tests/test_dynamic_depth_routing.py -q    # depth / P2 / P3
+python -m pytest tests/test_cost_and_autoprotocol.py -q     # cost model + protocol
+python validate_ext_in.py                                  # CUDA kernels (needs a GPU)
 ```
 
 These encode the specific failures observed: uninitialised memory leaking into
 per-sample-skipped rows, dtype mismatch under autocast, the MoE dispatch zeroing
 the architecture gradient, and EWC's Fisher being reset instead of accumulated.
+
+> The one-off diagnostic scripts that produced those measurements lived in
+> `scratch/`, which is git-ignored and therefore **not** shipped. Where a check
+> mattered it was rewritten as one of the tests above; the rest was a throwaway
+> and is not claimed as reproducible.
 
 ---
 

@@ -1171,7 +1171,7 @@ finder, and it had **no `mgn/blocks/` package at all**:
 
 ```
 python -c "import mgn; print(mgn.__file__)"     ->  ...\New folder (8)\mgn\__init__.py   (repo root)
-python scratch\foo.py                           ->  ...\site-packages\mgn\__init__.py    (stale)
+python <a script in a subdirectory>            ->  ...\site-packages\mgn\__init__.py    (stale)
 ```
 
 The duplicate was removed. `pip install -e .` in CI keeps only the editable
@@ -1183,11 +1183,30 @@ stale code whenever launched from a subdirectory.
 ## 10. Reproduction
 
 ```powershell
-python scratch\diag_arch_grad.py        # arch gradient / step-budget diagnostic
-python scratch\ab_arch.py --prior neutral --depth-cost 0 --steps 60
-python scratch\ab_arch.py --prior staged  --depth-cost 0.02 --arch-lr 3e-3 --steps 60
-python scratch\test_p2_p3.py            # P2/P3/FLOPs equivalence + gradient guards
-python -m pytest tests\test_dynamic_depth_routing.py -q
+python -m pytest tests -q                                  # the enforced guards
+python -m pytest tests\test_dynamic_depth_routing.py -q     # depth gates, P2, P3
+python -m pytest tests\test_cost_and_autoprotocol.py -q      # cost model, protocol
+python -m pytest tests\test_router_cov_per_task.py -q       # per-task covariance
+python -m pytest tests\test_auto_equals_oracle.py -q         # A_auto == A_oracle
+python validate_ext_in.py                                   # CUDA parity (GPU only)
+python probes\probe_router_calibration.py                   # router metric sweep
+python probes\probe_router_agreement.py routing_state_after_cifar10.pt
+python train_continual_aml.py --tasks mnist,cifar10,fashion --epochs 5,28,16 --replay-per-class 0
+```
+
+**The one-off scripts that produced the original measurements are not shipped.**
+They lived in `scratch/`, which is git-ignored, so a fresh clone has no
+`scratch\ab_arch.py`, no `scratch\diag_arch_grad.py` and no
+`scratch\test_p2_p3.py`. Where a check was worth keeping it was rewritten as one
+of the tests listed above; the rest were throwaway A/B drivers and are not
+claimed as reproducible. The `--steps 60` A/Bs behind §2c can be re-run with the
+shipped trainer:
+
+```powershell
+python train_continual_aml.py --tasks mnist --epochs 5 --steps 60 --freeze 1 \
+       --arch-prior neutral --depth-cost 0.0
+python train_continual_aml.py --tasks mnist --epochs 5 --steps 60 --freeze 1 \
+       --arch-prior staged --depth-cost 0.02 --arch-lr 3e-3
 ```
 
 Baseline comparison used a detached worktree at `7a9b920`:

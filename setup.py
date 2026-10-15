@@ -4,6 +4,11 @@ setup.py - Standard packaging for AML with CUDA extensions.
 Enables:
     pip install -e .
     python setup.py build_ext --inplace
+
+Set FORCE_CUDA=1 to build the extensions on a machine with no visible GPU
+(Docker image builders, cross-compile hosts). `torch.cuda.is_available()`
+alone would silently skip the extensions there, producing an image whose
+imports fail later with a bare ModuleNotFoundError instead of a build error.
 """
 
 import os
@@ -23,7 +28,23 @@ try:
 except ImportError:
     has_torch = False
 
-if has_torch and torch.cuda.is_available():
+
+def _force_cuda():
+    """True when the user asked for a CUDA build regardless of local hardware.
+
+    `pip install -e .` inside a Docker build stage has no GPU, so
+    `torch.cuda.is_available()` is False and the extensions are skipped; the
+    image then ships without them and every fused-kernel import fails at run
+    time instead of at build time. FORCE_CUDA=1 makes the intent explicit.
+    """
+    v = os.environ.get("FORCE_CUDA", "")
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+if has_torch and (torch.cuda.is_available() or _force_cuda()):
+    if not torch.cuda.is_available():
+        print("[setup] FORCE_CUDA set: building the CUDA extensions on a host "
+              "with no visible GPU")
     cmdclass = {"build_ext": BuildExtension}
     extra_compile_args = {
         "cxx": ["/EHsc", "/std:c++17", "/Zc:preprocessor"] if sys.platform == "win32" else ["-std=c++17"],
