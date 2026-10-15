@@ -1805,19 +1805,23 @@ def main():
         for j in range(T - 1):
             worst_before = max(M[t][j] for t in range(j, T - 1))
             forg.append(worst_before - M[T-1][j])
-        return bwt, sum(forg) / len(forg)
+        # A_avg: mean of the final row - the single number the README tables
+        # quote, so it is printed here instead of being recomputed by hand from
+        # the matrix (and mis-transcribed, which is what the old tables did).
+        a_avg = sum(M[T-1][j] for j in range(T)) / T
+        return bwt, sum(forg) / len(forg), a_avg
 
     print_matrix(A_auto, "ACCURACY MATRIX A[i,j] - AUTONOMOUS ROUTER (Domain-IL / Class-IL)")
     print_matrix(A, "ACCURACY MATRIX A[i,j] - TASK-ORACLE SNAPSHOT RETRIEVAL (Task-IL)")
     print_matrix(A_live, "ACCURACY MATRIX A[i,j] - LIVE WEIGHTS (Standard Continual Learning)")
 
     if T > 1:
-        bwt_l, forg_l = cl_metrics(A_live)
-        bwt_a, forg_a = cl_metrics(A_auto)
-        bwt_m, forg_m = cl_metrics(A)
-        print(f"\n[live]       BWT: {bwt_l*100:+.2f}% | Forgetting: {forg_l*100:.2f}%")
-        print(f"[auto-route] BWT: {bwt_a*100:+.2f}% | Forgetting: {forg_a*100:.2f}%")
-        print(f"[oracle]     BWT: {bwt_m*100:+.2f}% | Forgetting: {forg_m*100:.2f}%")
+        bwt_l, forg_l, avg_l = cl_metrics(A_live)
+        bwt_a, forg_a, avg_a = cl_metrics(A_auto)
+        bwt_m, forg_m, avg_m = cl_metrics(A)
+        print(f"\n[live]       A_avg: {avg_l*100:6.2f}% | BWT: {bwt_l*100:+.2f}% | Forgetting: {forg_l*100:.2f}%")
+        print(f"[auto-route] A_avg: {avg_a*100:6.2f}% | BWT: {bwt_a*100:+.2f}% | Forgetting: {forg_a*100:.2f}%")
+        print(f"[oracle]     A_avg: {avg_m*100:6.2f}% | BWT: {bwt_m*100:+.2f}% | Forgetting: {forg_m*100:.2f}%")
         print("  (method column uses test-time router+snapshot retrieval; report")
         print("   the LIVE column when comparing against standard CL literature)")
 
