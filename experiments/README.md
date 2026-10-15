@@ -148,6 +148,64 @@ A[2,2] cifar10: auto 33.55% | oracle 33.55% | route_acc 100.00%
 > **không còn đúng** — đã sửa tại đây. Số tham số phụ thuộc `--norm`; bảng đầy đủ
 > nằm trong README.md.
 
+#### Bảng số 3.3 (benchmark lịch sử) — **đã bị thay thế**
+
+Các số ở mục 3.3 đến từ `benchmarks/benchmark_cl_comparison.py` **trước** khi
+script được sửa: snapshot chỉ khôi phục một phần trạng thái, encoder và
+prototype selector không có trong optimizer, và `isolator.mask_grad()/restore()`
+chưa từng được gọi. Chúng được giữ lại để đối chiếu, không nên trích dẫn.
+
+#### 3.6. Chạy production đầy đủ (2026-10-15)
+
+```bash
+python train_continual_aml.py --tasks mnist,cifar10,fashion \
+  --epochs 5,28,16 --replay-per-class 0 --norm in \
+  --encoder-tail-act none --arch-lr 3e-3 --depth-cost 0.02
+```
+
+Mọi tham số còn lại đều là mặc định của repo (`--ewc-lambda 0`,
+`--route-tau 0.6`, `--route-per-task 1`), seed 42, bf16, một GPU.
+
+| Giao thức | `A_avg` | BWT | Quên Lãng | `route_acc` thấp nhất |
+| :--- | ---: | ---: | ---: | ---: |
+| `A_live` (trọng số sống) | 48.61% | −57.80% | 57.80% | — |
+| `A_auto` (router tự trị) | 50.31% | −54.43% | 54.43% | **5.94%** |
+| `A_oracle` (có task id) | **86.73%** | **+0.00%** | **0.00%** | — |
+
+Ma trận đầy đủ:
+
+| Ma trận | sau MNIST | sau CIFAR-10 | sau Fashion |
+| :--- | ---: | ---: | ---: |
+| `A_oracle` | 98.65% | 98.65% \| 69.22% | 98.65% \| 69.22% \| 92.32% |
+| `A_auto` | 98.65% | 93.47% \| 69.22% | 16.09% \| 42.93% \| 91.91% |
+| `A_live` | 98.61% | 21.65% \| 70.10% | 22.95% \| 30.15% \| 92.74% |
+
+`route_acc` theo từng ô: 100.00% → 93.96% → 100.00% qua stage 2, rồi **5.94%**
+(MNIST) và **50.01%** (CIFAR-10) sau task 3. 5.94% thấp hơn nhiều so với ngẫu
+nhiên (33.3%), tức là router sai có hệ thống chứ không phải nhiễu.
+
+**Nguyên nhân (đo trên chính checkpoint của lần chạy này, xem B40).** Router
+nhúng query bằng encoder của từng task, nên centroid của task *k* nằm trong
+không gian đặc trưng của encoder *k*; nhưng metric Mahalanobis dùng **một**
+covariance gộp của cả ba task. Ba không gian ấy chỉ chung số chiều, nên ma trận
+gộp không mô tả được không gian nào. Đo lại trên `aml_continual_after_*.pt`:
+
+| Routing accuracy (3 task) | covariance gộp (cũ) | covariance từng task |
+| :--- | ---: | ---: |
+| MNIST | 6.07% (run: 5.94%) | 95.10% |
+| CIFAR-10 | 41.16% (run: 50.01%) | 99.98% |
+| Fashion | 98.78% (run: 99.39%) | 85.75% |
+
+Dùng riêng từng task thì mất Fashion, nên metric mới là hỗn hợp
+`S_k = (1−α)·S_k + α·S_gộp` với `--router-cov-alpha 0.15`: MNIST 95.37%,
+CIFAR-10 99.67%, Fashion 96.36%, trung bình **97.13%** (so với 48.67% của bản
+gộp). Bộ nhớ tăng từ một ma trận `D×D` lên `T×D×D` (3.0 MB với T=3, D=512) và
+vẫn **zero-replay**: đây là moment thống kê, không phải ảnh exemplar.
+
+> Đây mới là **chẩn đoán**. Số trên đo trên checkpoint thật và tái lập đúng
+> `route_acc` của lần chạy, nhưng xác nhậng end-to-end phải chờ lần chạy lại
+> với mặc định mới.
+
 #### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn (A[i, j]):
 
 | Kiến Trúc / Mô Hình | Sau Stage 1 (MNIST) | Sau Stage 2 (CIFAR-10) | Sau Stage 3 (Fashion-MNIST) | `A_avg` Cuối | Quên Lãng |
