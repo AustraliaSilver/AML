@@ -944,13 +944,100 @@ protocols keep their task mask.
 
 **B15 (medium) — README credited the wrong model with 12,759,873 parameters.**
 That is the legacy `ConvAML_CIFAR_TrueDynamic` (`train.py`), which stores every
-conv kernel inside `proto_weights`. `ConvAML_18Layer_Hybrid` has **1,874,073**
-(7.5 MB fp32) — the legacy model is **6.81× larger**. All four tables corrected.
+conv kernel inside `proto_weights`. `ConvAML_18Layer_Hybrid` has **1,871,385**
+(7.49 MB fp32) at the default `--norm in` — the legacy model is **6.82× larger**.
+All four tables corrected. The count is norm-dependent, because `conv_has_bias`
+and the norm's own affine pair trade against each other, so it is quoted per
+norm rather than as a single number:
+
+| `norm_type` | parameters | fp32 size |
+|---|---|---|
+| `bn` | 1,874,073 | 7.15 MB |
+| `gn1` | 1,876,761 | 7.16 MB |
+| **`in` (default)** | **1,871,385** | **7.14 MB** |
 
 B5 and B6 were both written by the fix for this task and caught by the tests
 written alongside it — which is the argument for keeping
 `tests/test_dynamic_depth_routing.py` in CI. B9 was found by re-reading the two
 sources of `layer_gates` after the tests passed, not by the tests themselves.
+
+### B30–B36 — found by re-reading the code against the math, then pinned by tests
+
+**B30 (high) — EWC anchored every past task to the *most recent* task's weights.**
+The across-task state was a running sum of Fisher `_fisher_all` plus a single
+`_star` that `consolidate()` **overwrote** each task. After task 2 that scores
+task 1's Fisher against task 2's `θ*`, i.e. it anchors the model to a point that
+has already forgotten task 1. A second defect compounded it: the guard read
+`if not self.enabled or not self._fisher_all or not self._star` while
+`consolidate()` rebuilt `_star` from the parameters actually present in the
+Fisher set, so the penalty could return exactly `0.0` for every task after the
+first.
+
+The exact expansion needs only two accumulators of the same size as the
+`(F, θ*)` pair it replaces:
+
+```
+sum_t F^(t)(θ − θ*^(t))²  =  A·θ² − 2B·θ + c      A = Σ F^(t),  B = Σ F^(t)θ*^(t)
+penalty()                 =  (λ/2)·Σ A(θ − B/A)²   completed square; c is θ-free
+```
+
+The completed square keeps the value non-negative and vanishing at the
+**Fisher-weighted mean of every task's optimum**, which is where the true
+quadratic is minimised. `state_bytes()` is unchanged at 2 vectors/parameter.
+`tests/test_fisher_ewc.py` checks the gradient against a brute-force T-copy
+reference, asserts the minimum is the weighted mean and not `θ*^(last)`, and
+quantifies how much worse the old scheme was at the optimum. EWC remains
+*disabled by default* (`--ewc-lambda 0`); this fixes the maths, not B19's verdict.
+
+**B31 (medium, perf) — the fused backward was unreachable at every default config.**
+`pipeline_backward` gated the fused mix kernels on `C_out <= 256 and 256 % C_out == 0`,
+a v1 leftover; the v2 kernel walks channels sequentially and only parallelises
+over spatial, so the divisor test is meaningless. At the shipped default
+`--max-dim 48` it is `256 % 48 == 16`, so `use_mix` was **false on every default
+run** and the backward silently fell back to ATen recompute. Lifted to
+`C <= MB_MAX_C` (1024, the kernel's own cap) on both sides of the boundary —
+the Python guard and the `TORCH_CHECK` in `mgn/csrc/bindings.cpp` had already
+drifted, which is exactly the failure mode a source-level test can catch:
+`tests/test_fused_kernel_guard.py` pins both guards to the `#define` in
+`fused_pipeline.cu`. **The two guards must change together**: changing only the
+Python one turns a silent fallback into a hard `RuntimeError`.
+
+**B32 (medium) — the static child was a different function from its mother.**
+`extract_child_hybrid18` compiled the structure argmax but dropped the **depth
+gate** (every block ran at full strength, so `--depth-cost` had no effect on the
+extracted model), carried the legacy `dropout_p = 0.2` where `hybrid_18.py` uses
+`0.1`, and clamped the width at the legacy `24.0` instead of the mother's `16.0`.
+Each is a constant that silently drifts the moment the mother changes.
+`StaticHybridBlock` now takes `gate` / `is_first` / `gate_skip_eps`, compiles a
+closed gate out entirely (`is_active = False` → returns `x` untouched, so it
+costs nothing), and the constants are named and source-annotated. Four tests added.
+
+**B33 (low) — class default `norm_type="bn"` contradicted the CLI default `in`.**
+`ConvAML_18Layer_Hybrid()` built with no arguments produced BatchNorm while
+`train_continual_aml.py --norm` defaulted to InstanceNorm, so any script that
+constructed the model directly (tests, probes, benchmarks) silently measured a
+different model from the trainer. Defaults aligned to `in`.
+
+**B34 (low, tooling) — `python -m pytest` at the repo root collected `scratch/`.**
+`scratch/test_p2_p3.py` calls `sys.exit()` at import time (it is a script, not a
+test), which pytest reports as `INTERNALERROR … caught unexpected SystemExit` and
+**zero tests run** — a green-looking failure that hides the entire suite. Fixed
+with `testpaths = ["tests"]` in `pyproject.toml` rather than by deleting the
+scratch script, which is still referenced by the reproduction commands below.
+
+**B35 (medium) — "snapshot retrieval" in `benchmark_cl_comparison.py` was a partial swap.**
+It restored `stem`, `layers`, `proto_weights` and the structure heads, but not
+`vision_encoder`, `prototype_selector` or `ln` — the three blocks that carry the
+domain signal — and then evaluated with `pi_mask=None`, so a snapshot was scored
+against all K prototype rows, including rows never trained for that domain (the
+same defect as B14, one layer down). Both fixed: the benchmark now swaps the
+full snapshot and evaluates each task under its own prototype row range.
+
+**B36 (medium) — the AML-vs-HtS benchmark never trained its router.**
+`dom_head = nn.Linear(1024, T)` was created, used at evaluation, and put in
+**no optimizer and no loss term**, so autonomous routing there was a fixed random
+projection. It now has its own `AdamW`, a `0.3`-weighted cross-entropy against
+the current task id, and its own gradient-norm clip.
 
 ---
 
