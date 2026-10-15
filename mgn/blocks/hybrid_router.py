@@ -20,7 +20,7 @@ class HybridBlock(BaseDynamicBlock):
         in_channels: int,
         out_channels: int,
         num_heads: int = 4,
-        norm_type: str = "bn",
+        norm_type: str = "in",
         norm_groups: int = 1
     ):
         super().__init__(in_channels, out_channels)

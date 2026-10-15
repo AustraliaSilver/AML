@@ -530,6 +530,41 @@ class TestNormalizationChoices(unittest.TestCase):
         # "(default: ...)" suffix which argparse may push onto a later line
         self.assertIn("DEFAULT CHANGED bn -> in", r.stdout[i:i + 900])
 
+    def test_every_block_default_matches_the_cli_default(self):
+        """The CLI default is only meaningful if the classes agree.
+
+        `--norm` defaults to `in` (InstanceNorm), and BatchNorm is the only
+        option carrying running statistics, which go stale per candidate
+        branch. A block class that still defaulted to `bn` builds a *different
+        model* for anyone constructing it directly - which is exactly what
+        happened here: `cnn_block` and `hybrid_18` were aligned to `in` and
+        `hybrid_router.HybridBlock` was missed, so the legacy executor kept
+        building BatchNorm blocks while the trainer asked for InstanceNorm.
+        """
+        import inspect
+        from mgn.blocks import cnn_block, hybrid_router
+        from mgn.blocks.hybrid_18 import ConvAML_18Layer_Hybrid
+
+        for cls in (cnn_block.PlainConvBlock, cnn_block.ResNetBlock,
+                    hybrid_router.HybridBlock):
+            sig = inspect.signature(cls.__init__)
+            self.assertEqual(sig.parameters["norm_type"].default, "in",
+                             f"{cls.__name__} still defaults to BatchNorm")
+        sig = inspect.signature(ConvAML_18Layer_Hybrid.__init__)
+        self.assertEqual(sig.parameters["norm_type"].default, "in")
+
+    def test_class_default_actually_builds_instance_norm(self):
+        """Not just the signature: build the block the way an unaware caller
+        would and inspect the module that actually got constructed."""
+        import torch.nn as nn
+        from mgn.blocks.cnn_block import PlainConvBlock, ResNetBlock
+        from mgn.blocks.hybrid_router import HybridBlock
+        self.assertIsInstance(PlainConvBlock(4, 4).norm, nn.InstanceNorm2d)
+        self.assertIsInstance(ResNetBlock(4, 4).norm1, nn.InstanceNorm2d)
+        hb = HybridBlock(4, 4)
+        self.assertIsInstance(hb.plain.norm, nn.InstanceNorm2d)
+        self.assertIsInstance(hb.resnet.norm1, nn.InstanceNorm2d)
+
 
 if __name__ == "__main__":
     unittest.main()
