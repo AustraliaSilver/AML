@@ -1381,8 +1381,15 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
 # ----------------------------------------------------------------------
 # Main continual loop
 # ----------------------------------------------------------------------
-def main():
-    _prevent_sleep()
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The trainer's CLI, as its own function.
+
+    Extracted from main() so the defaults can be asserted by a test without
+    launching a training run. That matters here because the defaults *are* the
+    scientific claim: `--replay-per-class 0` and `--norm in` are what every
+    README number was measured with, and a default that drifts from the
+    documented command silently changes which method was measured.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument('--tasks', type=str, default='mnist,cifar10,fashion')
     ap.add_argument('--epochs', type=str, default='5,28,16', help='per-task epochs')
@@ -1426,8 +1433,14 @@ def main():
                          "before quoting as final.")
     ap.add_argument('--workers', type=int, default=2, help='DataLoader workers')
     ap.add_argument('--freeze', type=int, default=2)
-    ap.add_argument('--replay-per-class', type=int, default=400,
-                    help='exemplars per class stored in the replay buffer (0 = off)')
+    ap.add_argument('--replay-per-class', type=int, default=0,
+                    help='exemplars per class stored in the replay buffer (0 = off). '
+                         'DEFAULT CHANGED 400 -> 0. Every headline result in the '
+                         'README and the paper is a ZERO-REPLAY result; shipping '
+                         'a default that silently stores 400 exemplars per class '
+                         'meant the documented command and a bare '
+                         '`python train_continual_aml.py` measured two different '
+                         'methods.')
     ap.add_argument('--consolidate-epochs', type=int, default=2)
     ap.add_argument('--route-tau', type=float, default=0.6,
                     help='router margin below which a sample is evaluated under ALL '
@@ -1510,6 +1523,12 @@ def main():
                     help='shrinkage added to the diagonal of the shared '
                          'covariance, as a fraction of its mean diagonal. '
                          'Stabilises the inverse; 0.01 measured best.')
+    return ap
+
+
+def main():
+    _prevent_sleep()
+    ap = build_arg_parser()
     args = ap.parse_args()
     use_replay = args.replay_per_class > 0
     shared_backbone = bool(args.shared_backbone)
