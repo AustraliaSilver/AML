@@ -1469,14 +1469,22 @@ adds $\approx 6$ nats to a $10$-way cross-entropy and suppresses classification
 entirely.
 
 \paragraph{Snapshot size and a stability mechanism that was disabled.}
-The full per-task snapshot is $1{,}781{,}793$ values $\approx 7.2\,\mathrm{MB}$
-(of which the $18$ layers are $5.86\,\mathrm{MB}$), or $\approx 21.6\,\mathrm{MB}$
+The per-task snapshot (encoder, prototype selector, stem, the $18$ layers, the
+head LayerNorm and the two structure heads) is $1{,}779{,}105$ values
+$\approx 7.12\,\mathrm{MB}$ at the default \texttt{--norm in}
+(of which the $18$ layers are $5.85\,\mathrm{MB}$), or $\approx 21.4\,\mathrm{MB}$
 over three tasks; it is a $7\,\mathrm{MB}$ problem rather than the tens of
-megabytes sometimes quoted. Separately, the only stability term shipped in the
-continual trainer was an $L_2$-SP anchor on the encoder and prototype selector,
-defaulting to $\lambda = 0.0$, i.e.\ \emph{disabled}; measured $A_{\text{live}}$
-decays $98.05\% \rightarrow 3.52\% \rightarrow 28.99\%$ across the three tasks.
-We therefore add diagonal-Fisher Elastic Weight Consolidation over the shared
+megabytes sometimes quoted. The figure is norm-dependent: with
+\texttt{--norm bn} the same snapshot is $1{,}781{,}793$ values
+$\approx 7.13\,\mathrm{MB}$. The prototype matrix itself is not part of that
+number --- it is only $92{,}280$ values and is stored int8-quantised --- so
+quoting it alone, rounded to whole megabytes, reports ``$0$ MB'' and understates
+the real cost by two orders of magnitude. Separately, the only stability term
+shipped in the continual trainer was an $L_2$-SP anchor on the encoder and
+prototype selector, defaulting to $\lambda = 0.0$, i.e.\ \emph{disabled};
+measured $A_{\text{live}}$ decays $98.05\% \rightarrow 3.52\% \rightarrow
+28.99\%$ across the three tasks. We therefore add diagonal-Fisher Elastic Weight
+Consolidation over the shared
 trunk. The penalty is the exact multi-task quadratic
 $L_{\mathrm{EWC}} = \tfrac{\lambda}{2}\sum_t \sum_i F_i^{(t)}\bigl(\theta_i -
 \theta^{\star\,(t)}_i\bigr)^2$, which naively wants one
@@ -1646,13 +1654,13 @@ We envision several promising extensions of Architecture Mode Learning:
     
     \item \textbf{Per-sample routing:} Extending from per-task to per-sample routing would enable different images within a single batch to traverse entirely different computational graphs, maximizing the efficiency gains for heterogeneous-difficulty datasets. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Candidate-block dispatch on the routing sub-batch is implemented and verified numerically equivalent for one-hot routing, but it is currently worth nothing in practice: on the released checkpoints the per-batch mode assignment is already uniform, so the pre-existing single-branch fast path already absorbs the win. The remaining open question is how to make mode routing non-uniform in the first place without destabilising weight training.
     
-    \item \textbf{Online and continual learning:} Coupling AML with elastic weight consolidation would allow the architecture to dynamically expand for new tasks while protecting previously learned knowledge through the Ghost Layer mechanism. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Diagonal-Fisher EWC over the shared trunk is now implemented and tested. What remains open is the stronger variant: dropping the per-task snapshot entirely in favour of a single shared backbone plus task-conditioned sparse adapters, which would reduce per-task state from the current $7.2\,\mathrm{MB}$ to a bitmask plus quantised prototypes. We did not attempt this here, because removing the $18$-layer snapshot without first validating that EWC holds $A_{\text{live}}$ steady is precisely the configuration that currently collapses accuracy.
+    \item \textbf{Online and continual learning:} Coupling AML with elastic weight consolidation would allow the architecture to dynamically expand for new tasks while protecting previously learned knowledge through the Ghost Layer mechanism. \emph{(Partially realised --- see Section~\ref{sec:depth_audit}.)} Diagonal-Fisher EWC over the shared trunk is now implemented and tested. What remains open is the stronger variant: dropping the per-task snapshot entirely in favour of a single shared backbone plus task-conditioned sparse adapters, which would reduce per-task state from the current $7.12\,\mathrm{MB}$ to a bitmask plus quantised prototypes. We did not attempt this here, because removing the $18$-layer snapshot without first validating that EWC holds $A_{\text{live}}$ steady is precisely the configuration that currently collapses accuracy.
 
 \emph{(Subsequently measured --- Section~\ref{sec:depth_audit}.)} Under
 \texttt{--shared-backbone}, a controlled A/B at an identical schedule shows the
 trade cuts the \emph{opposite} way from the usual expectation:
 $A_{\text{live}}$ forgetting falls from $23.05\%$ to $13.91\%$ and per-task
-state from $7.2\,\mathrm{MB}$ to $\approx 1.2\,\mathrm{MB}$, while
+state from $7.12\,\mathrm{MB}$ to $\approx 1.2\,\mathrm{MB}$, while
 $A_{\text{oracle}}$ forgetting rises from $0.00\%$ to $9.00\%$ --- unavoidable,
 since there is a single shared trunk and therefore nothing to retrieve. The
 setting is a deployment-dependent trade rather than a strict improvement, and it
