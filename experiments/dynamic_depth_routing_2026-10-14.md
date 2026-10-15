@@ -1702,7 +1702,11 @@ moved the HtS baseline numbers, so the file is untouched;
 native kernels, verified by rebuilding.**
 
 Measured, not asserted: `python build_ext.py` -> `_C: OK (11 exports)`,
-`_Cin: OK (4 exports)`; the full suite above runs against the rebuilt `.pyd`.
+`_Cin: OK (4 exports)`; the full suite above runs against the rebuilt `.pyd`;
+and `validate_ext_in.py` (the B39 forward/gradient parity gate) still ends
+`done -- all gated checks passed` at every gated width (GN1 rel_err 0.00409 vs
+tol 0.05000; L=18 D=48 production rel_err 0.18970 vs tol 0.31684), so the widened
+indices and the contiguity fix do not move the fused numerics.
 
 - `in/bindings_in.cpp:in_maxpool2x2_bwd` passed `data_ptr()` straight through
   from the incoming tensors, and `dh_out` is an upstream autograd gradient that
