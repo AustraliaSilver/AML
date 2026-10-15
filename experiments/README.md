@@ -206,6 +206,63 @@ vẫn **zero-replay**: đây là moment thống kê, không phải ảnh exempla
 > `route_acc` của lần chạy, nhưng xác nhậng end-to-end phải chờ lần chạy lại
 > với mặc định mới.
 
+#### 3.6. Chạy production đầy đủ (2026-10-15, bản cuối)
+
+```bash
+python train_continual_aml.py --tasks mnist,cifar10,fashion \
+  --epochs 5,28,16 --replay-per-class 0 --norm in \
+  --encoder-tail-act none --arch-lr 3e-3 --depth-cost 0.02
+```
+
+Các tham số còn lại đều là mặc định của repo: `--ewc-lambda 0`,
+`--router-metric mahalanobis-task`, `--router-cov-alpha 0`,
+`--router-logdet-weight 0.5`, `--router-fit-split train`, seed 42, bf16.
+
+| Giao thức | `A_avg` | BWT | Quên Lãng | `route_acc` thấp nhất |
+| :--- | ---: | ---: | ---: | ---: |
+| `A_live` (trọng số sống) | 47.49% | −58.71% | 58.71% | — |
+| `A_auto` (router tự trị) | **81.96%** | −6.34% | 6.34% | 89.02% |
+| `A_oracle` (có task id) | **86.19%** | **+0.00%** | **0.00%** | — |
+
+Ma trận đầy đủ:
+
+| Ma trận | sau MNIST | sau CIFAR-10 | sau Fashion |
+| :--- | ---: | ---: | ---: |
+| `A_oracle` | 98.54% | 98.54% \| 67.92% | 98.54% \| 67.92% \| 92.12% |
+| `A_auto` | 98.54% | 98.54% \| 67.92% | 88.96% \| 64.82% \| 92.11% |
+| `A_live` | 98.57% | 36.52% \| 68.84% | 23.78% \| 26.21% \| 92.47% |
+
+`route_acc`: 100.00% (mọi ô stage 1–2), rồi 89.02% / 95.00% / 99.97% ở stage 3.
+Chênh lệch còn lại giữa `A_auto` và `A_oracle` là **4.23 điểm**, và nó có
+hướng rõ ràng: 10.98% ảnh MNIST bị gửi sang Fashion sau task 3, 5.00% ảnh
+CIFAR-10 tương tự — **toàn bộ sai sót đi về phía trước**, về encoder mới
+nhất, chứ không quay lại task cũ.
+
+**Tiến bộ qua ba lần chạy cùng lịch `5,28,16`:**
+
+| | `A_auto A_avg` | `A_oracle A_avg` | `route_acc` thấp nhất |
+| :--- | ---: | ---: | ---: |
+| Shared covariance, thống kê trên **test** | 50.31% | 86.73% | 5.94% |
+| Per-task covariance (α=0.15), test | — | — | 1.29% (stage 2) |
+| **Per-task + log-det (β=0.5), train** | **81.96%** | **86.19%** | **89.02%** |
+
+Hai bài học (chi tiết ở B41 trong
+[`dynamic_depth_routing_2026-10-14.md`](dynamic_depth_routing_2026-10-14.md)):
+
+1. **Bản đầu tiên của "cách sửa" sai.** Dự đoán offline rằng covariance
+   từng task với α=0.15 sẽ sửa được, nhưng khi chạy thật thì stage 2 tệ đi
+   (93.96% → 1.29%).
+2. **Nguyên nhân thật là rò rỉ dữ liệu.** Trainer vốn ước lượng centroid và
+   second moment trên **tập test** — đúng những ảnh router sẽ phải phân loại.
+   `probes/probe_router_agreement.py` xác nhận đường tính toán của probe trùng
+   khớp trainer (sai số tương đối 8e-5) khi dùng tập test; khác biệt chỉ nằm ở
+   split. CIFAR-10 có centroid train/test lệch nhau 6.4%, và khi bỏ rò rỉ thì
+   *mọi* metric đều giảm — kể cả metric đang chạy.
+
+Vậy nên thống kê router giờ được ước lượng trên **tập train**
+(`--router-fit-split train`, mặc định), và số liệu ở trên là số liệu trung
+thực.
+
 #### Diễn Tiến Độ Chính Xác Qua Từng Giai Đoạn (A[i, j]):
 
 | Kiến Trúc / Mô Hình | Sau Stage 1 (MNIST) | Sau Stage 2 (CIFAR-10) | Sau Stage 3 (Fashion-MNIST) | `A_avg` Cuối | Quên Lãng |
