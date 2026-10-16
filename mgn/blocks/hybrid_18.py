@@ -27,6 +27,32 @@ from .cnn_block import make_norm, conv_has_bias
 from mgn.generator import DistanceRouter
 
 
+def _hoist_block_mode_flags(block_mode: torch.Tensor):
+    """Read every layer's routing predicates in ONE device->host transfer.
+
+    `HybridBlock.forward` needs three host-side scalars per layer: whether the
+    mode distribution is one-hot (`all_hard`), whether every sample in the batch
+    chose the same mode (`same_mode`), and which mode that was (`chosen`). Read
+    inside the layer loop that is two synchronisations per layer -- 36 per
+    forward -- and each one drains the launch queue, so the GPU cannot be fed
+    ahead of the CPU. The whole `block_mode` [B, L, 3] tensor already exists
+    before the loop, so all L layers' flags can be packed into one [3, L] tensor
+    and read with a single `.tolist()`.
+
+    The values are computed from the same slice, by the same comparisons, as the
+    per-layer path in `HybridBlock.forward`; only the number of transfers
+    changes. Returns a list of `(all_hard, same_mode, chosen)` per layer.
+    """
+    with torch.no_grad():
+        mode_max, mode_idx = block_mode.max(dim=-1)          # [B, L]
+        all_hard = (mode_max > 0.99).all(dim=0)              # [L]
+        same_mode = (mode_idx == mode_idx[0:1]).all(dim=0)   # [L]
+        chosen = mode_idx[0]                                 # [L]
+        packed = torch.stack((all_hard.float(), same_mode.float(),
+                              chosen.float())).tolist()
+    return [(bool(a), bool(b), int(c)) for a, b, c in zip(*packed)]
+
+
 class DynamicStructure(NamedTuple):
     layer_gates: torch.Tensor
     dim_weights: torch.Tensor
@@ -376,6 +402,18 @@ class ConvAML_18Layer_Hybrid(nn.Module):
             skip_layer, partial_layer = a0, a1
             del agg, sk
 
+        # Same hoist, for the branch flags. `HybridBlock.forward` would otherwise
+        # read two scalars per layer off the device -- 36 synchronisations per
+        # forward, each draining the launch queue. `block_mode` is fully
+        # materialised above on every path (struct_override, the training
+        # straight-through sample, the eval one-hot), so all 18 layers'
+        # `(all_hard, same_mode, chosen)` come back in this one transfer.
+        #
+        # The per-sample depth-skip branch below deliberately passes no flags: it
+        # slices `w_mode` down to the active sub-batch, so this layer's row 0 is
+        # not that slice's row 0.
+        layer_flags = _hoist_block_mode_flags(block_mode)
+
         for i, layer in enumerate(self.layers):
             # Layer 0 defines the feature scale consumed by the rest of the
             # trunk, so its gate is deliberately ignored (unchanged behaviour).
@@ -387,7 +425,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                 gate_c = layer_gates[:, i:i + 1].view(B, 1, 1, 1)
 
                 if i == 0:
-                    h_new = layer(h, mode_weights=w_mode, dim_mask=d_mask)
+                    h_new = layer(h, mode_weights=w_mode, dim_mask=d_mask,
+                                  flags=layer_flags[0])
                     n_executed += 1
                 elif partial_layer[i]:
                     # Per-sample depth skip: run the block only for the samples
@@ -410,7 +449,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                     h_new[active] = upd
                     n_executed += 1
                 else:
-                    h_cand = layer(h, mode_weights=w_mode, dim_mask=d_mask)
+                    h_cand = layer(h, mode_weights=w_mode, dim_mask=d_mask,
+                                   flags=layer_flags[i])
                     h_new = gate_c * h_cand + (1.0 - gate_c) * h
                     n_executed += 1
             h = h_new

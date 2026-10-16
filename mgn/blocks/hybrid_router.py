@@ -32,29 +32,49 @@ class HybridBlock(BaseDynamicBlock):
         self,
         x: torch.Tensor,
         mode_weights: Optional[torch.Tensor] = None,
-        dim_mask: Optional[torch.Tensor] = None
+        dim_mask: Optional[torch.Tensor] = None,
+        flags: Optional[Tuple[bool, bool, int]] = None
     ) -> torch.Tensor:
         """
         x: [B, C_in, H, W]
         mode_weights: [B, 3] or [1, 3] (probabilities for [plain, resnet, vit])
         dim_mask: [B, C_out, 1, 1]
+        flags: this layer's `(all_hard, same_mode, chosen)`, precomputed by the
+            caller via `_hoist_block_mode_flags`. Computing them here costs two
+            device->host synchronisations (`_flags.tolist()` and
+            `mode_idx[0].item()`), i.e. 36 per 18-layer forward, each of which
+            drains the launch queue. A caller holding the whole `block_mode`
+            [B, L, 3] tensor can read every layer's flags in one transfer and
+            pass them down. The values come from the same comparisons on the
+            same slice, so `flags` is a pure latency knob: passing it does not
+            change the result. It MUST be left None whenever `mode_weights` is a
+            sub-batch slice (the per-sample depth-skip path in
+            `ConvAML_18Layer_Hybrid.forward`), because then row 0 of the slice is
+            not row 0 of the batch.
         """
         if mode_weights is None:
             # Default to resnet if unrouted
             return self.resnet(x, dim_mask=dim_mask)
 
         if mode_weights.ndim == 2:
-            mode_max, mode_idx = mode_weights.max(dim=-1)
-            # One device->host transfer serves BOTH predicates below. The previous
-            # code evaluated two separate Python `and`s, i.e. two syncs per layer.
-            _flags = torch.stack(((mode_max > 0.99).all(),
-                                  (mode_idx == mode_idx[0]).all()))
-            all_hard, same_mode = _flags.tolist()
-            del _flags
+            if flags is None:
+                mode_max, mode_idx = mode_weights.max(dim=-1)
+                # One device->host transfer serves BOTH predicates below. The previous
+                # code evaluated two separate Python `and`s, i.e. two syncs per layer.
+                _flags = torch.stack(((mode_max > 0.99).all(),
+                                      (mode_idx == mode_idx[0]).all()))
+                all_hard, same_mode = _flags.tolist()
+                del _flags
+            else:
+                all_hard, same_mode, chosen = flags
+                # Only the index is still needed (per-sample MoE dispatch below).
+                # argmax is device-side: it does not synchronise.
+                mode_idx = mode_weights.argmax(dim=-1)
 
             if all_hard and same_mode:
                 # Whole batch agrees: execute the single selected block once.
-                chosen = mode_idx[0].item()
+                if flags is None:
+                    chosen = mode_idx[0].item()
                 if chosen == 0:
                     cand = self.plain(x, dim_mask=dim_mask)
                 elif chosen == 1:

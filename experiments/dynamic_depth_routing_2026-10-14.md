@@ -2332,6 +2332,172 @@ Two artifact notes, both of which limit what can be checked later.
 
 ---
 
+**B69 (measurement + fix) - where a production training step actually spends its
+time: the 64x64 step is 5x slower per sample than it should be and the cause is
+VRAM oversubscription, not a kernel; the trunk carries fp32 activations because a
+fp32 routing weight promotes a bf16 one; and 36 device->host synchronisations per
+forward were removable, bit-for-bit.**
+
+Artifacts: `benchmarks/profile_hybrid18.py` (step timing and kernel/memory tables),
+`benchmarks/ab_router_flag_hoist.py` (interleaved A/B), and
+`benchmarks/capture_router_identity.py` (bitwise before/after capture). Host: the
+same RTX 3050 6 GB Laptop GPU, `cuda`, bf16 autocast, `K=12`, `max_dim=48`,
+`norm=in`, `cudnn.benchmark=False`.
+
+**(a) A step-time benchmark of this model is not a benchmark until the RNG is
+pinned.** The first batch sweep measured batch 16 *slower* than batch 64 (239 ms
+against 200 ms at 32x32), which is impossible on its face. The cause is that the
+forward samples its own architecture every call -- Gumbel over `pi_logits`, Gumbel
+over the per-layer block-mode logits, and a `0.05 * randn_like` perturbation of the
+depth gates -- so two steps of the same configuration execute different branches
+and cost up to 2x each other. Re-seeding before each measured step removes it. A
+second, subtler form survives that fix: `torch.randn(B, 3, H, W)` consumes a
+batch-dependent number of RNG values, so the draws feeding the routing Gumbel
+differ between batch sizes, and a cross-batch sweep is still a sweep over sampled
+architectures. Compare variants *within* one batch size, or fix the architecture
+with `struct_override`. Every number below is from the seeded harness.
+
+**(b) The 32x32 production step, measured.** batch 256: **449.7 ms** total
+(forward 162.1, backward 286.8, optimizer 0.7), peak **2706 MiB**.
+
+**(c) The 64x64 cliff is VRAM oversubscription, not super-linear compute.** Per
+sample, 64x64 is 3.6x the 32x32 cost for 4x the pixels -- i.e. *sub-linear*, and
+this model should be *cheaper* per pixel at higher resolution because the ViT
+branch pools to <= 8x8 tokens. What actually happens at batch 256:
+
+| 64x64 batch | ms/step | ms/sample | peak MiB |
+|---|---|---|---|
+| 16 | 204 | 12.8 | 656 |
+| 32 | 265 | 8.3 | 1253 |
+| 64 | 442 | 6.9 | 2532 |
+| 128 | 762 | 5.9 | 4893 |
+| 256 | **7702** | **30.1** | **9733** |
+
+Peak allocation is linear in batch at **41 MiB/sample**, and the card has **6144
+MiB**. The cliff sits between batch 128 (4893 MiB, fits) and batch 256 (9733 MiB,
+does not): per-sample cost jumps 5.9 -> 30.1 ms, and the earlier unseeded sweep
+showed the identical cliff (6162 ms, 9808 MiB). Windows oversubscribes silently to
+host memory over PCIe rather than raising OOM, so this does not look like a bug --
+it looks like "64x64 is 15x slower than 32x32". **There is no kernel to write
+here.** At 64x64 on this card, batch 128 is ~5x faster per epoch than batch 256.
+The same arithmetic on the production command explains the standing anomaly in
+open item 5: the fused kernels were never the reason.
+
+**(d) The trunk runs fp32 activations.** A dtype probe on the real forward
+(`%TEMP%\opencode\probe_layer_dtype.py`) reports `bfloat16 -> float32` for layer 0
+and `float32 -> float32` for all 17 remaining layers. The mechanism is type
+promotion: the candidates are bf16 under autocast, but the mode weight
+(`mode_weights[:, chosen]`), the channel mask (`dim_mask`) and the depth gate
+(`gate_c`) are all views of fp32 tensors, so `out * dim_mask` and
+`gate_c * h_cand + (1 - gate_c) * h` produce fp32 and every layer's boundary tensor
+is fp32. Each conv then casts that full-size tensor back down. So every activation
+and its gradient in the trunk is carried at 4 bytes/element instead of 2, on
+exactly the resource that is spilling in (c). Making the trilinear factors follow
+the activation dtype is the next lever, but it is a **numerical change** (the
+blend and the mask multiply would round to bf16), so it must be opt-in and cannot
+be measured by the bitwise method below. Not written yet; open item 18.
+
+**(e) The fix that was applied: hoist the per-layer routing flags.** Each
+`HybridBlock.forward` read two host scalars -- `_flags.tolist()` for
+`all_hard`/`same_mode` and `mode_idx[0].item()` for `chosen` -- i.e. **36
+device->host synchronisations per forward**, each of which drains the launch queue.
+The whole `block_mode` `[B, 18, 3]` tensor already exists before the layer loop, so
+`_hoist_block_mode_flags` packs all 18 layers' three scalars into one `[3, 18]`
+tensor and reads them with a single `.tolist()`. This is the same hoist that was
+already applied to the skip/partial masks, for the same reason. The per-sample
+depth-skip branch passes no flags on purpose: it slices `w_mode` to the active
+sub-batch, so this layer's row 0 is not that slice's row 0.
+
+Evidence, in the order it should be trusted:
+
+* **Bitwise identity.** `benchmarks/capture_router_identity.py` captures the
+  forward output, `pi`, `layer_soft`, `bm_logits`, the loss, all 345 parameter
+  tensors and all 139 gradient tensors from one fixed seed (7, batch 64, 32x32,
+  bf16, `loss=2.744635`, `n_executed=18.0`), and compares a later build against
+  that capture with `torch.equal`. Pre-change capture against post-change build:
+  **every recorded tensor bitwise identical**. The training-mode case is the
+  strong one -- it pins that the hoist does not consume the global RNG differently,
+  hence that the sampled architecture is unchanged.
+* **11 new tests** in `tests/test_router_flag_hoist.py`: the batched predicate
+  against the per-layer predicate (training-style one-hot, mixed per-sample,
+  the `> 0.99` boundary at 0.995 and 0.985, soft `struct_override` rows), the block
+  with and without `flags` (all three branches, mixed modes, soft mixture,
+  train and eval), the full model with the old path restored by monkeypatch in
+  both modes, and the gradients.
+* **304 tests pass** (`python -m unittest discover tests`, 56 s).
+* **Interleaved A/B**, both variants in one process with the RNG re-seeded every
+  step, so clock drift hits both equally (a separate-process comparison had shown a
+  spurious 24 % regression at batch 16):
+
+| config | old (per-layer sync) | new (hoisted) | change |
+|---|---|---|---|
+| 32x32 batch 256 | 489.22 ms | 451.57 ms | **-7.70 %** |
+| 32x32 batch 64 | 208.92 ms | 198.32 ms | **-5.07 %** |
+| 64x64 batch 128 | 785.34 ms | 755.20 ms | **-3.84 %** |
+
+Means over the same 15 paired reps agree in sign and rough size (-10.3 %, -3.8 %,
+-3.4 %). The spread on this machine is 22-70 ms sd, so any single-run comparison
+here is unresolved; the interleaved median *and* mean agreeing across three
+configurations is what makes the 4-8 % credible. It also means the published
+`--epochs 5,28,16` schedule would finish 4-8 % sooner, with a **bit-identical**
+trajectory -- no number in any table changes.
+
+**(f) Adjudication of the external performance/robustness report.** The report was
+treated as claims to verify. Verified as *code*: the missing input validation in
+`mgn/csrc/in/bindings_in.cpp` (242 lines, zero `TORCH_CHECK`, zero `is_cuda`, zero
+`is_contiguous`) against `bindings.cpp` (4 `TORCH_CHECK`, 2 `is_cuda`, 12
+`is_contiguous`, all four in `mix_bwd_v2_a/b`); the 32-bit overflow sites; the
+FP64 accumulators and `<<<B, MB_THREADS>>>` launches in `fused_pipeline.cu`
+(`__shared__ double s_part`, `double ab0/ab1/alg/ch_term`); the 5D `einsum` in
+`hts_lib/models/basis.py:13-17`; `mgn/trainer.py:209`'s up-to-16 per-sample
+generator calls; and `mgn/regularization.py:58-66`'s O(n^2) loop with a `.item()`
+sync per pair. Also verified: `collect_structure_slot` collects the structure slot
+with `pi_mask=None` (`train_continual_aml.py:1138`) while training and the oracle
+lock the row range -- that is existing open item 1, not a new finding -- and the
+`structural`-mode routing collapse, which is B67.
+
+Refuted or corrected:
+
+* **The whole "very high" performance section is off-path.** `mgn/blocks/*` imports
+  nothing from `csrc/`, `_C` or `executor`; it is pure PyTorch. The continuation
+  trainer builds `ConvAML_18Layer_Hybrid` and never touches the extension, whose
+  consumers are `mgn/executor.py` and `train_cv_cifar_18.py`. The profiler's kernel
+  table for a real 32x32 step contains `aten::*` and cuDNN only -- **no custom AML
+  kernel appears**. So the dynamic-conv/shared-memory/tensor-core item, the FP64
+  item, the repeated `pi.to(kBFloat16)` item and the WMMA `s_b` item currently
+  optimise a path this project's training does not execute. The report also misses
+  both of the effects that *are* on the path: the 5x VRAM cliff in (c) and the fp32
+  trunk in (d).
+* **"Launchers do not call `cudaGetLastError`"** is file-dependent, not general:
+  `fused_pipeline.cu` has 5 such checks, `batched_hyper_linear.cu` 6,
+  `in/fused_pipeline_in.cu` 1; the zero-check files are
+  `custom_dynamic_ops.cu`, `fused_backward.cu`, `in/fused_backward_in.cu`.
+* **"loads environment variables through `shell=True`" attributed to
+  `dllsetup.py`** is wrong: that file contains no `shell=True`. The repo's only one
+  is `build_ext.py:91`, a compiler invocation. The `write_atomic` patch itself is
+  quoted verbatim and real; its claimed failure mode (`Bus error`) is a Linux
+  symptom, and on Windows the likelier outcome of `unlink`ing a loaded `.pyd` is
+  `PermissionError` -- so the patch replaces a tolerated `FileExistsError` with a
+  crash, which is worth noting but is not the described bug.
+* **`HtSBasisIsolator` protecting only `b1_priv..b3_priv`** is accurate as code
+  (`hts_lib/training/trainer.py:24-29`), but it is the *design* of that isolation
+  scheme, not a memory-safety bug, and it is the same phenomenon B67 measured on
+  the AML side: what is left unfrozen drifts, and forgetting follows.
+* **The `int base` oddity** is real and sharper than stated: in
+  `mgn/csrc/in/fused_pipeline_in.cu:163` the base index is `int base = ((b * C + c)
+  * H + h0) * W_` while its siblings at `fused_pipeline.cu:92`,
+  `fused_backward.cu:54` and `in/fused_backward_in.cu:49` all use `long base`, so
+  the `in` copy was missed when every other copy was widened. Also unmentioned by
+  the report: `int total = B * C * H2 * W2` (the launch-geometry computation)
+  appears in eight places across the same four files. Still open item 15.
+
+None of the security items were changed. They are unreachable from the training
+command this project runs, and "unreachable" is an argument from control flow,
+which this log has been wrong about before -- so they stay open items, not closed
+ones.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".
@@ -2454,3 +2620,32 @@ Written down so that "not done" is not later mistaken for "not noticed".
     0.00 % routing accuracy in that arm -- `structural` stores no per-task
     encoders, so each centroid is scored in a space it does not belong to -- and
     whether a router fitted on the live encoder would recover it.
+18. **The trunk carries fp32 activations because fp32 routing factors promote the
+    bf16 candidates (B69d).** `mode_weights[:, chosen]`, `dim_mask` and `gate_c`
+    are views of fp32 tensors, so `out * dim_mask` and the depth blend return fp32
+    and all 18 boundary tensors are 4 bytes/element. Measured, not assumed: a
+    dtype probe on the real forward reports `float32 -> float32` for layers 1-17.
+    Making the factors follow the activation dtype is the obvious next
+    optimisation -- it should halve activation memory and bandwidth, which is the
+    resource that spills at 64x64 in B69c -- but it is a **numerical change** (the
+    blend and the mask multiply would round to bf16), so it cannot be justified by
+    the bitwise test used for the flag hoist and it needs a full
+    `--epochs 5,28,16` run before any number depends on it. Not written.
+19. **A step-time benchmark of this model must pin the RNG (B69a).** The forward
+    samples its architecture per call, and the input tensor's own `randn` consumes
+    a batch-dependent number of RNG values, so a cross-batch sweep measures a
+    sweep over sampled architectures. Two sweeps in this entry were affected. The
+    new `benchmarks/profile_hybrid18.py --seed` re-seeds per measured step; that
+    removes the repetition noise but *not* the cross-batch confound, which needs
+    `struct_override` or a within-batch-size comparison. Any absolute ms/step
+    figure for this model is only meaningful with the seed and batch recorded next
+    to it.
+20. **`evaluate()`'s per-batch snapshot swapping was not re-measured (B69f).**
+    The external report's item 5 (copy `vision_encoder` weights per task per batch,
+    reload all 18 layers for every domain present in a batch, and for *every*
+    domain when a single sample falls below `--amb-topk 0`'s routing margin)
+    describes the documented design, and its O(T) term is real, but that cost has
+    never been separated from the accuracy numbers it produces. The suggested fix
+    -- one grouped convolution over the `T` stacked encoders, `groups=T` -- is
+    plausible and is a genuine optimisation of the eval path rather than of
+    training. Not attempted.
