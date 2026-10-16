@@ -21,6 +21,7 @@ from typing import Optional, Tuple, Dict, Any, NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _ckpt
 
 from .hybrid_router import HybridBlock
 from .cnn_block import make_norm, conv_has_bias
@@ -53,6 +54,37 @@ def _hoist_block_mode_flags(block_mode: torch.Tensor):
     return [(bool(a), bool(b), int(c)) for a, b, c in zip(*packed)]
 
 
+def _run_block(blk, x, mode_weights=None, dim_mask=None, flags=None):
+    """Positional-argument entry point, so a block can be handed to checkpoint()."""
+    return blk(x, mode_weights=mode_weights, dim_mask=dim_mask, flags=flags)
+
+
+def _call_block(blk, x, mode_weights, dim_mask, flags, use_ckpt):
+    """Call a block, optionally under activation checkpointing.
+
+    Checkpointing is **bitwise identical** to the ordinary call: it saves the
+    block's inputs, drops its intermediate activations, and recomputes them during
+    backward with the RNG state restored. The sampled architecture is drawn outside
+    the checkpointed region, so nothing about the forward changes -- verified against
+    the ordinary path on the real model (loss, 147 gradients and the routing
+    distribution, all `torch.equal`). It is therefore safe to turn on and off
+    between steps, which is what `--grad-checkpoint auto` does.
+
+    What it buys is memory, and the trade is steeply in its favour exactly where it
+    is needed: at 64x64 batch 256 on a 6 GiB card it turns a step that spills to
+    host memory into one that fits -- measured through the committed harness at
+    10526 ms / 9737 MiB against **1858 ms / 3594 MiB** (5.7x), and an interleaved
+    run of the same arm measured 4.1x, so the honest figure is 4-5.7x and the
+    correct claim is directional: a step that does not fit becomes one that does.
+    It costs ~17 % when the step fits anyway (32x32 batch 256: 448 -> 524 ms, peak
+    2706 -> 982 MiB).
+    """
+    if use_ckpt:
+        return _ckpt.checkpoint(_run_block, blk, x, mode_weights, dim_mask, flags,
+                                use_reentrant=False)
+    return _run_block(blk, x, mode_weights, dim_mask, flags)
+
+
 class DynamicStructure(NamedTuple):
     layer_gates: torch.Tensor
     dim_weights: torch.Tensor
@@ -83,10 +115,17 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         norm_type: str = "in",
         arch_prior: str = "staged",
         compute_cost: bool = False,
-        encoder_tail_act: str = "none"
+        encoder_tail_act: str = "none",
+        grad_checkpoint: bool = False
     ):
         super().__init__()
         self.K = K
+        #: Recompute each block's activations in backward instead of keeping them
+        #: (see `_call_block`). Bitwise identical, ~17 % slower when the step fits
+        #: anyway, 4-5.7x faster when it spills. Mutable on purpose: the trainer's
+        #: `--grad-checkpoint auto` flips it once the first step has reported its
+        #: peak, and flipping it cannot change any result.
+        self.grad_checkpoint = grad_checkpoint
         self.latent_dim = latent_dim
         self.max_layers = max_layers
         self.max_dim = max_dim
@@ -414,6 +453,11 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         # not that slice's row 0.
         layer_flags = _hoist_block_mode_flags(block_mode)
 
+        # Recomputation in backward needs an input that requires grad, and is
+        # pointless (and warns) under no_grad, so decide once, here.
+        ckpt_on = bool(self.grad_checkpoint and torch.is_grad_enabled()
+                       and h.requires_grad)
+
         for i, layer in enumerate(self.layers):
             # Layer 0 defines the feature scale consumed by the rest of the
             # trunk, so its gate is deliberately ignored (unchanged behaviour).
@@ -425,8 +469,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                 gate_c = layer_gates[:, i:i + 1].view(B, 1, 1, 1)
 
                 if i == 0:
-                    h_new = layer(h, mode_weights=w_mode, dim_mask=d_mask,
-                                  flags=layer_flags[0])
+                    h_new = _call_block(layer, h, w_mode, d_mask, layer_flags[0],
+                                        ckpt_on)
                     n_executed += 1
                 elif partial_layer[i]:
                     # Per-sample depth skip: run the block only for the samples
@@ -437,8 +481,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                     # them (gate==0 only makes the *blend* the identity, it does
                     # not write anything).
                     active = ~(layer_gates.detach()[:, i] <= self.gate_skip_eps)
-                    h_act = layer(h[active], mode_weights=w_mode[active],
-                                  dim_mask=d_mask[active])
+                    h_act = _call_block(layer, h[active], w_mode[active],
+                                        d_mask[active], None, ckpt_on)
                     g = gate_c[active]
                     upd = g * h_act + (1.0 - g) * h[active]
                     # Under autocast the blend promotes to fp32 while `h` is
@@ -449,8 +493,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                     h_new[active] = upd
                     n_executed += 1
                 else:
-                    h_cand = layer(h, mode_weights=w_mode, dim_mask=d_mask,
-                                   flags=layer_flags[i])
+                    h_cand = _call_block(layer, h, w_mode, d_mask,
+                                         layer_flags[i], ckpt_on)
                     h_new = gate_c * h_cand + (1.0 - gate_c) * h
                     n_executed += 1
             h = h_new

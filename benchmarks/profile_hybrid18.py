@@ -36,6 +36,7 @@ def build(args, device):
     m = ConvAML_18Layer_Hybrid(
         K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=args.classes,
         norm_type=args.norm, encoder_tail_act="none",
+        grad_checkpoint=bool(args.grad_checkpoint),
     ).to(device)
     return m
 
@@ -124,6 +125,11 @@ def main():
     ap.add_argument("--max-dim", type=int, default=48)
     ap.add_argument("--classes", type=int, default=10)
     ap.add_argument("--norm", type=str, default="in")
+    ap.add_argument("--grad-checkpoint", type=int, default=0,
+                    help="1 = activation checkpointing inside the blocks (see "
+                         "--grad-checkpoint in train_continual_aml.py; bitwise "
+                         "identical, ~17%% slower when the step fits, 4-5.7x "
+                         "faster when it spills)")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--reps", type=int, default=9)
     ap.add_argument("--warmup", type=int, default=3)

@@ -2383,19 +2383,46 @@ here.** At 64x64 on this card, batch 128 is ~5x faster per epoch than batch 256.
 The same arithmetic on the production command explains the standing anomaly in
 open item 5: the fused kernels were never the reason.
 
-**(d) The trunk runs fp32 activations.** A dtype probe on the real forward
+**(d) The trunk runs fp32 activations -- and that hypothesis was then refuted by
+measurement, which is the useful part.** A dtype probe on the real forward
 (`%TEMP%\opencode\probe_layer_dtype.py`) reports `bfloat16 -> float32` for layer 0
 and `float32 -> float32` for all 17 remaining layers. The mechanism is type
 promotion: the candidates are bf16 under autocast, but the mode weight
 (`mode_weights[:, chosen]`), the channel mask (`dim_mask`) and the depth gate
 (`gate_c`) are all views of fp32 tensors, so `out * dim_mask` and
 `gate_c * h_cand + (1 - gate_c) * h` produce fp32 and every layer's boundary tensor
-is fp32. Each conv then casts that full-size tensor back down. So every activation
-and its gradient in the trunk is carried at 4 bytes/element instead of 2, on
-exactly the resource that is spilling in (c). Making the trilinear factors follow
-the activation dtype is the next lever, but it is a **numerical change** (the
-blend and the mask multiply would round to bf16), so it must be opt-in and cannot
-be measured by the bitwise method below. Not written yet; open item 18.
+is fp32. That much is measured fact. What I then assumed -- that 4 bytes/element
+across the trunk means roughly double the activation memory and double the
+bandwidth, "on exactly the resource that is spilling in (c)" -- is **wrong**, and
+the correction matters more than the observation.
+
+The fix was written rather than argued. `--trunk-dtype compute` cast each block's
+output back to its input dtype (a one-line wrapper around the block's forward,
+plus casting `dim_mask`/`gate_c` in the loop). Measured with both arms in one
+process, interleaved, RNG re-seeded per step, identical weights across the arms --
+i.e. a pure precision comparison:
+
+| config | `auto` (fp32 trunk) | `compute` (bf16 trunk) | time | peak |
+|---|---|---|---|---|
+| 32x32 batch 256 | 470.37 ms / 2700 MiB | 471.96 ms / 2604 MiB | -0.3 % (inside noise) | **-96 MiB** |
+| 64x64 batch 128 | 755.68 ms / 4891 MiB | 751.37 ms / 4699 MiB | +0.6 % (inside noise) | **-192 MiB** |
+| 64x64 batch 256 | 9523 ms / 9736 MiB | 7598 ms / 9352 MiB | both arms spill | **-384 MiB**, still 3.2 GiB over the card |
+
+So the fp32 promotion costs **2-4 % of peak memory and no time at all**, and it
+does not bring 64x64 batch 256 under a 6144 MiB card. The flag has therefore been
+**removed rather than shipped**: it is a numerical change (the mask multiply and
+the depth blend round to bf16) that buys ~3 % of one resource and 0 % of the
+thing the user asked to improve. 41 MiB/sample is being spent somewhere else, and
+the fp32 `instance_norm` round trips are the better candidate than the blend --
+`instance_norm` is on autocast's fp32 list, so each of the 1-2 norm calls per
+layer allocates an fp32 copy of a full-size bf16 tensor *regardless* of the trunk
+dtype, and the trunk dtype cannot touch them. That is not measured yet; it is the
+next hypothesis, and it is written down as such rather than as a finding.
+
+Correction note: the commit that shipped the flag hoist (`b216a12`) states, in its
+message, "2x the memory and bandwidth, on the resource that spills". That sentence
+is wrong, this table is the correction, and it stays wrong in the history -- so it
+is corrected here and in open item 18 rather than quietly dropped.
 
 **(e) The fix that was applied: hoist the per-layer routing flags.** Each
 `HybridBlock.forward` read two host scalars -- `_flags.tolist()` for
@@ -2495,6 +2522,83 @@ None of the security items were changed. They are unreachable from the training
 command this project runs, and "unreachable" is an argument from control flow,
 which this log has been wrong about before -- so they stay open items, not closed
 ones.
+
+**(g) The lever that actually works, shipped opt-in: recompute the blocks'
+activations in backward (`--grad-checkpoint`).** Everything in (c)/(d) points at
+one resource, and (d) left it unnamed. So it was attributed before it was guessed
+at again (`%TEMP%\opencode\probe_norm_memory.py`, 64x64 batch 128, forward peak /
+step peak / ms/step):
+
+| norm | forward peak | step peak | ms/step |
+|---|---|---|---|
+| `in` (default) | 4870.7 MiB | 4971.1 MiB | 1024.1 |
+| `bn` | 4879.4 MiB | 4977.5 MiB | **764.4** |
+| `gn1` | 6163.6 MiB | 6359.5 MiB | 2183.9 |
+
+`in` and `bn` peak within 8 MiB of each other, so **the fp32 `instance_norm`
+round trip that (d) proposed as the better candidate is not where the memory
+goes** -- withdraw that guess. `gn1` is the outlier and is worse on both axes,
+and `bn` is faster at equal memory but is unusable on accuracy (running stats go
+stale across tasks, README §376). What is left is what the arithmetic always
+said: **41 MiB/sample is the autograd graph** -- 18 layers x ~6 saved
+full-resolution tensors x 0.375 MiB. The way to remove a graph is to not keep it.
+
+`mgn/blocks/hybrid_18._call_block` therefore runs each block inside
+`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`: inputs are saved,
+intermediate activations are dropped and recomputed in backward. Exposed as
+`--grad-checkpoint {off,on,auto}` (default `off`) and as
+`benchmarks/profile_hybrid18.py --grad-checkpoint 1`.
+
+**Bitwise identity, which is the whole reason this is safe to flip mid-run:**
+
+* One seeded train-mode forward+backward: output, routing distribution and every
+  gradient `torch.equal`, on CPU (fp32, `gn1`) and on the production path (bf16
+  autocast, `norm=in`, batch 8, 64x64).
+* **Three chained training steps from a single seed: identical losses and an
+  identical final `state_dict`.** This is the strong test, not the single step.
+  The trainer seeds once and then draws a fresh architecture every step from the
+  global RNG (Gumbel over `pi_logits`, Gumbel over the block-mode logits,
+  `0.05 * randn_like` on the depth gates), and `checkpoint` internally forks and
+  restores the RNG; if that restored the stream differently, step 2 would sample a
+  *different architecture* and the run would diverge. It does not -- measured end
+  state after a forward is identical too. Same result for two steps on the
+  production bf16 path.
+* `benchmarks/capture_router_identity.py --compare` still passes on the default
+  path, so (e)'s guarantee is intact: with the flag off, nothing changed.
+* 8 new tests (`tests/test_grad_checkpoint.py`), including that `checkpoint` is
+  never entered under `no_grad` and never when the flag is off.
+
+**The price, from the committed harness** (seeded, `--no-benchmark`, 6 GiB card):
+
+| config | off | on | time | peak |
+|---|---|---|---|---|
+| 32x32 batch 256 | 448.1 ms / 2706 MiB | 523.9 ms / 982 MiB | +16.9 % | **-1724 MiB** |
+| 64x64 batch 128 | 757.7 ms / 4905 MiB | 905.0 ms / 1826 MiB | +19.4 % | **-3080 MiB** |
+| 64x64 batch 256 | 10525.6 ms / 9737 MiB (spilling) | **1858.3 ms / 3594 MiB** | **-82.3 % (5.7x)** | **-6143 MiB** |
+
+The `on` column is stable at 1.79-1.86 s across runs; the `off` column at batch
+256 is not (an interleaved run of the same arm measured 7245 ms, an early sweep
+7702 ms, this run 10526 ms) because the spill itself is unstable. The honest
+statement of the speedup is **4-5.7x, and the correct claim is directional: it
+turns a step that does not fit into one that does.**
+
+Consequently the default stays `off` -- it costs ~17 % exactly where the model
+already fits, so making it unconditional would be a straight regression on 32x32.
+`auto` runs the first step normally and switches it on if the peak since process
+start exceeds 85 % of the card; because the switch cannot change a number, this is
+safe by construction, and it fires correctly on all three configurations above
+(2706 and 4905 MiB pass, 9737 MiB does not). What is *not* validated is the
+heuristic itself -- it reads a peak since process start rather than the step's own,
+and 85 % is a judgement call. Its practical use is Tiny ImageNet: at 64x64 on a
+6 GiB card, **batch 128 (4893 MiB, fits) or batch 256 with `--grad-checkpoint on`
+(3594 MiB, 5.7x faster and also fits)** are the two shapes that work, and neither
+is the one a user would pick by default.
+
+Correction to (d): its closing paragraph named the fp32 `instance_norm` round trip
+as "the better candidate" for the 41 MiB/sample. The norm probe above refutes that
+(`in` and `bn` allocate the same peak). (d)'s dtype observation stands; its guess
+at where the memory went does not, and **41 MiB/sample is now identified as the
+autograd graph, not left open.**
 
 ---
 
@@ -2620,17 +2724,18 @@ Written down so that "not done" is not later mistaken for "not noticed".
     0.00 % routing accuracy in that arm -- `structural` stores no per-task
     encoders, so each centroid is scored in a space it does not belong to -- and
     whether a router fitted on the live encoder would recover it.
-18. **The trunk carries fp32 activations because fp32 routing factors promote the
-    bf16 candidates (B69d).** `mode_weights[:, chosen]`, `dim_mask` and `gate_c`
-    are views of fp32 tensors, so `out * dim_mask` and the depth blend return fp32
-    and all 18 boundary tensors are 4 bytes/element. Measured, not assumed: a
-    dtype probe on the real forward reports `float32 -> float32` for layers 1-17.
-    Making the factors follow the activation dtype is the obvious next
-    optimisation -- it should halve activation memory and bandwidth, which is the
-    resource that spills at 64x64 in B69c -- but it is a **numerical change** (the
-    blend and the mask multiply would round to bf16), so it cannot be justified by
-    the bitwise test used for the flag hoist and it needs a full
-    `--epochs 5,28,16` run before any number depends on it. Not written.
+18. ~~**The trunk carries fp32 activations and that is worth ~2x.**~~ **Measured
+    2026-10-16, refuted as a lever (B69d).** The dtype observation is true: fp32
+    routing factors promote the bf16 candidates, so layers 1-17 see fp32
+    boundary tensors. But the fix was written and measured before being believed,
+    and it buys **2-4 % of peak memory and 0 % of time**, and does not bring
+    64x64 batch 256 under a 6 GiB card (9352 MiB against 6144). The flag was
+    removed rather than shipped, because it is a numerical change with no
+    measurable benefit. What accounts for 41 MiB/sample is now identified: **the
+    autograd graph**, after the `instance_norm` fp32-round-trip hypothesis was
+    measured and refuted as well (`in` 4971 MiB against `bn` 4977 MiB at 64x64
+    batch 128, `gn1` worse on both axes). See B69g, whose fix removes the graph
+    exactly where removing it pays.
 19. **A step-time benchmark of this model must pin the RNG (B69a).** The forward
     samples its architecture per call, and the input tensor's own `randn` consumes
     a batch-dependent number of RNG values, so a cross-batch sweep measures a
@@ -2649,3 +2754,16 @@ Written down so that "not done" is not later mistaken for "not noticed".
     -- one grouped convolution over the `T` stacked encoders, `groups=T` -- is
     plausible and is a genuine optimisation of the eval path rather than of
     training. Not attempted.
+21. **`--grad-checkpoint auto`'s threshold is a judgement call, and its identity
+    guarantee is verified for two or three steps, not for a whole schedule
+    (B69g).** The latch reads `max_memory_allocated` since process start rather
+    than the first step's own peak, so it overestimates and biases towards
+    switching checkpointing on -- the safe direction, but it costs ~17 % of step
+    time if a later phase would have fitted anyway, and it has never been
+    exercised on a schedule long enough for that to show up. Separately, bitwise
+    identity is established for one step (CPU and GPU), three chained steps (CPU)
+    and two chained steps (production bf16); a whole `--epochs 5,28,16` run has
+    not been shown bit-identical under the flag, and a whole run is what the
+    production tables come from. Neither is a correctness risk -- the tests bound
+    it -- but neither is a measurement, so this is written down rather than
+    claimed.

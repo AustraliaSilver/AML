@@ -26,6 +26,7 @@ Read §3 before quoting any number here. Specifically:
 | router metric | **changed** to `mahalanobis-task` with `--router-logdet-weight 0.5` and `--router-fit-split train` (was one pooled covariance fitted on the test split) |
 | `--norm` | **`in`** (InstanceNorm), was `bn` |
 | `--replay-per-class` | **0** by default, was 400 — the default run is now the zero-replay run the docs describe |
+| `--grad-checkpoint` | **`off`** by default — recomputes block activations in backward instead of keeping them. Bitwise identical, so no number changes; it is a memory/time trade for 64×64 (§3, "Other task sequences") |
 | `--encoder-tail-act` | `none` — a terminal ReLU pinned every latent to the non-negative orthant |
 | EWC | implementation fixed (exact multi-task quadratic); the "does not help" measurement predates the fix and is **stale** |
 | benchmark tables in §3.4 / §3.5 | **superseded** — those scripts changed, so their old numbers no longer describe the code |
@@ -133,6 +134,21 @@ this option existed. Tiny ImageNet is read from disk (torchvision has no
 downloader for it), and `--data-root` may be an `os.pathsep`-separated list, so
 the datasets can live in separate mounts. For a Kaggle 2×T4 walkthrough see
 [`notebooks/kaggle_continual_aml.ipynb`](notebooks/kaggle_continual_aml.ipynb).
+
+**64×64 is memory-bound on a 6 GiB card.** Measured on the RTX 3050 Laptop (bf16,
+`K=12`, `max_dim=48`), a 64×64 step costs **41 MiB/sample** of peak activation
+memory, so batch 128 fits (4893 MiB) and batch 256 does not (9737 MiB) — and
+Windows oversubscribes silently to host memory instead of raising OOM, which
+turns batch 256 into a 10.5 s step rather than a fast one. `--grad-checkpoint on`
+recomputes each block's activations in backward instead of keeping them and is
+**bitwise identical** (verified on the losses and every weight across chained
+training steps — `tests/test_grad_checkpoint.py`): ~17 % slower when the step
+already fits, **5.7× faster** when it does not (64×64 batch 256: 1858 ms /
+3594 MiB against 10526 ms / 9737 MiB). `--grad-checkpoint auto` runs the first
+step normally and switches it on if the peak exceeds 85 % of the card. For Tiny
+ImageNet on a 6 GiB card use **batch 128 as it stands, or batch 256 with
+`--grad-checkpoint on`**; 32×32 is not memory-bound (batch 256 = 2706 MiB) and
+leaves it `off`.
 
 > The CIFAR-100 and Tiny ImageNet cells have **not** been run to convergence for
 > this README. §3.1–§3.2 remain the MNIST/CIFAR-10/Fashion protocol.

@@ -1748,6 +1748,31 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             if isolator is not None:
                 isolator.restore()
 
+            # --grad-checkpoint auto: decide from the peak this run has reached.
+            # `max_memory_allocated` is the peak since process start, so it is an
+            # upper bound on the step's own peak -- which biases the decision
+            # towards switching checkpointing on, the safe direction. The latch is
+            # on the model, so this fires once per run, not once per step. Turning
+            # it on mid-run cannot change any result: checkpointing is bitwise
+            # identical, verified across three chained steps from a single seed
+            # (see tests/test_grad_checkpoint.py).
+            if (getattr(model, '_grad_ckpt_mode', 'off') == 'auto'
+                    and getattr(model, 'grad_checkpoint', None) is not None
+                    and not getattr(model, '_grad_ckpt_decided', False)):
+                model._grad_ckpt_decided = True
+                peak = torch.cuda.max_memory_allocated()
+                total = torch.cuda.get_device_properties(0).total_memory
+                if peak > 0.85 * total:
+                    model.grad_checkpoint = True
+                    print(f"[*] --grad-checkpoint auto: peak {peak / 2**20:.0f} MiB "
+                          f"of {total / 2**20:.0f} MiB (>85%) -> checkpointing ON "
+                          f"(recomputes activations; same results, ~4x faster when "
+                          f"the step spills).", flush=True)
+                else:
+                    print(f"[*] --grad-checkpoint auto: peak {peak / 2**20:.0f} MiB "
+                          f"of {total / 2**20:.0f} MiB (<=85%) -> checkpointing "
+                          f"stays OFF.", flush=True)
+
             # Detached GPU-side sum (fp32: loss itself is bf16 under
             # autocast); synced once at epoch end. Log-only change.
             tot_loss = tot_loss + loss.detach().float()
@@ -1834,6 +1859,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "bn is kept only for comparison. Single-task "
                          "measurement - re-check on the full 3-task schedule "
                          "before quoting as final.")
+    ap.add_argument('--grad-checkpoint', type=str, default='off',
+                    choices=['off', 'on', 'auto'],
+                    help="activation checkpointing inside the 18 dynamic blocks. "
+                         "'on' recomputes each block's activations during backward "
+                         "instead of keeping them. It is BITWISE IDENTICAL to the "
+                         "ordinary path (verified on the real model: loss, all 147 "
+                         "gradients and the routing distribution, torch.equal, and "
+                         "the losses and weights of three chained training steps "
+                         "from one seed) because the sampled architecture is drawn "
+                         "outside the checkpointed region and the RNG state is "
+                         "restored on recompute -- so no result depends on this "
+                         "flag. What it trades is memory: ~17%% slower when the step "
+                         "already fits, but 4-5.7x FASTER when it does not. Measured "
+                         "on a 6 GiB card: 64x64 batch 256 spilling = 10526 ms / "
+                         "9737 MiB -> 1858 ms / 3594 MiB fitting; 32x32 batch 256 = "
+                         "448 -> 524 ms with peak 2706 -> 982 MiB. 'auto' "
+                         "(recommended for 64x64, i.e. Tiny ImageNet) leaves it off "
+                         "and switches it on if the peak memory seen by the first "
+                         "step exceeds 85%% of the card. See B69g.")
     ap.add_argument('--data-root', type=str, default=os.path.join(_ROOT, 'data'),
                     help='dataset root. Defaults to <repo>/data. May be an '
                          'os.pathsep-separated list (";" on Windows, ":" on '
@@ -2041,8 +2085,12 @@ def main():
             K=args.K, max_dim=args.max_dim, max_layers=18, num_classes=num_classes,
             norm_type=args.norm,
             encoder_tail_act=args.encoder_tail_act,
-            arch_prior=args.arch_prior
+            arch_prior=args.arch_prior,
+            grad_checkpoint=(args.grad_checkpoint == 'on')
         ).to(device)
+        # `train_task` does not receive `args`, so carry the policy on the model.
+        # It is read once, only to decide `auto` (see the latch in train_task).
+        model._grad_ckpt_mode = args.grad_checkpoint
     else:
         if num_classes != 10:
             raise SystemExit(
