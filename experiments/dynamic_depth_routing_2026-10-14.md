@@ -1863,10 +1863,29 @@ Per-task snapshot, production 10-class configuration, key by key:
 | **total** | **7.209** |
 
 So **81.2 %** (5.854 / 7.209) of the per-task snapshot is a full copy of the
-18-layer trunk. The router buffers add 4.209 MB **once** -- they are
-preallocated and do not grow with the task count: `routing_state_after_mnist.pt`
-11.536 MB, `after_fashion` 25.84 MB (26.18 MB on disk), `after_cifar100`
-22.368 MB, `after_tinyimagenet` 31.450 MB.
+18-layer trunk.
+
+**Correction (2026-10-16): the router is a second O(T) term, and B64 read its
+3-task total as a one-off cost.** The state_dict total of a three-task run is
+4.209 MB, but that is not O(1): `TaskCentroidRouter.__init__` allocates
+`centroids`, `task_counts`, `cov_task`, `zsum_task` and `cov_n_task` as
+`(max_tasks, ...)` and `train_continual_aml.py` passes `max_tasks = T`
+(`latent_dim` = 512 for `hybrid18`), so each holds `T` slots -- `cov_task` alone
+is 512 x 512 x 4 B = **1.048576 MB per task**. Measured split by the probe
+(`--dir <run>`, 10-class production run): once **1.051 MB** (`cov`, `zsum`,
+`cov_n`, `num_tasks`), per task **1.053 MB** (`cov_task` plus the small vectors).
+
+Total per-task state is therefore **8.263 MB**, not 7.209 MB, and the file sizes
+quoted below are the *cumulative snapshot list* plus that state -- they grow
+because `snaps[]` is saved inside the routing state, not because the buffers do:
+`routing_state_after_mnist.pt` 11.536 MB (1 snapshot), `after_cifar10` 18.861 MB
+(2), `after_fashion` 26.184 MB (3), i.e. +7.32 MB per task, which is the 7.209 MB
+of snapshot tensors plus ~110 KB of pickle framing. The T = 10 figure moves with
+it: 1.051 + 10 x 8.263 = **83.7 MB**, not 76.3 MB. Only `centroids` and the
+per-task scalars are irreducible (2 KB/task); `cov_task` is O(T) *up to*
+`max_tasks` and would be reallocated beyond it, so the 1.05 MB/task is a design
+choice, not a requirement. The probe now computes this split rather than
+asserting it.
 
 The counter-number sits in the same artifact. `slots[i]`, returned by
 `collect_structure_slot`, is only `gate[max_layers]`, `bm_res[max_layers]` and
@@ -1883,8 +1902,9 @@ Three consequences, stated plainly:
    by structure selection. The `--shared-backbone 1` mitigation (3A) removes the
    trunk copy and drops per-task state to 1.355 MB, but it is lossy and has only
    been measured at `--steps 50` on a single seed.
-2. **The cost is O(T) twice over.** Storage is `4.209 MB + T * 7.209 MB` (76.3 MB
-   at T = 10), and evaluation is also linear: `--amb-topk 0` "loads ~1.5M params
+2. **The cost is O(T) twice over.** Storage is `1.051 MB + T * 8.263 MB` (83.7 MB
+   at T = 10; 1.053 MB of that per-task term is the router, see the correction
+   above), and evaluation is also linear: `--amb-topk 0` "loads ~1.5M params
    per domain per batch", and `--route-per-task 1` costs `len(snaps)` encoder
    forwards per batch.
 3. **The question worth asking is not "how do we drop the snapshot" but "can a
