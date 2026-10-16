@@ -51,7 +51,7 @@ def _hoist_block_mode_flags(block_mode: torch.Tensor):
         chosen = mode_idx[0]                                 # [L]
         packed = torch.stack((all_hard.float(), same_mode.float(),
                               chosen.float())).tolist()
-    return [(bool(a), bool(b), int(c)) for a, b, c in zip(*packed)]
+    return [(bool(a), bool(b), int(c)) for a, b, c in zip(*packed, strict=True)]
 
 
 def _run_block(blk, x, mode_weights=None, dim_mask=None, flags=None):

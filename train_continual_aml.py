@@ -51,10 +51,6 @@ from mgn.datasets import (
     num_classes_for,
     resolve_task_root,
     pooled_input_stats,
-    CIFAR100_MEAN,
-    CIFAR100_STD,
-    TINY_IMAGENET_MEAN,
-    TINY_IMAGENET_STD,
 )
 
 
@@ -69,7 +65,12 @@ def _prevent_sleep():
 # ----------------------------------------------------------------------
 # Data
 # ----------------------------------------------------------------------
-CIFAR_MEAN, CIFAR_STD = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
+# The ONLY place this file names a torchvision dataset class. `build_replay_buffer`
+# reads each dataset's pixel layout through it and `--replay-per-class` resolves
+# the class through it, so task names and dataset classes cannot drift apart.
+_DATASET_CLASS = {"mnist": "MNIST", "fashion": "FashionMNIST",
+                  "cifar10": "CIFAR10", "cifar100": "CIFAR100"}
+_SPEC_OF_DATASET_CLASS = {cls: t for t, cls in _DATASET_CLASS.items()}
 
 _DATA_CACHE = {}
 
@@ -158,6 +159,36 @@ def check_input_norm_args(mode, use_replay):
             "with each task's OWN constants, so the replay stream and the "
             "live stream would be normalised differently. Run the "
             "zero-replay protocol (--replay-per-class 0).")
+
+
+def resolve_epoch_list(epochs_arg, tasks):
+    """`--epochs` as one positive count per task, in task order.
+
+    This used to be a bare `assert` that the two lists had the same length: it
+    vanishes under `python -O`, a too-short list failed later as an IndexError
+    inside the task loop, and a too-long list was ignored in silence. Every
+    published schedule (`5,28,16`) is unaffected -- only invalid input changes
+    behaviour, and it now says which side is wrong and by how much.
+    """
+    parts = [p.strip() for p in str(epochs_arg).split(',')]
+    try:
+        ep_list = [int(p) for p in parts]
+    except ValueError:
+        raise SystemExit(
+            f"--epochs must be a comma-separated list of integers, one per "
+            f"task; got {epochs_arg!r}.")
+    if len(ep_list) != len(tasks):
+        raise SystemExit(
+            f"--epochs has {len(ep_list)} value(s) ({epochs_arg}) but --tasks "
+            f"names {len(tasks)} task(s) ({', '.join(tasks)}). Give one epoch "
+            f"count per task, in the same order, e.g. --tasks "
+            f"mnist,cifar10,fashion --epochs 5,28,16.")
+    if any(e <= 0 for e in ep_list):
+        raise SystemExit(
+            f"--epochs must all be positive; got {epochs_arg}. A task with 0 "
+            f"epochs would be evaluated untrained, and its row of the accuracy "
+            f"matrix would be reported as if it had been learnt.")
+    return ep_list
 
 
 
@@ -513,6 +544,12 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
     # so it stays valid whichever rule the caller asks for; only the dataset that
     # goes into the loader is wrapped.
     _spec = task_spec(name)
+    # `mean`/`std` come from `mgn.datasets.TASK_SPECS` -- the file that documents
+    # itself as the one source of truth for per-task input normalisation -- and
+    # are NOT repeated as literals here. `--input-norm` already reads the spec
+    # (`resolve_input_norm` / `_RenormDataset`), so a local copy of the constants
+    # could only ever disagree with the rule the loader actually applies.
+    mean, std = _spec.mean, _spec.std
 
     def _wrap(ds):
         return ds if inorm is None else _RenormDataset(ds, _spec.mean, _spec.std, inorm)
@@ -527,14 +564,13 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
         return tl, el
 
     if name == "mnist":
-        mean, std = (0.1307,) * 3, (0.3081,) * 3
         if fast_cache:
             raw_tr = torchvision.datasets.MNIST(data_root, train=True, download=True)
             raw_te = torchvision.datasets.MNIST(data_root, train=False, download=True)
             x_tr = F.interpolate(raw_tr.data.unsqueeze(1).float() / 255.0, size=(32, 32), mode='bilinear').repeat(1, 3, 1, 1)
-            x_tr = (x_tr - 0.1307) / 0.3081
+            x_tr = (x_tr - mean[0]) / std[0]
             x_te = F.interpolate(raw_te.data.unsqueeze(1).float() / 255.0, size=(32, 32), mode='bilinear').repeat(1, 3, 1, 1)
-            x_te = (x_te - 0.1307) / 0.3081
+            x_te = (x_te - mean[0]) / std[0]
             tr = torch.utils.data.TensorDataset(x_tr, raw_tr.targets)
             te = torch.utils.data.TensorDataset(x_te, raw_te.targets)
             _DATA_CACHE[cache_key] = (tr, te)
@@ -556,14 +592,13 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             tr = torchvision.datasets.MNIST(data_root, train=True, download=True, transform=tf_train)
             te = torchvision.datasets.MNIST(data_root, train=False, download=True, transform=tf_test)
     elif name == "fashion":
-        mean, std = (0.2860,) * 3, (0.3530,) * 3
         if fast_cache:
             raw_tr = torchvision.datasets.FashionMNIST(data_root, train=True, download=True)
             raw_te = torchvision.datasets.FashionMNIST(data_root, train=False, download=True)
             x_tr = F.interpolate(raw_tr.data.unsqueeze(1).float() / 255.0, size=(32, 32), mode='bilinear').repeat(1, 3, 1, 1)
-            x_tr = (x_tr - 0.2860) / 0.3530
+            x_tr = (x_tr - mean[0]) / std[0]
             x_te = F.interpolate(raw_te.data.unsqueeze(1).float() / 255.0, size=(32, 32), mode='bilinear').repeat(1, 3, 1, 1)
-            x_te = (x_te - 0.2860) / 0.3530
+            x_te = (x_te - mean[0]) / std[0]
             tr = torch.utils.data.TensorDataset(x_tr, raw_tr.targets)
             te = torch.utils.data.TensorDataset(x_te, raw_te.targets)
             _DATA_CACHE[cache_key] = (tr, te)
@@ -592,11 +627,11 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             aug_ops.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
         tf_train = transforms.Compose(aug_ops + [
             transforms.ToTensor(),
-            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+            transforms.Normalize(mean, std),
         ])
         tf_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+            transforms.Normalize(mean, std),
         ])
         tr = torchvision.datasets.CIFAR10(data_root, train=True, download=True, transform=tf_train)
         te = torchvision.datasets.CIFAR10(data_root, train=False, download=True, transform=tf_test)
@@ -607,11 +642,11 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             aug_ops.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
         tf_train = transforms.Compose(aug_ops + [
             transforms.ToTensor(),
-            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+            transforms.Normalize(mean, std),
         ])
         tf_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+            transforms.Normalize(mean, std),
         ])
         tr = torchvision.datasets.CIFAR100(data_root, train=True, download=True, transform=tf_train)
         te = torchvision.datasets.CIFAR100(data_root, train=False, download=True, transform=tf_test)
@@ -626,11 +661,11 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             aug_ops.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10))
         tf_train = transforms.Compose(aug_ops + [
             transforms.ToTensor(),
-            transforms.Normalize(TINY_IMAGENET_MEAN, TINY_IMAGENET_STD),
+            transforms.Normalize(mean, std),
         ])
         tf_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(TINY_IMAGENET_MEAN, TINY_IMAGENET_STD),
+            transforms.Normalize(mean, std),
         ])
         tr = TinyImageNet(data_root, train=True, transform=tf_train)
         te = TinyImageNet(data_root, train=False, transform=tf_test)
@@ -1294,7 +1329,15 @@ def class_range_ce(outputs, targets, sample_n_classes, label_smoothing=0.1):
 
 def build_replay_buffer(dataset, per_class=100, num_classes=10):
     """Balanced exemplar set stored with canonical normalization.
-    Vectorized with direct tensor operations for instant execution (<0.02s)."""
+    Vectorized with direct tensor operations for instant execution (<0.02s).
+
+    The dataset class name decides the PIXEL LAYOUT only (CIFAR ships HWC uint8,
+    MNIST/Fashion HW); the normalisation constants come from
+    `mgn.datasets.TASK_SPECS` like every other loader in this file, so an
+    exemplar and a freshly loaded image of the same task are prepared by one
+    rule. That identity is what `--input-norm` relies on and what
+    `check_input_norm_args` refuses to mix with `--replay-per-class > 0`.
+    """
     ds_name = type(dataset).__name__
     targets = torch.as_tensor(dataset.targets)
     chosen = []
@@ -1304,19 +1347,25 @@ def build_replay_buffer(dataset, per_class=100, num_classes=10):
         chosen.append(sel)
     idx = torch.cat(chosen)
 
+    # The class name picks the pixel layout, the spec picks the constants. An
+    # unknown class keeps the original informative refusal (and is left after the
+    # selection loop so the RNG stream on that path is unchanged).
+    mean = std = None
+    spec_name = _SPEC_OF_DATASET_CLASS.get(ds_name)
+    if spec_name is not None:
+        spec = task_spec(spec_name)
+        mean = torch.tensor(spec.mean).view(1, 3, 1, 1)
+        std = torch.tensor(spec.std).view(1, 3, 1, 1)
+
     if ds_name in ("CIFAR10", "CIFAR100"):
         # dataset.data is numpy [N, 32, 32, 3] uint8
         data_np = dataset.data[idx.numpy()]
         data_t = torch.from_numpy(data_np).permute(0, 3, 1, 2).float() / 255.0
-        mean = torch.tensor(CIFAR_MEAN if ds_name == "CIFAR10" else CIFAR100_MEAN).view(1, 3, 1, 1)
-        std = torch.tensor(CIFAR_STD if ds_name == "CIFAR10" else CIFAR100_STD).view(1, 3, 1, 1)
         xs = (data_t - mean) / std
     elif ds_name in ("MNIST", "FashionMNIST"):
-        mean_val = 0.1307 if ds_name == "MNIST" else 0.2860
-        std_val = 0.3081 if ds_name == "MNIST" else 0.3530
         raw = dataset.data[idx].float().unsqueeze(1) / 255.0
         data_t = F.interpolate(raw, size=(32, 32), mode='bilinear').repeat(1, 3, 1, 1)
-        xs = (data_t - mean_val) / std_val
+        xs = (data_t - mean) / std
     else:
         raise ValueError(
             f"replay for {ds_name} is not supported: Tiny ImageNet keeps JPEGs "
@@ -1609,6 +1658,14 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
     if dom_head is not None and not isinstance(dom_head, TaskCentroidRouter):
         opt_dom = optim.AdamW(dom_head.parameters(), lr=1e-3, weight_decay=0.0)
 
+    # One table instead of a per-element `int(t_)` cast inside the batch loop:
+    # the cast moves a GPU scalar to the host, so the list comprehension below
+    # used to cost one device->host sync PER EXEMPLAR in the batch.
+    counts_tab = None
+    if task_class_counts is not None:
+        counts_tab = torch.tensor([int(c) for c in task_class_counts],
+                                  device=device, dtype=torch.long)
+
     for _ in range(epochs):
         for xb, yb, tb in replay.loader(batch_size=64):
             xb, yb, tb = xb.to(device), yb.to(device), tb.to(device)
@@ -1621,10 +1678,8 @@ def consolidate(model, replay: ReplayBuffer, device, amp_dtype, epochs=1, lr=1e-
                 out, _, _, diag = model(xb, tau=0.8)
                 # Exemplars come from several tasks with different class counts,
                 # so each is scored over its own task's class range.
-                if task_class_counts is not None:
-                    sample_n = torch.tensor(
-                        [task_class_counts[int(t_)] for t_ in tb],
-                        device=device, dtype=torch.long)
+                if counts_tab is not None:
+                    sample_n = counts_tab[tb]
                 else:
                     sample_n = torch.full((xb.size(0),), out.shape[1],
                                           device=device, dtype=torch.long)
@@ -1696,6 +1751,24 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
         task_pi_mask = torch.zeros(model.K, device=device, dtype=torch.bool)
         task_pi_mask[isolator.frozen_hi:isolator.future_lo] = True
 
+    # Per-step lookup tables for the replay path, built ONCE per task instead of
+    # once per step. Both expressions they replace forced a device->host sync
+    # inside the training step: a `unique().tolist()` over the batch's task ids
+    # (one sync) and a Python list comprehension over the replayed task ids (one
+    # sync PER EXEMPLAR, ~48 of them per step). The values are identical; the work
+    # just moves out of the loop. The zero-replay protocol executes neither path.
+    row_task = None
+    if hasattr(model, "K"):
+        # Row k belongs to the task whose half-open range [lo, hi) covers it; the
+        # ranges tile [0, K) exactly, so -1 never survives as a match.
+        row_task = torch.full((model.K,), -1, device=device, dtype=torch.long)
+        for t_ in range(n_tasks):
+            row_task[round(t_ * model.K / n_tasks):round((t_ + 1) * model.K / n_tasks)] = t_
+    counts_tab = None
+    if task_class_counts is not None:
+        counts_tab = torch.tensor([int(task_class_counts[t_]) for t_ in range(n_tasks)],
+                                  device=device, dtype=torch.long)
+
     for epoch in range(epochs):
         model.train()
         freeze = epoch < freeze_epochs
@@ -1738,17 +1811,11 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             # against the wrong head - the replay would actively teach the wrong
             # association. The 1-D task_pi_mask covers only the current task, so
             # it is correct only when there is no replay at all.
-            if re_t is not None and hasattr(model, "K"):
-                rows = torch.zeros(inputs.size(0), model.K, dtype=torch.bool,
-                                   device=device)
+            if re_t is not None and row_task is not None:
                 src = torch.full((inputs.size(0),), task_idx,
                                  device=device, dtype=torch.long)
                 src[inputs.size(0) - re_t.numel():] = re_t
-                for t_ in src.unique().tolist():
-                    lo = round(t_ * model.K / n_tasks)
-                    hi = round((t_ + 1) * model.K / n_tasks)
-                    rows[src == t_, lo:hi] = True
-                batch_pi_mask = rows
+                batch_pi_mask = row_task.unsqueeze(0) == src.unsqueeze(1)
             else:
                 batch_pi_mask = task_pi_mask
 
@@ -1760,10 +1827,8 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                 # and the loss is bit-identical to the old `ce(outputs, targets)`.
                 sample_n = torch.full((inputs.size(0),), int(n_classes),
                                       device=device, dtype=torch.long)
-                if task_class_counts is not None and re_t is not None:
-                    sample_n[inputs.size(0) - re_t.numel():] = torch.tensor(
-                        [task_class_counts[int(t_)] for t_ in re_t],
-                        device=device, dtype=torch.long)
+                if counts_tab is not None and re_t is not None:
+                    sample_n[inputs.size(0) - re_t.numel():] = counts_tab[re_t]
                 loss = class_range_ce(outputs, targets, sample_n)
                 if w_pi > 0:
                     pif = pi.float()
@@ -2189,8 +2254,7 @@ def main():
     tasks = [t.strip() for t in args.tasks.split(',')]
     for t in tasks:
         task_spec(t)                 # raises with the known-task list on a typo
-    ep_list = [int(e) for e in args.epochs.split(',')]
-    assert len(ep_list) == len(tasks)
+    ep_list = resolve_epoch_list(args.epochs, tasks)
     n_classes_per_task = class_counts(tasks)
     num_classes = num_classes_for(tasks)
     inorm_map = resolve_input_norm(tasks, args.input_norm)
@@ -2208,7 +2272,7 @@ def main():
                   f"for the whole sequence - this is a task-agnostic protocol "
                   f"and is NOT comparable to the per-task tables.", flush=True)
     if len(set(n_classes_per_task)) > 1:
-        print(f"[*] Mixed class counts {dict(zip(tasks, n_classes_per_task))}: one "
+        print(f"[*] Mixed class counts {dict(zip(tasks, n_classes_per_task, strict=True))}: one "
               f"shared head of width {num_classes}; each task trains and is read "
               f"back on its own class range [0, n).")
 
@@ -2361,8 +2425,7 @@ def main():
         # Store balanced exemplars (with task id) for future tasks
         if use_replay:
             data_root = resolve_task_root(name, args.data_root)
-            ds_name = {"mnist": "MNIST", "fashion": "FashionMNIST",
-                       "cifar10": "CIFAR10", "cifar100": "CIFAR100"}.get(name)
+            ds_name = _DATASET_CLASS.get(name)
             if ds_name is None:
                 raise SystemExit(
                     f"--replay-per-class > 0 is not supported for '{name}': its "
@@ -2532,8 +2595,12 @@ def main():
         bwt = sum(M[T-1][j] - M[j][j] for j in range(T - 1)) / (T - 1)
         forg = []
         for j in range(T - 1):
-            worst_before = max(M[t][j] for t in range(j, T - 1))
-            forg.append(worst_before - M[T-1][j])
+            # `best_before` is the highest accuracy task j ever held after it was
+            # learnt and before the last task arrived; forgetting is how much of
+            # that peak was lost. (It was called `worst_before`, which reads as
+            # the opposite of what the max() computes.)
+            best_before = max(M[t][j] for t in range(j, T - 1))
+            forg.append(best_before - M[T-1][j])
         # A_avg: mean of the final row - the single number the README tables
         # quote, so it is printed here instead of being recomputed by hand from
         # the matrix (and mis-transcribed, which is what the old tables did).
