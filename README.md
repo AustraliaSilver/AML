@@ -66,7 +66,7 @@ Two complementary engines:
 | **`ConvAML_18Layer_Hybrid`** (`mgn/blocks/hybrid_18.py`) | The modern 18-layer vision supernet. Each layer is a `HybridBlock` choosing between **Plain CNN**, **ResNet** and **Vision Transformer** in a 3-stage CoAtNet/MobileViT hierarchy. |
 | **`ConvAML_CIFAR_TrueDynamic`** (`train.py`) | Legacy prototype-generated dynamic supernet, 12.76M params. |
 | **`AcceleratedCVNetwork`** (`AML_Core_Code/train_cv_cifar_18.py`) | Executor with fused cuDNN Tensor Cores. |
-| **Static Subnet Compiler** (`AML_Core_Code/extract_static_model.py`) | Hard-prunes the supernet into a standalone `StaticChildModel` — pure `nn.Module`, zero Gumbel overhead at inference. |
+| **Static Subnet Compiler** (`AML_Core_Code/extract_static_model.py`) | Compiles the supernet's chosen **depth and mode** into a standalone `StaticChildModel` — pure `nn.Module`, zero Gumbel overhead at inference. The channel width is **not** compiled away: the child keeps the full-width convolution and multiplies by a constant mask (measured: `conv=(48,48,3,3)` and 10.91 ms/call at 48 channels against 10.89 ms/call at 16), so the width's FLOPs saving is accounting only — see B70. |
 | **C-infinity smooth efficiency barrier** (`mgn/constraints.py`) | Smooth surrogate for accuracy-per-parameter that keeps meta-gradients bounded. |
 
 Stage hierarchy of the hybrid supernet:

@@ -2602,6 +2602,135 @@ autograd graph, not left open.**
 
 ---
 
+**B70 (audit) - a second external report, five claims adjudicated: one is new and
+correct (the normalisation constants are per-task, so `A_auto` is measured with
+privileged information), one is correct but understated (the channel mask does not
+save compute and it COSTS 16 % of a step and 25 % of peak memory), and three are
+true as code but their conclusions are refuted by measurements already in this
+log.**
+
+**(1) "The channel mask saves no runtime" - confirmed, and the report understates
+the cost.** The code is exactly as quoted: `mgn/blocks/cnn_block.py:51-55` runs the
+conv at full width and then multiplies, `:97-108` does it *twice* per `ResNetBlock`
+(once after the first conv, once after the residual add), and
+`mgn/blocks/vit_block.py:112-113` does the same. `compute_flops(..., active_dim=)`
+(`cnn_block.py:62-67,118-124`) is the only place the width reduces anything:
+
+| call | reported |
+|---|---|
+| `ResNetBlock.compute_flops((32,32))` | 85.33 MFLOP |
+| `ResNetBlock.compute_flops((32,32), active_dim=16)` | **19.01 MFLOP** |
+
+a 4.5x smaller number for the same work. New measurements:
+
+* The **extracted** child does not narrow either: `StaticLayer.__init__` builds
+  `nn.Conv2d(conv_w.shape[1], conv_w.shape[0], 3)` - every channel - and masks in
+  `forward` (`AML_Core_Code/extract_static_model.py:54,72,77,79`). Measured on a
+  real `StaticLayer`: `conv=(48,48,3,3)` and **10.91 ms/call at 48 channels against
+  10.89 ms/call at 16**. So the report's "only the accounting changes" is right,
+  and it survives into the "hard-pruned" deployment artifact.
+* Keeping the mask **costs**. Interleaved A/B, one process, one seed, the same
+  sampled architecture, on the production step (32x32, batch 256, `norm=in`, bf16,
+  `K=12`, `max_dim=48`), 8 reps per arm:
+
+| arm | ms | peak MiB |
+|---|---|---|
+| mask removed entirely | 384.8 | 2169 |
+| mask as production runs it | **448.6** | **2706** |
+| mask cast to the activation dtype (B69d's `--trunk-dtype compute`) | 442.3 | 2682 |
+| mask detached (no architecture gradient through it) | 423.4 | 2677 |
+
+  So the width mechanism costs **+64 ms (+16 %) and +537 MiB (+25 % of peak)** on
+  the step where it is supposed to be free, and B69d's dtype fix cannot touch it:
+  the per-layer dtype chain is **identical** in the masked and unmasked arms
+  (`bfloat16->float32` at layer 0, `float32->float32` for 1-17), so this is not the
+  promotion B69d was chasing. Detaching the mask's gradient path (the mask is
+  derived from `d_lengths`, so it requires grad) recovers 25 of the 64 ms and none
+  of the memory. The remaining ~39 ms and the 537 MiB are **not attributed** - see
+  open item 22. Note the asymmetry with depth, where the same class of "ghost work"
+  was found and actually fixed (`hybrid_18.py:410-422` branches around a closed
+  gate); width never got that treatment.
+
+**(2) "The encoder is a single point of failure" - true as code, already measured
+in more detail here, and the conclusion is refuted.** `vision_encoder`
+(`hybrid_18.py:168-177`) is one `Conv2d(3, 48, 3)`, a norm, a ReLU, then
+`AdaptiveAvgPool2d((2, 2))` and `Linear(192, 512)`. Everything it feeds is as the
+report says: `prototype_selector` (pi), the structure decode (depth, width, mode)
+and the domain router - which reads this same encoder through `router_features`
+(`train_continual_aml.py:87-120`). What the report presents as hidden is written
+out in that function's own docstring, with the measurement: the 2x2 pool "averages
+32x32 down to 2x2 and flattens the signal; the values that survive are small and
+nearly equal", and under bf16 two *different* encoders produced **bitwise
+identical** features (maxdiff 0.000 against 0.368 in fp32), which collapsed routing
+to 0 %. What is refuted is the consequence: routing accuracy is **89.02 % at its
+worst cell and 100 % at every stage-2 cell** (README section 3.1a), and the
+misrouting that does exist has a shape a shallow encoder does not predict - 10.98 %
+of MNIST and 5.00 % of CIFAR-10 are routed to Fashion after the third task and
+nothing is ever routed backwards (open item 2). "The router cannot distinguish
+MNIST from Fashion-MNIST" is not what is measured.
+
+**(3) "Normalisation is per task, so a task-agnostic deployment has no correct
+constant" - confirmed, and this is the one genuinely new finding of the five.**
+MNIST `0.1307/0.3081`, Fashion `0.2860/0.3530`, CIFAR the channel tuple
+(`train_continual_aml.py:71,431,436-438,459,464-466`), applied inside each task's
+own loader. Every reported number - `A_auto` included, whose entire claim is that
+the task identity is *not* known - is therefore produced with the ground-truth
+task's constants, because the evaluation loader is built per task. A real
+deployment sees a raw image, must choose one constant, and the wrong choice shifts
+every activation before the first convolution - which is precisely the signal the
+router reads. The autonomous number is measured under privileged information that
+the autonomous setting does not provide. That gap was not disclosed anywhere, and
+it is now open item 23.
+
+**(4) "`StaticChildModel` cannot serve continual learning" - true, and it is not
+claimed to.** `extract_child_hybrid18` averages the mode over the batch and over
+prototypes weighted by pi (`AML_Core_Code/extract_static_model.py:298,317`) and
+compiles one child; a static child is one point in structure space, so T tasks mean
+T children. That is inherent to extraction and the code's own docstring says so
+(`StaticHybridBlock`, `:85-105`). The README presents the extractor as a
+**deployment compiler** (section 2: "zero Gumbel overhead at inference"), not as
+the continual mechanism - which is the snapshot path, and it stores 0.045 MB per
+task in `structural` mode (B66/B67) rather than T full models. Two corrections
+nonetheless. (a) "Hard-prunes" is true only for **depth and mode**
+(`is_active = is_first or gate > gate_skip_eps`, `:115`; the argmax branch is
+compiled away), **not** for width - measured in (1), the child keeps
+`conv=(48,48,3,3)` and multiplies by a constant mask - and that README line is
+corrected in this commit because it overstates what the compiler does. (b) The
+report's "batch-mean destroys the per-task shape-shifting" is accurate about
+extraction and orthogonal to continual learning, where the per-task structure is
+carried by the stored slot, not by a re-extraction.
+
+**(5) "Batch-consistent Gumbel starves the other branches" - true per step,
+refuted as a trajectory.** `hybrid_18.py:340-345` means the block-mode logits over
+the batch and draws ONE hard one-hot per layer, so `all_hard`/`same_mode` hold and
+`HybridBlock.forward:74-86` executes a single branch: the other two receive no
+weight gradient **in that step**. The comment claims "a 3x speedup while preserving
+full straight-through gradients", which is precise and the report misreads it - the
+straight-through path preserves gradients to the **architecture parameters**
+(`bm_logits`), not to the branches that were not executed. Refuted, by measurement:
+
+* Over a run the mode distribution is **12.9 % Plain / 59.0 % ResNet / 28.1 % ViT**
+  (measured on the shipped checkpoints, section 2), and it is identical to the
+  initialisation. The net is not "a ResNet-18".
+* 24 real production steps: **every** branch parameter group accumulates a non-zero
+  gradient in 22-24 of the 24 steps (plain 374,112 params, resnet 748,224, vit
+  341,280, shared 407,769). Starvation is proportional to the sampling probability,
+  not absolute.
+
+What the report is reaching for is already in this log, stated more strongly and
+measured: the mode distribution is **indistinguishable from the initialisation**
+(stage 1 18.4/81.1/0.6 against 18.1/81.3/0.5), i.e. the *mode search does not
+move* - "the structure is the initialisation" (section 2). And the measured cause is
+the initialisation, not branch starvation: `--arch-prior staged` 89.9 % against
+`neutral` 11.4 %.
+
+None of the five produced a code change. Two are now open items (22: the mask's
+cost is only partly attributed; 23: `A_auto` is measured with privileged
+normalisation), and one README line was corrected because the report showed it to
+be an overstatement.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".
@@ -2767,3 +2896,29 @@ Written down so that "not done" is not later mistaken for "not noticed".
     production tables come from. Neither is a correctness risk -- the tests bound
     it -- but neither is a measurement, so this is written down rather than
     claimed.
+22. **The channel mask costs ~16 % of a step and ~25 % of peak memory, saves no
+    compute, and only part of that cost is attributed (B70).** Measured on the
+    production step, interleaved and seeded: 384.8 ms / 2169 MiB with the mask
+    removed entirely, 448.6 ms / 2706 MiB as production runs it, 442.3 ms / 2682
+    MiB with the mask cast to the activation dtype, 423.4 ms / 2677 MiB with the
+    mask's gradient path detached. So the dtype fix (B69d) cannot touch it, and
+    ~25 of the 64 ms is the architecture gradient through the mask. **Not
+    attributed: the remaining ~39 ms and essentially all of the 537 MiB.** The
+    candidates, none tested: one extra full-size fp32 tensor per layer saved for
+    backward; the mask applied twice per `ResNetBlock` where once would do
+    (`cnn_block.py:101,108`); `cand * mode_weights[:, chosen]`
+    (`hybrid_router.py:86`), a multiply by exactly 1.0 under the one-hot fast
+    path; and the mask being re-applied to the next layer's input. Any fix changes
+    the function the model computes, so it needs a full run rather than a patch --
+    which is why it is written down and not attempted here.
+23. **Every reported number, `A_auto` included, is produced with the ground-truth
+    task's normalisation constants (B70).** MNIST, Fashion and CIFAR each carry
+    their own mean/std (`train_continual_aml.py:71,431,436-438,459,464-466`) and
+    the loader applies them per task, so the evaluation of a "task-agnostic"
+    protocol is fed images prepared with information the protocol claims not to
+    have. This is not a flaw of any single number -- the oracle and live protocols
+    are meant to be task-aware -- but it means the autonomous result has not been
+    measured in the setting it describes. Closing it means evaluating `A_auto`
+    under a *single* fixed normalisation (or exposing the choice as part of the
+    routing decision), which would change the `A_auto` column and therefore needs
+    a full run.
