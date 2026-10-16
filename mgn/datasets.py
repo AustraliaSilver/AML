@@ -69,6 +69,48 @@ def task_spec(name: str) -> TaskSpec:
         raise ValueError(f"unknown task {name!r}; known tasks: {known}") from None
 
 
+#: Training-set sizes. Used only to weight the pooled single-normalisation
+#: statistics below; these are facts about the datasets, not tuning knobs.
+N_TRAIN: Dict[str, int] = {
+    "mnist": 60000,
+    "fashion": 60000,
+    "cifar10": 50000,
+    "cifar100": 50000,
+    "tinyimagenet": 100000,
+}
+
+
+def pooled_input_stats(tasks: List[str]) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+    """One ``(mean, std)`` for a whole sequence, weighted by training-set size.
+
+    The constants in ``TASK_SPECS`` are per task, so reproducing them requires
+    the task identity -- which the autonomous protocol that ``A_auto`` measures
+    does not have (open item 23 / B71). This is the constant a deployer *can*
+    compute without labels: pool every image of the sequence into one pile and
+    take its statistics.
+
+    Only the per-task moments are available here rather than the pixels, so the
+    second moment is rebuilt from ``E[x^2] = Var[x] + E[x]^2`` and the pooled
+    variance from ``E[x^2] - E[x]^2``.
+    """
+    if not tasks:
+        raise ValueError("pooled_input_stats needs at least one task")
+    unknown = [t for t in tasks if t not in N_TRAIN]
+    if unknown:
+        raise ValueError(f"no training-set size recorded for {unknown}")
+    total = float(sum(N_TRAIN[t] for t in tasks))
+    mean = [0.0, 0.0, 0.0]
+    second = [0.0, 0.0, 0.0]
+    for t in tasks:
+        spec = task_spec(t)
+        w = N_TRAIN[t] / total
+        for c in range(3):
+            mean[c] += w * spec.mean[c]
+            second[c] += w * (spec.std[c] ** 2 + spec.mean[c] ** 2)
+    std = [max(second[c] - mean[c] ** 2, 0.0) ** 0.5 for c in range(3)]
+    return tuple(mean), tuple(std)
+
+
 def class_counts(tasks: List[str]) -> List[int]:
     """Per-task class counts, in sequence order."""
     return [task_spec(t).n_classes for t in tasks]

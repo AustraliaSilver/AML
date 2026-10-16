@@ -2731,6 +2731,61 @@ be an overstatement.
 
 ---
 
+**B71 (implementation) - `--input-norm`: open item 23 made measurable.**
+
+The gap B70 named: every loader in `train_continual_aml.py` normalises its images
+with the **ground-truth task's** own mean/std, because `get_task_data` is called
+once per task. `A_oracle` and `A_live` are told the task, so that is legitimate.
+`A_auto` is the protocol whose entire content is that the task identity is *not*
+available, and it is scored on images prepared with it. The README now says so
+next to the table, and the number is an upper bound rather than a measurement.
+
+Implemented, opt-in, default untouched:
+
+  * `mgn/datasets.py`: `N_TRAIN` and `pooled_input_stats(tasks)` -- one
+    `(mean, std)` for a sequence, weighted by training-set size, rebuilt from the
+    per-task moments with `E[x^2] = Var[x] + E[x]^2`. For
+    `mnist,cifar10,fashion` it is `mean = (0.2916, 0.2889, 0.2784)`,
+    `std = (0.3323, 0.3302, 0.3247)`.
+  * `train_continual_aml.py`: `_RenormDataset` (recovers the raw image with
+    `x * std + mean` and applies the requested rule), `resolve_input_norm`,
+    `check_input_norm_args`, the `--input-norm {per-task,pooled,imagewise,none}`
+    flag, and the descriptor threaded through `train_task` and the three other
+    `get_task_data` call sites.
+  * The design choice worth recording: it wraps the **dataset**, not the
+    transform, so all five data branches -- including the in-memory MNIST/Fashion
+    cache -- go through one path, and the cache keeps storing **per-task** tensors
+    so it stays valid whichever rule the caller asks for. Tested.
+
+Two properties worth stating, because they are why this is an experiment rather
+than a formality:
+
+  * **No single constant can match a domain.** The pooled std (0.332) is larger
+    than every per-task std (MNIST 0.3081, CIFAR 0.2023, Fashion 0.3530), because
+    pooling distributions with different means adds between-domain variance. A
+    "pooled" implementation that averaged the *means* and reused a std would put
+    every image off its own distribution by a different amount and would have
+    looked like a bug in the model rather than in the normalisation. The test
+    pins the second moment against an independent hand computation.
+  * **`--input-norm != per-task` with `--replay-per-class > 0` is refused**, not
+    mixed: `build_replay_buffer()` stores its exemplars with the per-task
+    constants, so the replay stream and the live stream would be normalised
+    differently and the run would measure neither protocol.
+
+Guarantee that nothing published moves: `inorm=None` (the default) makes `_wrap`
+return the dataset unchanged, the flag defaults to `per-task` and is asserted by
+`tests/test_input_norm.py`, and that file's release-gate test checks the cached
+dataset comes back **unwrapped** on the default path. 19 new tests, 334 total.
+
+**The measurement is in flight.** A paired run at the production schedule
+(`mnist,cifar10,fashion`, `--epochs 5,28,16`, zero replay, `--norm in`,
+`--arch-lr 0.003`, `--depth-cost 0.02`), same commit and same seed, per-task
+against `--input-norm pooled`. Until its numbers land, open item 23 stays open
+and no table above is edited -- a per-task run on the current code is needed for
+that comparison anyway, because the published `A_oracle` 86.19 predates B46/B47.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".
@@ -2912,13 +2967,12 @@ Written down so that "not done" is not later mistaken for "not noticed".
     the function the model computes, so it needs a full run rather than a patch --
     which is why it is written down and not attempted here.
 23. **Every reported number, `A_auto` included, is produced with the ground-truth
-    task's normalisation constants (B70).** MNIST, Fashion and CIFAR each carry
-    their own mean/std (`train_continual_aml.py:71,431,436-438,459,464-466`) and
-    the loader applies them per task, so the evaluation of a "task-agnostic"
+    task's normalisation constants (B70, implementation B71).** MNIST, Fashion and
+    CIFAR each carry their own mean/std (`train_continual_aml.py:71,431,436-438,459,464-466`)
+    and the loader applies them per task, so the evaluation of a "task-agnostic"
     protocol is fed images prepared with information the protocol claims not to
     have. This is not a flaw of any single number -- the oracle and live protocols
     are meant to be task-aware -- but it means the autonomous result has not been
-    measured in the setting it describes. Closing it means evaluating `A_auto`
-    under a *single* fixed normalisation (or exposing the choice as part of the
-    routing decision), which would change the `A_auto` column and therefore needs
-    a full run.
+    measured in the setting it describes. `--input-norm {pooled,imagewise,none}`
+    now exists to measure it, with `per-task` as the unchanged default; a paired
+    production-schedule run is in flight and the item closes when its numbers land.

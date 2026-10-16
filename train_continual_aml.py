@@ -50,6 +50,7 @@ from mgn.datasets import (
     class_counts,
     num_classes_for,
     resolve_task_root,
+    pooled_input_stats,
     CIFAR100_MEAN,
     CIFAR100_STD,
     TINY_IMAGENET_MEAN,
@@ -78,6 +79,85 @@ def _base_gray(mean, std):
         transforms.Grayscale(num_output_channels=3),
         transforms.Resize((32, 32)),
     ]
+
+
+class _RenormDataset(torch.utils.data.Dataset):
+    """Re-normalise a task's images with a task-agnostic rule (open item 23).
+
+    Every loader in this file hands out images already normalised with the
+    ground-truth task's constants, because the loader is built per task. That is
+    correct for the oracle and live protocols, which are told the task, and it is
+    exactly the privileged information the *autonomous* protocol claims not to
+    have: a deployer sees a raw image and must choose one rule for the whole
+    sequence. This wrapper recovers the raw image (``x * std + mean``) and applies
+    the requested rule instead, so `--input-norm` can be measured without a second
+    data pipeline.
+
+    It is only ever installed when ``--input-norm`` is not ``per-task``; the
+    default path does not build it, so no published number moves. ``dst`` is
+    ``("const", mean, std)``, ``("imagewise", None, None)`` or
+    ``("none", None, None)``.
+    """
+
+    def __init__(self, base, src_mean, src_std, dst):
+        self.base = base
+        self.dst = dst
+        self._src_mean = torch.tensor(tuple(src_mean)).view(3, 1, 1)
+        self._src_std = torch.tensor(tuple(src_std)).view(3, 1, 1)
+        if dst[0] == "const":
+            self._dst_mean = torch.tensor(tuple(dst[1])).view(3, 1, 1)
+            self._dst_std = torch.tensor(tuple(dst[2])).view(3, 1, 1)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        x, y = self.base[i]
+        raw = x * self._src_std + self._src_mean
+        kind = self.dst[0]
+        if kind == "const":
+            return (raw - self._dst_mean) / self._dst_std, y
+        if kind == "imagewise":
+            mu = raw.mean(dim=(1, 2), keepdim=True)
+            sd = raw.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(1e-6)
+            return (raw - mu) / sd, y
+        return raw, y
+
+
+def resolve_input_norm(tasks, mode):
+    """Per-task descriptor for `--input-norm`; ``None`` means "leave it alone".
+
+    ``None`` is the default and means each task keeps its own `TASK_SPECS`
+    constants -- what every published number uses. The other modes return the
+    descriptor `get_task_data` needs in order to rewrite the normalisation.
+    """
+    if mode == "per-task":
+        return {t: None for t in tasks}
+    if mode == "pooled":
+        mean, std = pooled_input_stats(tasks)
+        return {t: ("const", mean, std) for t in tasks}
+    if mode == "imagewise":
+        return {t: ("imagewise", None, None) for t in tasks}
+    if mode == "none":
+        return {t: ("const", (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)) for t in tasks}
+    raise SystemExit(f"unknown --input-norm value {mode!r}")
+
+
+def check_input_norm_args(mode, use_replay):
+    """Refuse the combination that would silently mix two normalisations.
+
+    `build_replay_buffer()` stores its exemplars with each task's OWN constants,
+    so with `--input-norm` other than 'per-task' the replay stream and the live
+    stream would be normalised differently and the run would measure neither
+    protocol. Zero-replay is the documented protocol anyway.
+    """
+    if mode != 'per-task' and use_replay:
+        raise SystemExit(
+            "--input-norm other than 'per-task' is incompatible with "
+            "--replay-per-class > 0: build_replay_buffer() stores exemplars "
+            "with each task's OWN constants, so the replay stream and the "
+            "live stream would be normalised differently. Run the "
+            "zero-replay protocol (--replay-per-class 0).")
 
 
 
@@ -399,7 +479,8 @@ class TaskCentroidRouter(nn.Module):
         return (-d2 / scale) / max(self.temperature, 1e-3) * 10.0
 
 
-def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batch_size=256):
+def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batch_size=256,
+                  inorm=None):
     """Ultra-fast data loader pipeline: In-memory pre-processed tensors for MNIST
     and FashionMNIST eliminate PIL resize bottlenecks on Windows, running epochs in ~30s.
 
@@ -413,14 +494,32 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
     default. The three tasks in one reported sequence are therefore not treated
     identically, and reproducing with `fast_cache=False` will not match the
     MNIST/Fashion columns. Disclosed as B54 in the audit log.
+
+    `inorm` is the third disclosed gap and the widest: the constants applied here
+    are the task's OWN (`mgn.datasets.TASK_SPECS`), so every loader in this file
+    assumes the task identity. The oracle and live protocols are handed it;
+    `A_auto` is not, and is measured on images prepared with it anyway. Pass the
+    descriptor from `resolve_input_norm` to apply one task-agnostic rule to the
+    whole sequence instead (open item 23 / B71). ``None`` means per-task, which is
+    the default and the path every published number came from.
     """
     # `data_root` may be an os.pathsep-separated list of roots (on Kaggle each
     # dataset is mounted under its own /kaggle/input/<slug>); pick the one that
     # actually holds this task. A single root is returned unchanged.
     data_root = resolve_task_root(name, data_root)
     cache_key = (name, os.path.abspath(data_root))
+    # `inorm` rewrites the task's own normalisation into a task-agnostic one (see
+    # _RenormDataset, open item 23). The cache always holds the PER-TASK tensors,
+    # so it stays valid whichever rule the caller asks for; only the dataset that
+    # goes into the loader is wrapped.
+    _spec = task_spec(name)
+
+    def _wrap(ds):
+        return ds if inorm is None else _RenormDataset(ds, _spec.mean, _spec.std, inorm)
+
     if fast_cache and cache_key in _DATA_CACHE:
         tr, te = _DATA_CACHE[cache_key]
+        tr, te = _wrap(tr), _wrap(te)
         tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                          num_workers=0, pin_memory=False, drop_last=True)
         el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
@@ -439,6 +538,7 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             tr = torch.utils.data.TensorDataset(x_tr, raw_tr.targets)
             te = torch.utils.data.TensorDataset(x_te, raw_te.targets)
             _DATA_CACHE[cache_key] = (tr, te)
+            tr, te = _wrap(tr), _wrap(te)
             tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                              num_workers=0, pin_memory=False, drop_last=True)
             el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
@@ -467,6 +567,7 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             tr = torch.utils.data.TensorDataset(x_tr, raw_tr.targets)
             te = torch.utils.data.TensorDataset(x_te, raw_te.targets)
             _DATA_CACHE[cache_key] = (tr, te)
+            tr, te = _wrap(tr), _wrap(te)
             tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                              num_workers=0, pin_memory=False, drop_last=True)
             el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
@@ -537,6 +638,7 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
         known = ", ".join(sorted(TASK_SPECS))
         raise ValueError(f"unknown task {name!r}; known tasks: {known}")
 
+    tr, te = _wrap(tr), _wrap(te)
     tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
                                      num_workers=workers, pin_memory=True,
                                      persistent_workers=workers > 0, drop_last=True)
@@ -1557,13 +1659,13 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                anchor=None, anchor_lam=1e-3, aug="basic", workers=2, steps=0,
                arch_lr=3e-3, depth_cost=0.0, flops_cost=0.0, depth_target=0.0, ewc=None,
                n_tasks: int = 1, n_classes=None, task_class_counts=None,
-               data_root=None):
+               data_root=None, inorm=None):
     if data_root is None:
         data_root = os.path.join(_ROOT, "data")
     if n_classes is None:
         n_classes = getattr(model, "num_classes", None)
-    trainloader, _ = get_task_data(name, data_root, workers=workers, aug=aug)
-    _, testloader = get_task_data(name, data_root, workers=workers)
+    trainloader, _ = get_task_data(name, data_root, workers=workers, aug=aug, inorm=inorm)
+    _, testloader = get_task_data(name, data_root, workers=workers, inorm=inorm)
 
     arch_names = ("structure_prototypes", "block_mode_prototypes", "mode_prototypes")
     arch_params = [p for n_, p in model.named_parameters() if any(k in n_ for k in arch_names)]
@@ -1859,6 +1961,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "bn is kept only for comparison. Single-task "
                          "measurement - re-check on the full 3-task schedule "
                          "before quoting as final.")
+    ap.add_argument('--input-norm', type=str, default='per-task',
+                    choices=['per-task', 'pooled', 'imagewise', 'none'],
+                    help="how INPUT images are normalised -- not the post-conv "
+                         "layer normalisation, which has its own separate flag. "
+                         "'per-task' (default) applies each domain's own "
+                         "mean/std from mgn.datasets.TASK_SPECS. That needs the "
+                         "task identity, so it is unavailable to exactly the "
+                         "setting A_auto claims to measure, and every published "
+                         "number was produced with it (open item 23). The other "
+                         "choices apply ONE task-agnostic rule to the whole "
+                         "sequence, which is what a deployment can do: 'pooled' "
+                         "= statistics of the unlabelled pile, weighted by "
+                         "training-set size; 'imagewise' = each image's own "
+                         "per-channel statistics; 'none' = raw [0,1] pixels. "
+                         "Anything other than 'per-task' changes every number in "
+                         "every column, so it is opt-in, needs its own run, and "
+                         "gets its own row; see B71.")
     ap.add_argument('--grad-checkpoint', type=str, default='off',
                     choices=['off', 'on', 'auto'],
                     help="activation checkpointing inside the 18 dynamic blocks. "
@@ -2074,6 +2193,20 @@ def main():
     assert len(ep_list) == len(tasks)
     n_classes_per_task = class_counts(tasks)
     num_classes = num_classes_for(tasks)
+    inorm_map = resolve_input_norm(tasks, args.input_norm)
+    if args.input_norm != 'per-task':
+        check_input_norm_args(args.input_norm, use_replay)
+        desc = inorm_map[tasks[0]]
+        if desc is not None and desc[0] == 'const':
+            print(f"[*] --input-norm {args.input_norm}: ONE constant for the "
+                  f"whole sequence, mean={tuple(round(v, 4) for v in desc[1])} "
+                  f"std={tuple(round(v, 4) for v in desc[2])} - this is a "
+                  f"task-agnostic protocol and is NOT comparable to the "
+                  f"per-task tables.", flush=True)
+        else:
+            print(f"[*] --input-norm {args.input_norm}: ONE task-agnostic rule "
+                  f"for the whole sequence - this is a task-agnostic protocol "
+                  f"and is NOT comparable to the per-task tables.", flush=True)
     if len(set(n_classes_per_task)) > 1:
         print(f"[*] Mixed class counts {dict(zip(tasks, n_classes_per_task))}: one "
               f"shared head of width {num_classes}; each task trains and is read "
@@ -2145,7 +2278,8 @@ def main():
         s, e = isolator.begin_task(i, T, reinit=False)
         print(f"  [proto-isolation] rows [{s}:{e}) owned; rows [0:{s}) frozen", flush=True)
         print(f"  [replay] buffer size: {len(replay)} exemplars", flush=True)
-        tr_loader, _ = get_task_data(name, args.data_root, workers=args.workers)
+        tr_loader, _ = get_task_data(name, args.data_root, workers=args.workers,
+                                     inorm=inorm_map[name])
         del tr_loader
         train_task(model, name, ep_list[i],
                    freeze_epochs=(args.freeze if i == 0 else min(args.freeze, 1)),
@@ -2169,10 +2303,11 @@ def main():
                    n_tasks=T,
                    n_classes=n_classes_per_task[i],
                    task_class_counts=n_classes_per_task,
-                   data_root=args.data_root)
+                   data_root=args.data_root,
+                   inorm=inorm_map[name])
 
         # Freeze this domain's structure into its slot & pristine router centroid
-        tl_fit, el_self = get_task_data(name, args.data_root)
+        tl_fit, el_self = get_task_data(name, args.data_root, inorm=inorm_map[name])
         # The router's centroid and second moment are estimated on the TRAIN
         # split by default. They used to be estimated on `el_self`, the TEST
         # split - i.e. on the very images the router is later asked to route.
@@ -2306,7 +2441,7 @@ def main():
         #   A_auto[i][j] - Domain-IL / Class-IL (autonomous centroid router prediction)
         #   A_live[i][j] - Standard CL (current mutable live weights, no snapshot)
         for j in range(i + 1):
-            _, el = get_task_data(tasks[j], args.data_root)
+            _, el = get_task_data(tasks[j], args.data_root, inorm=inorm_map[tasks[j]])
             use_route = all(slots[k] is not None for k in range(i + 1))
             pi_mask_j = None
             if hasattr(model, 'K'):

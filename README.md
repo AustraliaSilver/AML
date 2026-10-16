@@ -245,6 +245,16 @@ produced the predictions):
 > 4. **These router statistics are fitted on the TRAIN split.** An earlier run
 >    fitted them on the test split; §3.4a explains why that is a leak and what
 >    it was doing to the numbers.
+> 5. **The `A_auto` cells are measured under the ground-truth task's input
+>    normalisation, which the autonomous setting does not have.** Every loader
+>    normalises its images with the domain's *own* mean/std
+>    (`mgn.datasets.TASK_SPECS`), because the loader is built per task. The
+>    oracle and live protocols are entitled to that; the autonomous one is not,
+>    and is scored on images prepared with it anyway. So 81.96 % is an **upper
+>    bound** on what a deployment without task labels sees.
+>    `--input-norm {pooled,imagewise,none}` applies one task-agnostic rule to the
+>    whole sequence instead, and a paired run at the same schedule measures the
+>    gap. See B71 / open item 23.
 
 #### 3.4a Why the router collapses — and how the first answer was wrong
 
