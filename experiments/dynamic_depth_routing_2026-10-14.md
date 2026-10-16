@@ -1887,6 +1887,19 @@ per-task scalars are irreducible (2 KB/task); `cov_task` is O(T) *up to*
 choice, not a requirement. The probe now computes this split rather than
 asserting it.
 
+**Class-count scaling (2026-10-16).** The probe reads whichever run wrote the
+artefacts it is pointed at, and the repo root currently holds two of them -- a
+3-task 10-class run overwrote `mnist`/`fashion`, a 3-task 200-wide-head run
+overwrote `cifar10`/`cifar100`/`tinyimagenet` -- so its default output was
+silently blending configurations. The probe now detects that (`stage` must equal
+`len(snaps) - 1`) and skips the storage model rather than blending. From the
+single-run artefacts: the class-independent part of the snapshot is 7.117 MB and
+the prototype rows add 9.2 KB per class (`proto_weights` measures (12, 7690) at
+ten classes and (12, 153800) at a 200-wide head; int8 in the snapshot gives
+0.092 MB and 1.846 MB). The snapshot is therefore 7.209 MB at ten classes and
+8.962 MB at 200, and the trunk copy falls from 81.2 % to 65.3 % of it -- the
+cached-weights criticism gets *worse* as the class count grows, not better.
+
 The counter-number sits in the same artifact. `slots[i]`, returned by
 `collect_structure_slot`, is only `gate[max_layers]`, `bm_res[max_layers]` and
 optionally `bm_mode[max_layers, 3]` -- about 90 float32, i.e. **~0.4 KB of

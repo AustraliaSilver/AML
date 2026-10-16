@@ -104,10 +104,25 @@ def report_routing(directory):
         accounted = router_b + slot_b + sum(per_snap)
         print(f"  accounted {mb(accounted):.3f} MB of {file_mb:.3f} MB on disk "
               f"(rest = pickle/framing overhead)")
-        rows.append(dict(name=name, n=len(snaps), file_mb=file_mb,
+        rows.append(dict(name=name, n=len(snaps), stage=blob.get("stage"),
+                         file_mb=file_mb,
                          snap_mb=mb(per_snap[-1]) if per_snap else 0.0,
+                         proto_mb=mb(snapshot_bytes(snaps[-1].get("protos", {}))) if snaps else 0.0,
                          once_mb=mb(once_b), per_task_mb=mb(per_task_b),
                          slot_mb=mb(slot_b), slots=n_slots))
+
+    # One run writes one file per task from a fixed --tasks order, so the k-th
+    # file of that run holds k snapshots.  A directory that mixes runs -- the
+    # repo root does, because a later run overwrites only the names it uses --
+    # would otherwise have its numbers blended without warning.
+    counts = sorted(r["n"] for r in rows)
+    expected = list(range(1, len(rows) + 1))
+    if counts != expected or any(r["stage"] != r["n"] - 1 for r in rows):
+        print(f"\n  [!] NOT one run: snapshot counts {counts} instead of {expected},")
+        print("      or stage != snapshots-1.  The per-file blocks above are still")
+        print("      correct; the storage model is SKIPPED because it would blend")
+        print("      configurations.  Point --dir at a single run's artefacts.")
+        return []
     return rows
 
 
@@ -133,6 +148,12 @@ def report_storage_model(rows):
     print("  (treating the router's per-task share as O(T): it is allocated with "
           "max_tasks=T,\n   so it is O(T) up to T and would have to be reallocated "
           "beyond it.)")
+    protos = [r["proto_mb"] for r in rows if r["proto_mb"]]
+    if protos:
+        print(f"\n  class scaling: the prototype rows are the only class-dependent "
+              f"part of the\n  snapshot ({min(protos):.3f}-{max(protos):.3f} MB here, "
+              f"the shared head's rows in int8);\n  the other {last['snap_mb'] - max(protos):.3f} MB "
+              f"is class-independent.")
 
 
 def report_checkpoints(directory):

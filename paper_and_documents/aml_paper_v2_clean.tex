@@ -1618,7 +1618,7 @@ Rather than caching past exemplar images (which violates strict zero-replay cons
 During inference on historical domains, the corresponding state $\mathcal{S}_t$ is restored in constant time $\mathcal{O}(1)$.
 
 \paragraph{What the snapshot actually contains.}
-The cost of this state is worth stating in bytes rather than in symbols, because ``constant time'' at inference is not the same claim as ``constant space'' across tasks. Measured directly from the saved artefacts (\texttt{experiments/snapshot\_storage\_probe.py}, recorded as B64 in the investigation log), one per-task snapshot in the 10-class configuration is \textbf{7.209 MB}:
+The cost of this state is worth stating in bytes rather than in symbols, because ``constant time'' at inference is not the same claim as ``constant space'' across tasks. Measured directly from the saved artefacts (\texttt{experiments/snapshot\_storage\_probe.py}, recorded as B64 in the investigation log), one per-task snapshot in the 10-class configuration is \textbf{7.209 MB}, of which $7.117$ MB does not depend on the class count. Only the prototype rows do ($9.2$ KB per class in int8: $0.092$ MB at ten classes, $1.846$ MB at a $200$-wide head), so the same snapshot is $8.962$ MB at $200$ classes, where the trunk copy is $65.3\%$ of it rather than $81.2\%$. The breakdown is:
 
 \begin{table}[h]
 \centering
