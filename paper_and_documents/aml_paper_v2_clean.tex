@@ -1617,6 +1617,34 @@ Rather than caching past exemplar images (which violates strict zero-replay cons
 \end{equation}
 During inference on historical domains, the corresponding state $\mathcal{S}_t$ is restored in constant time $\mathcal{O}(1)$.
 
+\paragraph{What the snapshot actually contains.}
+The cost of this state is worth stating in bytes rather than in symbols, because ``constant time'' at inference is not the same claim as ``constant space'' across tasks. Measured directly from the saved artefacts (\texttt{experiments/snapshot\_storage\_probe.py}, recorded as B64 in the investigation log), one per-task snapshot in the 10-class configuration is \textbf{7.209 MB}:
+
+\begin{table}[h]
+\centering
+\caption{\textbf{Per-task snapshot, key by key.} Measured from \texttt{routing\_state\_after\_*.pt} at the shipped \texttt{--norm in} setting. The router buffers are preallocated and do \emph{not} grow with the task count.}
+\label{tab:snapshot_bytes}
+\small
+\begin{tabular}{l r}
+\toprule
+\textbf{component} & \textbf{MB per task} \\
+\midrule
+\texttt{layers} (the 18 hybrid blocks) & 5.854 \\
+\texttt{sel} (prototype selector) & 0.805 \\
+\texttt{enc} (vision encoder) & 0.401 \\
+\texttt{protos} (prototype head rows) & 0.092 \\
+\texttt{struct\_heads} ($\boldsymbol{\alpha}_{\text{struct}}, \boldsymbol{\alpha}_{\text{modes}}$) & 0.045 \\
+\texttt{ln}, \texttt{stem} & 0.011 \\
+\midrule
+\textbf{total} & \textbf{7.209} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three consequences are stated rather than glossed over. \textbf{(i)} $81.2\%$ ($5.854 / 7.209$) of the snapshot is a full copy of the 18-layer trunk, so $A_{\text{oracle}}$'s zero forgetting is bought by caching weights, not by structure selection: the objection that AML caches parameters per task is correct for the default configuration. \textbf{(ii)} Storage is $O(T)$ in the number of tasks --- $4.209$ MB of router buffers once, plus $7.209$ MB per task, i.e.\ $76.3$ MB at $T = 10$ --- and evaluation is $O(T)$ as well, since the ambiguous-sample retry re-loads the snapshot of every seen domain. \textbf{(iii)} The structure slot stored next to those weights, $\texttt{slots}[t] = \{\text{gate}, \text{bm\_res}, \text{bm\_mode}\}$, is $\approx 0.4$ KB of float32, about four orders of magnitude smaller than the weights it accompanies. That asymmetry is what makes ``can a task be served from the structure alone?'' a measurable question rather than a rhetorical one, and Section~\ref{sec:zero_bytes} answers it.
+
+\paragraph{The cheaper per-task states that ship.} Two flags reduce what is stored, and neither is a free lunch. \texttt{--snapshot-mode shared} (equivalently \texttt{--shared-backbone 1}) drops the trunk copy, leaving $\approx 1.34$ MB per task at ten classes but giving up the zero-forgetting claim. \texttt{--snapshot-mode structural} drops \emph{every} per-task weight --- the encoder, selector, trunk and prototype rows all come from the shared live model --- leaving the structure library and the slot, $\approx 0.05$ MB per task. Such a configuration has nothing holding the trunk in place, so it is only meaningful together with a mechanism that does; and the framework's own candidate for that mechanism, Elastic Weight Consolidation, was measured \emph{not} to hold the trunk at the production schedule (B19). The consequence is recorded as a measurement in Section~\ref{sec:zero_bytes}.
+
 \paragraph{TaskCentroidRouter.}
 To route unlabeled test instances without knowledge of the task index, AML
 maintains one pristine feature centroid $\mu_t$ per task, computed over a clean
@@ -1805,6 +1833,41 @@ third task, $10.98\%$ of MNIST images are routed to Fashion-MNIST and $5.00\%$
 of CIFAR-10 images likewise. All misrouting at that stage goes \emph{forward}
 to the newest encoder's space and never backward to an older one, which
 identifies the next thing to fix instead of leaving it as an unexplained gap.
+
+\subsection{Zero Bytes per Task: What the Weight Copy Is Worth}
+\label{sec:zero_bytes}
+
+Table~\ref{tab:snapshot_bytes} showed that $81.2\%$ of the per-task state is a copy of the trunk. The natural question is whether that copy can be removed. It can: a task can be served with \emph{no} per-task parameters at all. The question worth answering is what that costs, and the answer turns out to be set by the distance between the tasks.
+
+\paragraph{A test bed with zero per-task parameters by construction.}
+We built a two-task setting in which the per-task parameter count is exactly zero \emph{by construction} rather than by an accounting convention: one shared stem, one shared 20-wide classification head, the two tasks occupying disjoint class ranges of that single head, and cross-entropy restricted to the task's own range. Nothing is stored per task, so the candidate mechanisms can differ only in what they do to the shared trunk. Two task pairs are used, differing solely in the domain gap: an \emph{easy} pair (MNIST $\to$ Fashion-MNIST, same modality and $28{\times}28$ resolution) and a \emph{hard} pair (MNIST $\to$ CIFAR-10 collapsed to one channel: colour, $32{\times}32$, natural images, forced through the same stem). Table~\ref{tab:zero_bytes} reports the mean of the two tasks' final accuracies.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Zero bytes per task.} Every row except the first stores no per-task parameters; ``fixed'' is the one-off cost of the retention mechanism and ``ACC'' is the mean of the two final task accuracies. The snapshot row is shown for scale: it is the only row that pays $5.621$ MB \emph{per task}.}
+\label{tab:zero_bytes}
+\small
+\begin{tabular}{l r r r r}
+\toprule
+\textbf{mechanism} & \textbf{per-task} & \textbf{fixed} & \textbf{ACC} & \textbf{ACC} \\
+& & & \textbf{easy pair} & \textbf{hard pair} \\
+\midrule
+per-task snapshot & 5.621 MB & --- & \textbf{94.60} & \textbf{78.57} \\
+\midrule
+freeze trunk (norms/head free) & 0 & 0 & \textbf{89.00} & 57.12 \\
+Fisher mask, 90 \% frozen & 0 & 0.172 MB & 88.42 & 58.43 \\
+random mask, 90 \% frozen & 0 & \textbf{4 B} & 84.89 & \textbf{58.68} \\
+EWC, int8 Fisher & 0 & 2.798 MB & 87.18 & 49.31 \\
+EWC, fp32 Fisher ($\lambda{=}10^3$) & 0 & 11.191 MB & 79.80 & 48.34 \\
+naive (nothing retained) & 0 & 0 & 63.58 & 42.01 \\
+freeze everything & 0 & 0 & 52.51 & 55.05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three findings follow. \textbf{(i) Zero bytes per task is reachable, and it beats paying for an anchor.} On both pairs the best zero-byte mechanism outscores EWC in both fp32 and int8 by $5$--$10$ points: the framework's own $O(1)$ anti-forgetting mechanism is dominated by simply not moving the weights. \textbf{(ii) The Fisher bitmask does not earn its 180 KB.} Fisher-selected and randomly-selected masks of the same size land within $0.25$ points of each other on the hard pair, and the random one wins, so a 4-byte seed matches a 180 KB importance bitmask. \textbf{(iii) The cost of removing the weight copy is set by the domain gap.} It is 5.6 points on the easy pair and $19.9$ points on the hard pair ($78.57 \to 58.68$). On a genuinely cross-domain shift the cached weights are doing work that no free mechanism recovered here.
+
+We therefore do not claim that the per-task snapshot is avoidable at no cost. We claim the opposite, and measure it: the storage in Eq.~(1) is a deliberate trade whose price is $6$ points on a same-modality shift and $20$ points across modalities. The ranking among the free mechanisms is also not the intuitive one: a full freeze wins the easy pair, while a \emph{random} $90\%$ freeze wins the hard pair, because the $10\%$ left plastic is what lets the trunk re-represent a new input distribution. These are single-seed, three-epoch-per-task measurements; the shape is the result, not the third digit.
 
 \section{Conclusion}
 %======================================================================

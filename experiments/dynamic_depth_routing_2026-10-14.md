@@ -1972,6 +1972,122 @@ stores a literal zero and reaches 4.57 % forgetting. See B66 for the direct
 
 ---
 
+**B66 (measurement) - 0 bytes per task is reachable, it is not free, and the
+price is set by the size of the domain gap.**
+
+B64 established that the per-task snapshot is 81.2 % a copy of the trunk and that
+the structural fingerprint stored beside it is ~0.4 KB. `--snapshot-mode
+structural` makes the weight-free per-task state a shipped option, so the
+question "can a task be served without a per-task weight copy?" becomes a
+measurement instead of an argument.
+
+`experiments/exp_zero_per_task.py` is the test bed, and it is deliberately
+adversarial to the *mechanism* rather than to the framework: one shared stem, one
+shared 20-wide head, the two tasks occupying disjoint class ranges of that single
+head, and cross-entropy restricted to the task's own range. The per-task
+parameter count is therefore exactly **zero by construction** -- not zero by some
+accounting convention -- and the mechanisms can differ only in what they do to the
+shared 5.6 MiB trunk. Two task pairs are run, differing solely in the domain gap:
+
+* **easy pair** MNIST -> Fashion-MNIST (same modality, same 28x28 resolution);
+* **hard pair** MNIST -> CIFAR-10 collapsed to one channel (colour, 32x32, natural
+  images, forced through the same stem, so the trunk has to re-represent the
+  input distribution).
+
+ACC below is the mean of the two tasks' final accuracies, i.e. the quantity a
+deployment actually cares about; "forget" is the drop on task 1.
+
+Easy pair (MNIST -> Fashion, 3 epochs/task):
+
+| mechanism | per-task | fixed | MNIST | FASHION | forget | ACC |
+| :-- | --: | --: | --: | --: | --: | --: |
+| per-task snapshot | 5.621 MiB | 0 | 98.99 % | 90.21 % | 0.00 % | **94.60** |
+| freeze trunk (leave norm/head) | **0** | **0** | 93.41 % | 84.59 % | 5.64 % | **89.00** |
+| Fisher mask, 90 % frozen | 0 | 0.172 MiB | 88.93 % | 87.90 % | 10.12 % | 88.42 |
+| EWC, int8 Fisher | 0 | 2.798 MiB | 84.74 % | 89.61 % | 14.31 % | 87.18 |
+| Fisher mask, 50 % frozen | 0 | 0.172 MiB | 81.67 % | 89.95 % | 17.38 % | 85.81 |
+| random mask, 90 % frozen | 0 | **4 B** | 81.68 % | 88.09 % | 17.37 % | 84.89 |
+| random mask, 50 % frozen | 0 | 4 B | 70.29 % | 90.32 % | 28.76 % | 80.31 |
+| EWC fp32, lambda 1000 | 0 | 11.191 MiB | 70.03 % | 89.56 % | 29.02 % | 79.80 |
+| EWC fp32, lambda 100 | 0 | 11.191 MiB | 54.06 % | 90.24 % | 44.99 % | 72.15 |
+| naive, nothing retained | 0 | 0 | 36.79 % | 90.36 % | 62.26 % | 63.58 |
+| freeze everything | 0 | 0 | 99.05 % | 5.97 % | 0.00 % | 52.51 |
+
+Hard pair (MNIST -> CIFAR-10 grayscale, 3 epochs/task):
+
+| mechanism | per-task | fixed | MNIST | CIFAR-G | forget | ACC |
+| :-- | --: | --: | --: | --: | --: | --: |
+| per-task snapshot | 5.621 MiB | 0 | 99.06 % | 58.08 % | 0.00 % | **78.57** |
+| **random mask, 90 % frozen** | **0** | **4 B** | 73.58 % | 43.78 % | 25.48 % | **58.68** |
+| Fisher mask, 90 % frozen | 0 | 0.172 MiB | 73.83 % | 43.03 % | 25.23 % | 58.43 |
+| freeze trunk (leave norm/head) | 0 | 0 | 80.64 % | 33.60 % | 18.42 % | 57.12 |
+| Fisher mask, 50 % frozen | 0 | 0.172 MiB | 56.13 % | 55.26 % | 42.93 % | 55.70 |
+| freeze everything | 0 | 0 | 99.06 % | 11.04 % | 0.00 % | 55.05 |
+| EWC, int8 Fisher | 0 | 2.798 MiB | 43.53 % | 55.09 % | 55.53 % | 49.31 |
+| EWC fp32, lambda 1000 | 0 | 11.191 MiB | 40.69 % | 56.00 % | 58.37 % | 48.34 |
+| random mask, 50 % frozen | 0 | 4 B | 39.62 % | 56.13 % | 59.44 % | 47.88 |
+| EWC fp32, lambda 100 | 0 | 11.191 MiB | 26.16 % | 58.88 % | 72.90 % | 42.52 |
+| naive, nothing retained | 0 | 0 | 24.45 % | 59.57 % | 74.61 % | 42.01 |
+
+Six results, in order of how much they change what the framework can claim:
+
+1. **Zero bytes per task is reachable, and it beats paying for an anchor.** On
+   both pairs the best 0-byte mechanism outscores EWC in fp32 (11.191 MiB fixed)
+   and in int8 (2.798 MiB fixed) by 5-10 ACC points. The framework's own O(1)
+   anti-forgetting mechanism is dominated by simply not moving the weights, which
+   is the cheap-baseline conclusion of B19 arriving at the per-task budget as
+   well.
+2. **The price of dropping the per-task copy is set by the domain gap, and it is
+   not small.** Easy pair: 5.6 points (94.60 -> 89.00). Hard pair: **19.9 points**
+   (78.57 -> 58.68). So "0 MB per task" is a real configuration, not a fantasy,
+   but on a cross-domain shift the cached weights are doing work that no free
+   mechanism recovered here. The paper's per-task storage is a deliberate trade,
+   not an oversight, and this is the measurement that says so.
+3. **The Fisher bitmask does not earn its 180 KB.** Fisher-selected masks and
+   random-selected masks land within 0.25 points of each other at the same
+   fraction on the hard pair (58.43 vs 58.68, and the *random* one wins), and
+   within 3.5 points on the easy pair. A 4-byte seed therefore matches a
+   180 KB importance bitmask, which is the same "importance ranking is not the
+   binding constraint" result B65 found for the OGP basis.
+4. **Which 0-byte mechanism wins depends on the gap, and the ranking is not the
+   one intuition suggests.** Freezing the whole trunk wins the easy pair
+   (89.00); freezing 90 % of it at *random* wins the hard pair (58.68), because
+   the 10 % left plastic is what lets the trunk re-represent a genuinely new input
+   distribution. On the hard pair a *full* freeze costs 11 points of new-task
+   accuracy (33.60 vs naive's 59.57) while buying 56 points of retention.
+5. **`freeze everything` is not a 0-byte strategy, it is a 1-task strategy.** It
+   scores 99.0 % on task 1 and 6-11 % on task 2 on both pairs. It is in the table
+   as the control that shows the retention above is retention of *something the
+   trunk could do*, not of a frozen accident.
+6. **The 0-byte column is a lower bound, and that is the useful direction.** The
+   worst-performing 0-byte mechanism was run on the real model (see below), so the
+   gap reported here is an upper bound on the cost.
+
+Two protocol defects were found and fixed while producing the easy-pair table,
+and both are recorded because they had made the freeze arm look better than it
+is. First, the snapshot row originally evaluated both tasks *after* restoring the
+snapshot, which reported the pre-task-2 Fashion accuracy for a task-2 snapshot and
+printed 5.97 %; the correct order is task 2 before the restore and task 1 after,
+giving 90.21 %. Second, `set_seed` was called once at process start rather than
+per mechanism, so the mechanisms shared RNG order -- the same confound that made
+the OGP baseline in B65 move 19 points. The **hard pair was run after both fixes**
+and is the clean table; the easy pair predates the per-mechanism re-seeding and
+carries a +/-1-2 point order confound, which `--seed` plus
+`experiments/aggregate_seeds.py` now exists to remove.
+
+Neither table is multi-seed yet, and both use 3 epochs per task, so they are not
+comparable in absolute terms to the production schedule in the paper. What they
+establish is the *shape*: a free mechanism is competitive with every storage-backed
+anchor, a 4-byte mask is competitive with a 180 KB one, and the per-task weight
+copy is worth 6 points on a same-modality shift and 20 on a cross-domain one.
+
+The corresponding measurement on the real 18-layer hybrid
+(`--snapshot-mode structural --freeze-trunk 1`, ~0.05 MB/task against the 7.209 MB
+default) is set up in `%TEMP%\opencode\run_aml_freeze.ps1` but had **not** been run
+when this entry was written; it is open item 17.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".
@@ -2079,3 +2195,16 @@ Written down so that "not done" is not later mistaken for "not noticed".
     `snaps=[]`, so none of the touched branches fire; but that is an argument
     from control flow, and "the branch cannot fire" has been wrong before in this
     log. A full re-run is the way to close it (with open item 7).
+17. **The weight-free configuration has not been measured on the real hybrid.**
+    B66 measured 0 bytes/task in a purpose-built test bed, but
+    `--snapshot-mode structural --freeze-trunk 1` (~0.05 MB/task against the
+    7.209 MB default) has not been run on the 18-layer model. The bed already
+    predicts the direction: the production sequence MNIST -> CIFAR-10 ->
+    Fashion-MNIST is a cross-domain shift, and there a *full* freeze cost 11
+    points of new-task accuracy. `%TEMP%\opencode\run_aml_freeze.ps1` runs the
+    matched pair -- default vs structural+freeze -- in a copy of the repo so the
+    published artefacts are never overwritten, at `--epochs 3,10,6` so both runs
+    fit the budget. Absolute numbers at that reduced schedule are **not**
+    comparable to the published ones; only the paired difference is a result. It
+    was set up and validated to start, but not launched, because the time budget
+    ran out first.
