@@ -446,6 +446,10 @@ def main():
     d1, d2, d3 = (int(v) for v in args.dims.split(","))
     lambdas = [float(v) for v in args.ewc_lambdas.split(",") if v.strip()]
     fracs = [float(v) for v in args.mask_fracs.split(",") if v.strip()]
+    # Label for task 2 in every report line below.  Before this existed the
+    # hard pair (`--task2 cifar10gray`) was still printed as "FASHION", which is
+    # how the two tables in B66 came to be hand-relabelled.
+    t2 = "CIFAR10g" if args.task2 == "cifar10gray" else "FASHION"
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -503,7 +507,7 @@ def main():
         row = dict(method=label, per_task=per_task, fixed=fixed, acc_m=am,
                    acc_f=af, forget=acc_m_init - am, note=note)
         results.append(row)
-        print(f"  MNIST {am:.2f}% | FASHION {af:.2f}% | forget {row['forget']:.2f}% "
+        print(f"  MNIST {am:.2f}% | {t2} {af:.2f}% | forget {row['forget']:.2f}% "
               f"| bytes/task {per_task} | fixed {mib(fixed):.3f} MiB")
         return row
 
@@ -518,6 +522,11 @@ def main():
 
     def on(name):
         return want is None or name in want
+
+    # Set only if the `snapshot` row runs.  With `--methods` excluding it the
+    # report tail used to raise UnboundLocalError after printing the whole table,
+    # which also threw away the JSON dump.
+    snap_bytes = None
 
     # ---- naive ----
     if on("naive"):
@@ -593,7 +602,7 @@ def main():
         results.append(dict(method="snapshot", per_task=snap_bytes, fixed=0,
                             acc_m=am, acc_f=af, forget=acc_m_init - am,
                             note="exact; per-task restore"))
-        print(f"  MNIST {am:.2f}% | FASHION {af:.2f}% | forget {acc_m_init - am:.2f}% "
+        print(f"  MNIST {am:.2f}% | {t2} {af:.2f}% | forget {acc_m_init - am:.2f}% "
               f"| bytes/task {human(snap_bytes)}")
         os.remove(snap)
 
@@ -603,7 +612,7 @@ def main():
     print(" O(1) anchor costs and how much retention/plasticity it buys)")
     print("=" * 104)
     hdr = (f"{'mechanism':<20} | {'bytes/task':>10} | {'fixed O(1)':>12} | "
-           f"{'MNIST':>7} | {'FASHION':>7} | {'forget':>7} | note")
+           f"{'MNIST':>7} | {t2:>7} | {'forget':>7} | note")
     print(hdr)
     print("-" * len(hdr))
     for r in sorted(results, key=lambda d: (d["per_task"], d["fixed"])):
@@ -622,11 +631,14 @@ def main():
     best = max(zero, key=lambda d: (d["acc_f"] - d["forget"])) if zero else None
     if best:
         print(f"\n best 0-byte/task option: {best['method']}  "
-              f"MNIST {best['acc_m']:.2f}%  FASHION {best['acc_f']:.2f}%  "
+              f"MNIST {best['acc_m']:.2f}%  {t2} {best['acc_f']:.2f}%  "
               f"forget {best['forget']:.2f}%  fixed {mib(best['fixed']):.3f} MiB")
         print(f" it costs {best['per_task']} bytes per task vs the snapshot's "
               f"{mib(snap_bytes):.3f} MiB -- i.e. the snapshot is "
-              f"{'infinitely' if best['per_task'] == 0 else ''} more expensive per task")
+              f"{'infinitely' if best['per_task'] == 0 else ''} more expensive per task"
+              if snap_bytes is not None else
+              f" it costs {best['per_task']} bytes per task "
+              f"(the snapshot row did not run; pass it in --methods to compare)")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:

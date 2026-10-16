@@ -2078,26 +2078,35 @@ Six results, in order of how much they change what the framework can claim:
    not an oversight, and this is the measurement that says so.
 3. **The Fisher bitmask does not earn its 180 KB.** Fisher-selected masks and
    random-selected masks land within 0.25 points of each other at the same
-   fraction on the hard pair (58.43 vs 58.68, and the *random* one wins), and
-   within 3.5 points on the easy pair. A 4-byte seed therefore matches a
-   180 KB importance bitmask, which is the same "importance ranking is not the
-   binding constraint" result B65 found for the OGP basis.
+   fraction on the hard pair (58.43 vs 58.68), and within 3.5 points on the easy
+   pair. A 4-byte seed therefore matches a 180 KB importance bitmask, which is
+   the same "importance ranking is not the binding constraint" result B65 found
+   for the OGP basis. Which of the two is nominally ahead is *not* a finding: B68
+   measures up to 3.6 points of run-to-run spread on exactly these rows, so the
+   equality is the claim and the direction is noise.
 4. **Which 0-byte mechanism wins depends on the gap, and the ranking is not the
-   one intuition suggests.** Freezing the whole trunk wins the easy pair
-   (89.00); freezing 90 % of it at *random* wins the hard pair (58.68), because
-   the 10 % left plastic is what lets the trunk re-represent a genuinely new input
-   distribution. On the hard pair a *full* freeze costs 11 points of new-task
-   accuracy (33.60 vs naive's 59.57) while buying 56 points of retention.
+   one intuition suggests.** Freezing the whole trunk is the best 0-byte position
+   on the easy pair (89.00, and by 5.6 points -- outside the spread B68 measures,
+   so that one holds). On the hard pair the best position in *this* run is a 90 %
+   random mask (58.68), with the 10 % left plastic doing the work of
+   re-representing a genuinely new input distribution; but the frozen trunk is
+   within 1.6 points of it and B68 puts the spread on these rows at 3.6, so on the
+   hard pair the top three 0-byte mechanisms are not separable. On the hard pair a
+   *full* freeze costs 11 points of new-task accuracy (33.60 vs naive's 59.57)
+   while buying 56 points of retention.
 5. **`freeze everything` is not a 0-byte strategy, it is a 1-task strategy.** It
    scores 99.0 % on task 1 and 6-11 % on task 2 on both pairs. It is in the table
    as the control that shows the retention above is retention of *something the
    trunk could do*, not of a frozen accident.
 6. **The real-model gap is deliberately conservative.** The mechanism carried to
    the 18-layer hybrid is `freeze trunk`: 0 bytes by construction, the best
-   zero-byte arm on the easy pair (89.00) and 1.6 points *below* the best one on
-   the hard pair (57.12 against the random mask's 58.68). The gap it measures is
-   therefore an upper bound on the cost of 0 bytes/task, and the bias runs in the
-   safe direction.
+   zero-byte arm on the easy pair (89.00), and on the hard pair 57.12 against the
+   random mask's 58.68 -- a 1.6-point gap that B68 shows is inside the run-to-run
+   spread, so it is not a real concession. It is also the *safest* arm to carry: a
+   frozen parameter is 0 bytes under any implementation, while a mask is 0 bytes
+   only if the decoupled decay is masked along with the gradient (the correction
+   above). The gap it measures is therefore an upper bound on the cost of
+   0 bytes/task, and the bias runs in the safe direction.
 
 Two protocol defects were found and fixed while producing the easy-pair table,
 and both are recorded because they had made the freeze arm look better than it
@@ -2134,9 +2143,15 @@ selection really is all that has to be carried. `exp_zero_per_task.py` now does
 that, and `--self-check` proves the invariant on CPU in 0.1 s: manual decay is
 bit-identical to AdamW's own for unmasked parameters, the frozen values stay
 bit-equal to their initial values, and an unmasked decay does move them.
-**The correction does not move any ACC**, because the honest update and the
-restore-based one produce element-for-element identical trajectories; the four
-mask rows are therefore re-run as a *check*, and its result is recorded below.
+**The correction changes the byte column, not the trajectory.** The honest
+update and the restore-based one are element-for-element identical -- `x * 1.0` is
+exact in IEEE-754 and AdamW's decay is a per-element multiply by a scalar -- so no
+ACC can move. That argument is exact and machine-independent, and `--self-check`
+proves it on CPU in 0.1 s. The *empirical* version of the check was attempted and
+is recorded as B68; it cannot settle the ACC question, because this table does not
+reproduce run to run. B68 also records a real defect the attempt found in the
+first implementation of the honest path, and it corrects two over-reads here
+(claims 3 and 4).
 What changes is the reading of the table: the two `freeze` rows are 0 bytes under
 *any* implementation (a parameter with `requires_grad=False` is never visited by
 the optimizer at all), while a mask row is 4 B / 0.172 MiB only under the stricter
@@ -2144,9 +2159,176 @@ implementation -- a naive one silently pays a snapshot with extra steps, which i
 exactly the distinction the section is about.
 
 The corresponding measurement on the real 18-layer hybrid
-(`--snapshot-mode structural --freeze-trunk 1`, ~0.05 MB/task against the 7.209 MB
-default) is set up in `%TEMP%\opencode\run_aml_freeze.ps1` but had **not** been run
-when this entry was written; it is open item 17.
+(`--snapshot-mode structural --freeze-trunk 1`, 0.045 MB/task against the 7.209 MB
+default) was run on 2026-10-16 and is B67, below.
+
+---
+
+**B67 (measurement) - the matched pair on the real 18-layer hybrid: dropping the
+per-task weight copy costs 10.85 points of task-aware accuracy and gains 28.75
+points of the same quantity, because the arm that stores nothing is the arm that
+cannot drift.**
+
+`%TEMP%\opencode\run_aml_freeze.ps1` ran the production command twice, changing
+one flag. Both arms: `--tasks mnist,cifar10,fashion --epochs 3,10,6
+--replay-per-class 0 --norm in --encoder-tail-act none --arch-lr 0.003
+--depth-cost 0.02`, one seed, zero replay, RTX 3050 Laptop. Arm 1 is the shipped
+default (`--snapshot-mode full`, 7.209 MB/task, 40.3 min); arm 2 is the
+weight-free point on the storage curve (`--snapshot-mode structural
+--freeze-trunk 1`, 0.045 MB/task, 37.2 min). Both exit 0. Read with
+`experiments/parse_aml_matrix.py`.
+
+| protocol | arm | mnist | cifar10 | fashion | A_avg | forget |
+| :-- | :-- | --: | --: | --: | --: | --: |
+| oracle | full, 7.209 MB/task | 97.58 | 55.32 | 90.52 | **81.14** | 0.00 |
+| oracle | structural+freeze, 0.045 MB/task | 97.71 | 33.46 | 79.71 | **70.29** | -0.04 |
+| live | full | 10.73 | 22.95 | 90.30 | **41.33** | 59.79 |
+| live | structural+freeze | 97.73 | 32.37 | 80.13 | **70.08** | 0.08 |
+| auto | full | 35.80 | 46.46 | 90.51 | 57.59 | 35.31 |
+| auto | structural+freeze | 8.89 | 10.15 | 79.71 | 32.92 | 56.02 |
+
+Six readings.
+
+1. **The two protocols disagree about which arm is better, and that is the
+   result.** `oracle` (task identity *and* a snapshot restore) prefers the default
+   by 10.85 points; `live` (task identity at the read-out, current weights only,
+   no restore) prefers the weight-free arm by 28.75. The 7.209 MB is worth 10.85
+   points *together with the restore*; without it the stored weights are dead
+   capital and arm 1 forgets 59.79 %. B66's test bed found the same asymmetry on a
+   harder pair, where dropping the copy cost 19.9 points.
+2. **What buys the retention is that nothing moves -- and the head is not what
+   forgets.** `A_live` keeps its read-out rows per task (`pi_mask_j` splits the
+   K = 12 prototype rows 4/4/4 by task index; `evaluate` documents that `A_live`
+   is task-aware, unlike `A_auto`), and a task's rows are only ever trained by
+   that task, so task 1's read-out is intact in both arms. Arm 2's mnist is 97.73
+   because a frozen trunk leaves mnist features where task 1 put them; arm 1's is
+   10.73 because the trunk re-represented the input for CIFAR-10 and a read-out
+   tuned to the old features then reads noise. Forgetting here is representational
+   drift, not head overwrite.
+3. **The plasticity cost lands on the cross-domain task.** `oracle` cifar10 33.46
+   against 55.32 (-21.86), fashion 79.71 against 90.52 (-10.81), mnist 97.71
+   against 97.58 (+0.13). Same ordering as B66: the cheap mechanisms are within a
+   point of the snapshot on the same-modality task and ~20 points behind it on the
+   cross-domain one.
+4. **The autonomous protocol is unavailable at this storage point, for a
+   structural reason.** Stage-3 `route_acc` collapses to 0.00 % in arm 2
+   (`route_hist [0,0,10000]` -- every query assigned to the most recent task)
+   against 27.04 / 79.33 / 99.99 % in arm 1, and `auto` A_avg falls 24.67 points.
+   A centroid lives in the space of the encoder that produced it
+   (`route_per_task`), and `structural` mode stores no per-task encoders -- only
+   the live one -- so every candidate is scored in a space it does not belong to.
+   The cheapest mode that keeps the router working is `shared` (1.343 MB/task),
+   which does keep `enc`. Note that this column is not a headline in *either* arm:
+   arm 1's router is also poor (27.04 % on mnist, `route_hist [2704,0,7296]`), and
+   `A_auto` is the identity-free protocol, which is bad in both -- that is the
+   B46/B47 problem, not this entry's.
+5. **Storage was read off the artefacts, not asserted.** Arm 1 printed
+   `[snap] ... snapshot 7.21 MB` and wrote `routing_state_after_*.pt` of 11.536 /
+   18.861 / 26.184 MB; arm 2 printed `0.045 MB per task` and wrote 4.261 / 4.308 /
+   4.355 MB. The per-task difference is exactly the snapshot (~7.3 MB). The router
+   is identical in both arms and contributes 1.053 MB/task either way (B64
+   correction), so the honest ratio is 8.263 against 1.098 MB per task -- 7.5x,
+   not the ~160x the snapshot lines alone suggest.
+6. **The default arm's `live` forgetting is B19 seen from the other side.** 59.79 %
+   with `--ewc-lambda 0`: the snapshot does not *prevent* forgetting, it repairs it
+   when the protocol permits a restore.
+
+Caveats, so the numbers are not over-read. The schedule is `3,10,6`, not the
+published `5,28,16`: this is a *paired* experiment and its absolute values are not
+comparable to the published table. The same 3-task command under the full schedule
+gives `oracle` A_avg 86.73 (the older `full_production.log`), against 81.14 here,
+so roughly 5.6 of the 10.85-point oracle gap is schedule rather than mechanism. One
+seed. `--freeze-trunk` was chosen over the sandbox's slightly better random mask
+(B66: 58.68 against 57.12 on the hard pair -- a gap B68 shows is inside the
+run-to-run spread, so the two are not separable) because a frozen parameter is
+0 bytes under *any* implementation while a mask is 0 bytes only if the decay is
+masked too (B66 correction) -- so 10.85 is an upper bound on the cost of
+0 bytes/task, and the bias runs in the safe direction.
+
+---
+
+**B68 (measurement) - the 0-byte table does not reproduce run to run, and the
+attempt to reproduce it found a real defect in the corrected implementation.**
+
+B66's correction said the honest update "does not move any ACC" and that the four
+mask rows were therefore "re-run as a *check*". The check was run. It produced two
+results, and neither is the one that sentence predicted.
+
+**(a) The first implementation of the honest path was wrong, in a way that a
+toy-scale proof missed.** The manual substitute for AdamW's decoupled decay
+multiplied *every* trainable parameter, but `torch.optim` skips a parameter whose
+`.grad is None` (`if p.grad is None: continue` in `_single_tensor_adamw`), so
+grad-less parameters were decayed by `1 - lr*wd` per step where AdamW left them
+untouched. Latent parameters are normal in this model: an expert the gate did not
+select receives no gradient. Measured on a two-parameter toy (8 steps, one
+grad-bearing and one grad-less parameter): the grad-less tensor moved by `1.9e-6`
+while the AdamW reference did not move it at all, and the grad-bearing tensor was
+bit-identical. Fixed by gating on `p.grad is not None`, which is exactly AdamW's
+own condition. `--self-check` now has two checks for it (a grad-bearing parameter
+matches AdamW with the guard; a grad-less one is not decayed), so this class of
+mistake fails a 0.1 s CPU check instead of surviving into a table. The existing
+`--self-check` did not catch it because the toy it used gave its single parameter
+a gradient every step.
+
+**(b) The table does not reproduce, so the ACC column cannot be used as the
+check.** Same command, same seed (42), same epochs (3), hard pair, six rows, run
+again with the fix in place:
+
+| row | B66 (acc_m / acc_f) | re-run (acc_m / acc_f) | dACC |
+| :-- | :-- | :-- | --: |
+| naive | 24.45 / 59.57 | 30.78 / 59.87 | +3.32 |
+| freeze_trunk | 80.64 / 33.60 | 82.87 / 33.40 | +1.02 |
+| mask_random_p0.5 | 39.62 / 56.13 | 50.66 / 54.93 | +4.92 |
+| mask_random_p0.9 | 73.58 / 43.78 | 72.63 / 44.13 | -0.30 |
+| mask_fisher_p0.5 | 56.13 / 55.26 | 53.58 / 54.37 | -1.72 |
+| mask_fisher_p0.9 | 73.83 / 43.03 | 80.71 / 43.34 | +3.60 |
+| `acc_m_init` | 99.06 | 98.96 | -0.10 |
+
+`acc_m_init` is one evaluation of the task-1 model with no task-2 training
+involved, and it moves 0.10. Every retention number moves by 1-5 points. Open item
+4 already records 0.26 points of variation on the production command
+(`cudnn.benchmark = True` selects convolution algorithms by timing, so the result
+depends on machine load); this table is worse by an order of magnitude on the
+unprotected rows, and for a reason the earlier entry did not name: a mechanism
+that does not hold the representation ends on a *small* task-1 accuracy, and a
+small numerical difference is a large relative one there. `naive` is the clearest
+case -- 24.45 % against 30.78 %.
+
+Three consequences.
+
+1. **B66's correction is a byte-column correction, and it must not be defended by
+   reproducing the ACC column.** What justifies it is the code argument (`x * 1.0`
+   is exact in IEEE-754; AdamW's decay is a per-element multiply by a scalar) and
+   the CPU self-check, both exact and machine-independent. Reproducing the ACC
+   column would need a determinism this run does not have.
+2. **The ordering inside B66's 0-byte table is not resolved at the precision the
+   table prints.** Published order: `mask_random_p0.9` 58.68 > `mask_fisher_p0.9`
+   58.43 > `freeze_trunk` 57.12. Re-run order: `mask_fisher_p0.9` 62.03 >
+   `mask_random_p0.9` 58.38 > `freeze_trunk` 58.14. The top three sit within
+   0.25-1.6 points of each other in one run and reorder in the next, against a
+   measured spread of up to 3.6 points on these rows. The honest statement is that
+   the Fisher mask, the random mask and the frozen trunk are **not separable** on
+   this pair at this schedule. B66 claims 3, 4 and 6 have been rewritten
+   accordingly.
+3. **What survives is the magnitude, not the order.** Both runs put every 0-byte
+   mechanism 10-20 points below the snapshot on the hard pair, within a few points
+   on the easy pair, and 10+ points above `naive` on the hard pair. That contrast
+   is the result; the ranking below the snapshot is noise. B67's real-model pair is
+   unaffected in kind -- it compares one mechanism with the default, not five
+   mechanisms with each other -- but the 1.6-point mask-versus-freeze gap it cited
+   as a concession is noise, and B67 now says so.
+
+Two artifact notes, both of which limit what can be checked later.
+
+* The re-run crashed *after* printing its table (`UnboundLocalError: snap_bytes`
+  when `--methods` excludes the `snapshot` row), so the table above is transcribed
+  from `%TEMP%\opencode\zero_hard_v3.log` and there is no JSON for it. The report
+  tail now handles an absent snapshot row.
+* `zero_hard.json` -- the file B66's hard table was read from -- records only
+  `acc_m_init`, `snapshot_bytes` and `shared_weight_bytes`. It predates the
+  revision that writes `seed` and `task2`, so it does not pin which code produced
+  the published rows. That is why this entry reports a fresh measurement rather
+  than a reproduction.
 
 ---
 
@@ -2180,7 +2362,12 @@ Written down so that "not done" is not later mistaken for "not noticed".
    `A[1,1]` = 98.65 % and 98.91 %. That is a 0.26-point spread on the same seed,
    which is small compared with the effects under study but large enough that a
    single run cannot support a claim finer than about half a point. BatchNorm
-   was already shown not to reproduce (two runs 14.3 points apart).
+   was already shown not to reproduce (two runs 14.3 points apart). **B68 measures
+   a worse case in the sandbox: 1-5 points on retention rows and up to 3.6 on the
+   0-byte ranking, because an unprotected mechanism ends on a small task-1
+   accuracy where a small numerical difference is a large relative one.** Any
+   table whose rows are within a few points of each other must say which spread it
+   was measured against, and B66's did not.
 5. **CUDA shared-memory tiling (point 5) not started.** The fused mix kernels are
    elementwise and already bandwidth-bound; the remaining candidates are the
    grouped-convolution path in `fused_dynamic_conv2d` and the two-convolution
@@ -2257,16 +2444,13 @@ Written down so that "not done" is not later mistaken for "not noticed".
     `snaps=[]`, so none of the touched branches fire; but that is an argument
     from control flow, and "the branch cannot fire" has been wrong before in this
     log. A full re-run is the way to close it (with open item 7).
-17. **The weight-free configuration has not been measured on the real hybrid.**
-    B66 measured 0 bytes/task in a purpose-built test bed, but
-    `--snapshot-mode structural --freeze-trunk 1` (~0.05 MB/task against the
-    7.209 MB default) has not been run on the 18-layer model. The bed already
-    predicts the direction: the production sequence MNIST -> CIFAR-10 ->
-    Fashion-MNIST is a cross-domain shift, and there a *full* freeze cost 11
-    points of new-task accuracy. `%TEMP%\opencode\run_aml_freeze.ps1` runs the
-    matched pair -- default vs structural+freeze -- in a copy of the repo so the
-    published artefacts are never overwritten, at `--epochs 3,10,6` so both runs
-    fit the budget. Absolute numbers at that reduced schedule are **not**
-    comparable to the published ones; only the paired difference is a result. It
-    was set up and validated to start, but not launched, because the time budget
-    ran out first.
+17. ~~**The weight-free configuration has not been measured on the real hybrid.**~~
+    **Closed 2026-10-16 -- see B67.** It has now been run as a matched pair at
+    `--epochs 3,10,6`, one seed: the weight-free arm costs 10.85 points of
+    task-aware accuracy (oracle A_avg 70.29 against 81.14) and gains 28.75 on the
+    no-restore protocol (70.08 against 41.33), with the plasticity loss
+    concentrated on the cross-domain task (CIFAR-10 33.46 against 55.32). What
+    remains open from it is the *reason* the autonomous protocol collapses to
+    0.00 % routing accuracy in that arm -- `structural` stores no per-task
+    encoders, so each centroid is scored in a space it does not belong to -- and
+    whether a router fitted on the live encoder would recover it.
