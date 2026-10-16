@@ -23,6 +23,7 @@ Read §3 before quoting any number here. Specifically:
 | :-- | :-- |
 | `A_oracle` at `--epochs 5,28,16` | **measured**: 86.73 % `A_avg`, **zero** forgetting — §3.1a |
 | `A_auto` at the same schedule | **measured**: 81.96 % `A_avg`, 6.34 % forgetting, 4.23 points below the oracle — §3.1a |
+| `A_auto` input-norm A/B (B71) | per-task **66.05 %** is the upper bound (default `--input-norm per-task`); `--input-norm pooled` measures **40.46 %** (−25.59 pts). Oracle unchanged (85.90 → 86.61 %), confirming the gap is the router under task-agnostic norm, not the model. §3.1a, open item 23 |
 | router metric | **changed** to `mahalanobis-task` with `--router-logdet-weight 0.5` and `--router-fit-split train` (was one pooled covariance fitted on the test split) |
 | `--norm` | **`in`** (InstanceNorm), was `bn` |
 | `--replay-per-class` | **0** by default, was 400 — the default run is now the zero-replay run the docs describe |

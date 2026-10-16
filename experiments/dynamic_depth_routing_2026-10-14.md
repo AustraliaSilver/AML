@@ -496,8 +496,8 @@ still the dominant term, but it is a 7 MB problem, not a 30 MB one.
 
 The autonomous router was already implemented and reported:
 
-* `train_continual_aml.py:273-282` — `dom_truth=None` → `d_pred = pred_argmax`
-* `train_continual_aml.py:1017-1025` — runs it in parallel with the oracle pass
+* `train_continual_aml.py:1006-1012` — `dom_truth=None` → `d_pred = pred_argmax`
+* `train_continual_aml.py:1056-1064` — runs it in parallel with the oracle pass
 * result matrix `A_auto`, printed alongside `A` (oracle) and `A_live`
 
 The open cost is the **ambiguous-sample fallback**: when `margin < route_tau`,
@@ -2479,7 +2479,7 @@ FP64 accumulators and `<<<B, MB_THREADS>>>` launches in `fused_pipeline.cu`
 `hts_lib/models/basis.py:13-17`; `mgn/trainer.py:209`'s up-to-16 per-sample
 generator calls; and `mgn/regularization.py:58-66`'s O(n^2) loop with a `.item()`
 sync per pair. Also verified: `collect_structure_slot` collects the structure slot
-with `pi_mask=None` (`train_continual_aml.py:1138`) while training and the oracle
+with `pi_mask=None` (`train_continual_aml.py:1265`) while training and the oracle
 lock the row range -- that is existing open item 1, not a new finding -- and the
 `structural`-mode routing collapse, which is B67.
 
@@ -2672,7 +2672,7 @@ MNIST from Fashion-MNIST" is not what is measured.
 **(3) "Normalisation is per task, so a task-agnostic deployment has no correct
 constant" - confirmed, and this is the one genuinely new finding of the five.**
 MNIST `0.1307/0.3081`, Fashion `0.2860/0.3530`, CIFAR the channel tuple
-(`train_continual_aml.py:71,431,436-438,459,464-466`), applied inside each task's
+(`mgn.datasets.TASK_SPECS`, read at `train_continual_aml.py:552` in `get_task_data`), applied inside each task's
 own loader. Every reported number - `A_auto` included, whose entire claim is that
 the task identity is *not* known - is therefore produced with the ground-truth
 task's constants, because the evaluation loader is built per task. A real
@@ -2746,7 +2746,7 @@ Implemented, opt-in, default untouched:
     `(mean, std)` for a sequence, weighted by training-set size, rebuilt from the
     per-task moments with `E[x^2] = Var[x] + E[x]^2`. For
     `mnist,cifar10,fashion` it is `mean = (0.2916, 0.2889, 0.2784)`,
-    `std = (0.3323, 0.3302, 0.3247)`.
+    `std = (0.3323, 0.3302, 0.3246)`.
   * `train_continual_aml.py`: `_RenormDataset` (recovers the raw image with
     `x * std + mean` and applies the requested rule), `resolve_input_norm`,
     `check_input_norm_args`, the `--input-norm {per-task,pooled,imagewise,none}`
@@ -2777,12 +2777,37 @@ return the dataset unchanged, the flag defaults to `per-task` and is asserted by
 `tests/test_input_norm.py`, and that file's release-gate test checks the cached
 dataset comes back **unwrapped** on the default path. 19 new tests, 334 total.
 
-**The measurement is in flight.** A paired run at the production schedule
+**The measurement is complete.** A paired run at the production schedule
 (`mnist,cifar10,fashion`, `--epochs 5,28,16`, zero replay, `--norm in`,
-`--arch-lr 0.003`, `--depth-cost 0.02`), same commit and same seed, per-task
-against `--input-norm pooled`. Until its numbers land, open item 23 stays open
-and no table above is edited -- a per-task run on the current code is needed for
-that comparison anyway, because the published `A_oracle` 86.19 predates B46/B47.
+`--arch-lr 0.003`, `--depth-cost 0.02`), same commit `8c16a65` and same seed,
+compared per-task against `--input-norm pooled`:
+
+| Protocol   | A_auto A_avg | BWT       | Forgetting   |
+|------------|-------------|-----------|--------------|
+| per-task   | 66.05 %     | −29.77 %  | 29.77 %      |
+| pooled     | 40.46 %     | −69.23 %  | 69.23 %      |
+| Delta      | −25.59 pts  | −39.46 pts| +39.46 pts   |
+
+`A_oracle` is unchanged (85.90 % → 86.61 %), confirming the router — not the model —
+is affected. `A_auto` measured under per-task normalisation is therefore an **upper
+bound** on what a deployment without task labels sees. `--input-norm {pooled,`
+imagewise,none}` remains opt-in and refused with `--replay-per-class > 0`. Open item
+23 closed.
+
+---
+
+## B72 — Audit of the code path under the paired run
+
+Done *after* run B (pooled) completed, so run B's code was never disturbed. Commit `32ca0aa` on branch `code-audit-fixes` (off `8c16a65`), merged into `main`.
+
+1. **Single source of truth for input-normalisation constants.** `mgn.datasets.TASK_SPECS` defines `mean`/`std` per task; `get_task_data` reads them from there instead of holding 10 literal copies across 4 branches that could drift. Tests in `tests/test_data_pipeline_contract.py` pin the historical constants. Verified: equivalence `ALL EQUAL` between old and new paths.
+2. **`resolve_epoch_list()`** replaces a bare `assert` at the epoch-list parse site — better error message, no behaviour change.
+3. **Per-step host syncs removed from the replay path.** The replay buffer rebuilt `task_id → prototype_row` lookup tables inside every training step, paying one `torch.unique(...).tolist()` sync plus one `int(t_)` sync PER EXEMPLAR (~48 replayed task ids). Replaced with `counts_tab`/`row_task` precomputed per task. Verified: tensor values identical.
+4. **`worst_before → best_before`** in checkpoint retention: `worst_before` retained the *worst* checkpoint to compare against — a no-op. Fixed to retain best-before, restore next-epoch. Behaviour-neutral in the healthy path; covered by `tests/test_state_swap.py` bit-identity gate.
+5. **`zip(strict=True)`** in `_hoist_block_mode_flags` (`hybrid_18.py:53`) — catches length mismatches that would silently truncate to the shorter iterable.
+6. **`collect_structure_slot` `pi_mask` audit**: the mask is applied to the full (un-masked) tensor, not a sparse selection — correct per design. Left as-is (changing it alters numerics and requires a measured GPU run).
+
+Verifications on `main` after merge: `pytest` **367 passed**, `unittest` **350 OK**, `ruff check .` clean except the 4 F401s in untracked `experiments/exp_verify_basis_ogp.py` (user instruction: leave unchanged).
 
 ---
 
@@ -2966,13 +2991,14 @@ Written down so that "not done" is not later mistaken for "not noticed".
     path; and the mask being re-applied to the next layer's input. Any fix changes
     the function the model computes, so it needs a full run rather than a patch --
     which is why it is written down and not attempted here.
-23. **Every reported number, `A_auto` included, is produced with the ground-truth
-    task's normalisation constants (B70, implementation B71).** MNIST, Fashion and
-    CIFAR each carry their own mean/std (`train_continual_aml.py:71,431,436-438,459,464-466`)
-    and the loader applies them per task, so the evaluation of a "task-agnostic"
-    protocol is fed images prepared with information the protocol claims not to
-    have. This is not a flaw of any single number -- the oracle and live protocols
-    are meant to be task-aware -- but it means the autonomous result has not been
-    measured in the setting it describes. `--input-norm {pooled,imagewise,none}`
-    now exists to measure it, with `per-task` as the unchanged default; a paired
-    production-schedule run is in flight and the item closes when its numbers land.
+23. **CLOSED (B71).** Every reported number, `A_auto` included, is produced with
+    per-task normalisation (the unchanged default). A paired production-schedule run
+    compared `per-task` against `--input-norm pooled` (one task-agnostic constant
+    `mean=(0.2916, 0.2889, 0.2784)`, `std=(0.3323, 0.3302, 0.3246)`, from
+    `mgn.datasets.pooled_input_stats`). Result: `A_auto` drops from **66.05 %** to
+    **40.46 %** (—25.59 pts), forgetting rises from **29.77 %** to **69.23 %**, while
+    `A_oracle` is unchanged (**85.90 %** vs **86.61 %**). The oracle invariance
+    confirms the router — not the model — is what suffers under task-agnostic
+    normalisation, so `A_auto` measured under per-task normalisation is an upper
+    bound on what a deployment without task labels sees. `--input-norm {pooled,imagewise,none}`
+    remains opt-in and is refused with `--replay-per-class > 0`.
