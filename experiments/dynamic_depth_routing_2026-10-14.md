@@ -2059,9 +2059,12 @@ Six results, in order of how much they change what the framework can claim:
    scores 99.0 % on task 1 and 6-11 % on task 2 on both pairs. It is in the table
    as the control that shows the retention above is retention of *something the
    trunk could do*, not of a frozen accident.
-6. **The 0-byte column is a lower bound, and that is the useful direction.** The
-   worst-performing 0-byte mechanism was run on the real model (see below), so the
-   gap reported here is an upper bound on the cost.
+6. **The real-model gap is deliberately conservative.** The mechanism carried to
+   the 18-layer hybrid is `freeze trunk`: 0 bytes by construction, the best
+   zero-byte arm on the easy pair (89.00) and 1.6 points *below* the best one on
+   the hard pair (57.12 against the random mask's 58.68). The gap it measures is
+   therefore an upper bound on the cost of 0 bytes/task, and the bias runs in the
+   safe direction.
 
 Two protocol defects were found and fixed while producing the easy-pair table,
 and both are recorded because they had made the freeze arm look better than it
@@ -2080,6 +2083,32 @@ comparable in absolute terms to the production schedule in the paper. What they
 establish is the *shape*: a free mechanism is competitive with every storage-backed
 anchor, a 4-byte mask is competitive with a 180 KB one, and the per-task weight
 copy is worth 6 points on a same-modality shift and 20 on a cross-domain one.
+
+**Correction (2026-10-16): what a mask row had to store.** The `fixed` column
+above is the size of the *selection* a mask persists -- 4 bytes for a random
+seed, 0.172 MiB for one bit per weight. That is the whole cost only if the frozen
+elements are never written, and the code that produced the table did not achieve
+that: `build_mask` kept a full clone of every masked tensor
+(`values[n] = p.detach().clone()`) and `train_task` restored the frozen elements
+from it after every `opt.step()`, because `AdamW(weight_decay=1e-4)` multiplies
+*every* element and would otherwise move them. Those rows therefore *held*
+`|selection| + p x |basis|` -- 4.97 MiB at p = 0.9, 2.76 MiB at p = 0.5, and
+5.52 MiB as coded, since the clone copies the whole tensor -- and not the 4 B the
+column prints. This is a property of the implementation, not of the mechanism:
+masking the decoupled decay together with the gradient (a decay factor of exactly
+1.0 on frozen elements, exact in IEEE-754) leaves those values unwritten, so the
+selection really is all that has to be carried. `exp_zero_per_task.py` now does
+that, and `--self-check` proves the invariant on CPU in 0.1 s: manual decay is
+bit-identical to AdamW's own for unmasked parameters, the frozen values stay
+bit-equal to their initial values, and an unmasked decay does move them.
+**The correction does not move any ACC**, because the honest update and the
+restore-based one produce element-for-element identical trajectories; the four
+mask rows are therefore re-run as a *check*, and its result is recorded below.
+What changes is the reading of the table: the two `freeze` rows are 0 bytes under
+*any* implementation (a parameter with `requires_grad=False` is never visited by
+the optimizer at all), while a mask row is 4 B / 0.172 MiB only under the stricter
+implementation -- a naive one silently pays a snapshot with extra steps, which is
+exactly the distinction the section is about.
 
 The corresponding measurement on the real 18-layer hybrid
 (`--snapshot-mode structural --freeze-trunk 1`, ~0.05 MB/task against the 7.209 MB

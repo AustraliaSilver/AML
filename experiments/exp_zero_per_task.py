@@ -23,7 +23,14 @@ two shapes of mechanism that can hit 0 B/task are:
 
     (a) freeze  -- store nothing, accept lost plasticity;
     (b) one O(1) anchor over the shared weights -- EWC-style, or a frozen-weight
-        mask whose *values* never need storing because they are never written.
+        mask.  A mask releases the values it protects IF AND ONLY IF the
+        decoupled weight decay is masked along with the gradient: with grad == 0
+        and no decay the optimizer cannot write those elements, so only the
+        SELECTION is carried (4 bytes for a seed, one bit per weight for
+        Fisher).  Restoring them from a saved copy -- which is what AdamW's
+        global decay forces -- silently costs frac x |basis| instead, i.e. a
+        snapshot rather than a selection.  This script takes the honest path
+        (see build_mask/train_task) and the difference is easy to get wrong.
 
 This script measures (a), (b) and their variants in a test bed where the
 per-task byte count is EXACTLY zero by construction:
@@ -40,10 +47,13 @@ Mechanisms, all with 0 bytes/task:
     freeze_trunk   basis + controller frozen, norms/head free
     ewc_l*         quadratic anchor over the shared weights (O(1) in T)
     ewc_int8       the same anchor quantised to int8 (0.5x the bytes)
-    mask_<sel>_p   freeze a fraction p of the basis weights.  The frozen VALUES
-                   never have to be stored (they are never written); only the
-                   SELECTION is stored: 4 bytes if it is a random seed, or one
-                   bit per weight if it is chosen by Fisher importance.
+    mask_<sel>_p   freeze a fraction p of the basis weights.  The decoupled
+                   weight decay is masked together with the gradient, so the
+                   frozen VALUES are never written and only the SELECTION is
+                   stored: 4 bytes if it is a random seed, or one bit per weight
+                   if it is chosen by Fisher importance.  (The reported byte
+                   count is the size the selection is PERSISTED at -- a seed, or
+                   a packed bitmask -- not the unpacked in-RAM bool tensor.)
 
 Reported: MNIST retention, Fashion plasticity, and the fixed O(1) bytes that
 buy them -- with the snapshot cost quoted alongside for contrast.
@@ -188,10 +198,18 @@ class SharedEWC:
 
 
 # ---------------------------------------------------------------------------
-# frozen-weight mask: values are never stored, only the selection
+# frozen-weight mask: the decay is masked too, so the frozen values are never
+# written and only the selection is stored (4-byte seed, or one bit per weight)
 # ---------------------------------------------------------------------------
 def build_mask(model, frac, select, fisher=None, seed=0):
-    frozen, values = {}, {}
+    """Selection of the fraction `frac` of the basis weights to freeze.
+
+    Only the SELECTION is returned; the values are pinned at update time by
+    masking the gradient and the decoupled decay, so no copy of them is held.
+    Returning a restore copy instead would cost frac x |basis| here -- exactly
+    the difference between a selection and a snapshot.
+    """
+    frozen = {}
     gen = torch.Generator().manual_seed(seed)
     nbits = 0
     for n, p in model.named_parameters():
@@ -209,11 +227,10 @@ def build_mask(model, frac, select, fisher=None, seed=0):
         m = torch.zeros(numel, dtype=torch.bool)
         m[idx] = True
         frozen[n] = m.view(p.shape).to(p.device)
-        values[n] = p.detach().clone()
         nbits += numel
     # random selection -> a 4-byte seed; Fisher selection -> one bit per weight
     nbytes = 4 if select == "random" else (nbits + 7) // 8
-    return {"frozen": frozen, "values": values}, nbytes
+    return {"frozen": frozen}, nbytes
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +246,27 @@ def range_ce(logits, y, lo, hi):
 
 
 def train_task(model, loader, device, lo, hi, epochs, lr,
-               ewc=None, mask=None, verbose=True):
+               ewc=None, mask=None, verbose=True, wd=1e-4):
     model.train()
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # AdamW's decoupled decay multiplies EVERY element of a tensor, so a frozen
+    # element would move and would then have to be restored from a saved copy --
+    # storage the mask is supposed to avoid.  The decay is applied by hand
+    # instead, with a factor of EXACTLY 1.0 on frozen elements (x * 1.0 is
+    # exact), so those values are never written and the mask costs a selection
+    # rather than a copy.  Multiplying by (1 - lr*wd) before opt.step() is
+    # AdamW's own order, so every non-masked row is unchanged.
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     frozen = mask["frozen"] if mask else None
-    saved = mask["values"] if mask else None
+    decay = {}
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if frozen is not None and n in frozen:
+            keep = torch.ones_like(p.data)
+            move = torch.full_like(p.data, 1.0 - lr * wd)
+            decay[n] = torch.where(frozen[n], keep, move)
+        else:
+            decay[n] = 1.0 - lr * wd
     for ep in range(1, epochs + 1):
         tot, corr, n = 0.0, 0, 0
         for x, y in loader:
@@ -254,12 +287,12 @@ def train_task(model, loader, device, lo, hi, epochs, lr,
                     if nm in frozen and p.grad is not None:
                         p.grad[frozen[nm]] = 0.0
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            with torch.no_grad():
+                # decoupled decay, before the Adam update (AdamW's own order)
+                for nm, p in model.named_parameters():
+                    if nm in decay:
+                        p.data.mul_(decay[nm])
             opt.step()
-            if frozen is not None:
-                with torch.no_grad():
-                    for nm, p in model.named_parameters():
-                        if nm in frozen:
-                            p.data[frozen[nm]] = saved[nm][frozen[nm]]
             tot += loss.item() * y.size(0)
             corr += (logits[:, lo:hi].argmax(-1) == (y - lo)).sum().item()
             n += y.size(0)
@@ -267,6 +300,67 @@ def train_task(model, loader, device, lo, hi, epochs, lr,
             print(f"        epoch {ep}/{epochs} loss {tot / n:.4f} | acc {100.0 * corr / n:.2f}%")
     if ewc is not None:
         ewc.consolidate()
+
+
+def self_check(verbose=True):
+    """Verify the invariant the mask's byte accounting rests on (CPU only).
+
+    AdamW's global decay multiplies every element, so a masked element would
+    move and would have to be restored from a saved copy -- a copy, not a
+    selection.  Masking the decay too (factor exactly 1.0 on frozen elements)
+    leaves them untouched.  On a tiny tensor, with the same weights and the same
+    gradient sequence for every variant:
+
+      ref        AdamW(weight_decay=1e-4)                    (old behaviour)
+      manual     AdamW(wd=0) + p *= (1 - lr*wd), unmasked    (must be identical)
+      naive      ... applied to the masked tensor as well    (values move)
+      honest     ... with a 1.0 factor where frozen          (values never move)
+
+    Returns 0 if every claim holds, 1 otherwise.
+    """
+    steps, lr, wd = 8, 1e-3, 1e-4
+    gen = torch.Generator().manual_seed(7)
+    grads = [torch.randn(64, 7, generator=gen) for _ in range(steps)]
+    mask = torch.zeros(64, 7, dtype=torch.bool)
+    sel = torch.randperm(64 * 7, generator=torch.Generator().manual_seed(3))
+    mask.view(-1)[sel[: int(0.9 * 64 * 7)]] = True
+
+    def run(mode):
+        torch.manual_seed(1)
+        p = torch.nn.Parameter(torch.randn(64, 7))
+        init = p.detach().clone()
+        opt = torch.optim.AdamW([p], lr=lr, weight_decay=wd if mode == "ref" else 0.0)
+        for g in grads:
+            p.grad = g.clone()
+            if mode in ("naive", "honest"):
+                p.grad[mask] = 0.0
+            if mode != "ref":
+                with torch.no_grad():
+                    if mode == "honest":
+                        p.data.mul_(torch.where(mask, torch.ones_like(p.data),
+                                                torch.full_like(p.data, 1.0 - lr * wd)))
+                    else:
+                        p.data.mul_(1.0 - lr * wd)
+            opt.step()
+        return p.detach().clone(), init
+
+    ref, init = run("ref")
+    manual, _ = run("manual")
+    naive, _ = run("naive")
+    honest, _ = run("honest")
+    checks = [
+        ("manual decay is bit-identical to AdamW's own decay", torch.equal(ref, manual)),
+        ("frozen values are never written (bit-equal to init)",
+         torch.equal(honest[mask], init[mask])),
+        ("free values match the unmasked reference exactly",
+         torch.equal(honest[~mask], ref[~mask])),
+        ("an unmasked decay would move the frozen values",
+         not torch.equal(naive[mask], init[mask])),
+    ]
+    if verbose:
+        for name, ok in checks:
+            print(f"  [{'ok' if ok else 'FAIL'}] {name}")
+    return 0 if all(ok for _, ok in checks) else 1
 
 
 @torch.no_grad()
@@ -306,7 +400,13 @@ def main():
                     help="seed for every mechanism; run the script once per seed and "
                          "aggregate the JSONs to get error bars")
     ap.add_argument("--json-out", type=str, default="")
+    ap.add_argument("--self-check", action="store_true",
+                    help="run the CPU-only mask-accounting invariant check and exit")
     args = ap.parse_args()
+
+    if args.self_check:
+        print(" mask accounting self-check (no GPU needed)")
+        return self_check()
 
     d1, d2, d3 = (int(v) for v in args.dims.split(","))
     lambdas = [float(v) for v in args.ewc_lambdas.split(",") if v.strip()]
@@ -433,7 +533,8 @@ def main():
             label = f"mask_{select}_p{frac:g}"
             if not on(label):
                 continue
-            print(f"\n[{label}] 0 bytes/task, fixed = mask only")
+            print(f"\n[{label}] 0 bytes/task, fixed = selection only "
+                  f"(decay masked too, so no copy of the values is held)")
             m = fresh()
             mask, mbytes = build_mask(m, frac, select, fisher=fisher_A, seed=args.seed)
             train_task(m, tr_f, device, 10, 20, args.epochs, args.lr_task2, mask=mask)
@@ -476,6 +577,13 @@ def main():
               f"{r['acc_m']:>6.2f}% | {r['acc_f']:>6.2f}% | {r['forget']:>6.2f}% | {r['note']}")
 
     zero = [r for r in results if r["per_task"] == 0]
+    if any(r["method"].startswith("mask_") for r in results):
+        print("\n note: a mask row's fixed bytes are the SELECTION it persists -- 4 bytes for a")
+        print(" random seed, or one bit per protected weight if Fisher-ranked.  The values it")
+        print(" pins are never written, because the decoupled decay is masked along with the")
+        print(" gradient (x * 1.0 is exact).  An implementation that instead restores them from")
+        print(" a saved copy would hold frac x |basis| of extra state -- the difference between")
+        print(" a selection and a snapshot.")
     best = max(zero, key=lambda d: (d["acc_f"] - d["forget"])) if zero else None
     if best:
         print(f"\n best 0-byte/task option: {best['method']}  "
@@ -496,5 +604,6 @@ def main():
 
 if __name__ == "__main__":
     t0 = time.time()
-    main()
+    rc = main()
     print(f"\n[done] {time.time() - t0:.1f}s")
+    sys.exit(rc or 0)
