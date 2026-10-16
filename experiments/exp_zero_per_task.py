@@ -288,9 +288,12 @@ def train_task(model, loader, device, lo, hi, epochs, lr,
                         p.grad[frozen[nm]] = 0.0
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             with torch.no_grad():
-                # decoupled decay, before the Adam update (AdamW's own order)
+                # Decoupled decay, before the Adam update (AdamW's own order) and
+                # only for the parameters AdamW itself would touch: torch.optim
+                # skips a parameter whose `.grad is None`, so decaying one here
+                # would be a behavioural difference rather than a rounding one.
                 for nm, p in model.named_parameters():
-                    if nm in decay:
+                    if p.grad is not None and nm in decay:
                         p.data.mul_(decay[nm])
             opt.step()
             tot += loss.item() * y.size(0)
@@ -356,6 +359,38 @@ def self_check(verbose=True):
          torch.equal(honest[~mask], ref[~mask])),
         ("an unmasked decay would move the frozen values",
          not torch.equal(naive[mask], init[mask])),
+    ]
+
+    # A parameter that receives no gradient must also be left alone: torch.optim
+    # skips `grad is None` parameters entirely, so a manual decay that does not
+    # skip them is a behavioural difference, not a rounding one.  (The first
+    # version of this change made exactly that mistake, which is why the check
+    # exists.)
+    g2 = torch.Generator().manual_seed(13)
+    seq = [torch.randn(32, 5, generator=g2) for _ in range(steps)]
+
+    def gradless(manual):
+        torch.manual_seed(3)
+        used = torch.nn.Parameter(torch.randn(32, 5))
+        unused = torch.nn.Parameter(torch.randn(16, 3))
+        ps = [used, unused]
+        opt = torch.optim.AdamW(ps, lr=lr, weight_decay=0.0 if manual else wd)
+        for gr in seq:
+            used.grad = gr.clone()
+            unused.grad = None
+            if manual:
+                with torch.no_grad():
+                    for p in ps:
+                        if p.grad is not None:
+                            p.data.mul_(1.0 - lr * wd)
+            opt.step()
+        return used.detach().clone(), unused.detach().clone()
+
+    ru, rx = gradless(False)
+    mu, mx = gradless(True)
+    checks += [
+        ("grad-bearing parameter matches AdamW with the guard", torch.equal(ru, mu)),
+        ("grad-less parameter is not decayed either", torch.equal(rx, mx)),
     ]
     if verbose:
         for name, ok in checks:
