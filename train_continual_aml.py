@@ -161,6 +161,41 @@ def check_input_norm_args(mode, use_replay):
             "zero-replay protocol (--replay-per-class 0).")
 
 
+def resolve_amp_dtype(device):
+    """Pick the autocast dtype this GPU can actually accelerate.
+
+    The gate is **bf16 tensor cores**, which is not what
+    `torch.cuda.is_bf16_supported()` answers. That helper reports whether basic
+    bf16 *operations* work, and they do on Turing: a T4 returns True for it while
+    having fp16 tensor cores and no bf16 ones at all, so bf16 there is emulated.
+    Measured on a Tesla T4 (sm_75), 18-layer AML at batch 256 / 32x32:
+
+        fp32      314.1 ms
+        bf16     1072.4 ms     <- 3.4x slower than fp32
+        fp16      266.8 ms     <- the fastest of the three
+
+    The `mma.sync` bf16 instructions arrive in sm_80 (Ampere), so capability
+    >= (8, 0) is the gate. Turing and Volta have fp16 tensor cores, which is why
+    fp16 is the fallback rather than fp32.
+
+    This only changes behaviour where bf16 was already unusable: every device at
+    sm_80 or newer -- which includes every GPU the published numbers were measured
+    on -- takes the same branch as before. The chosen value is printed, because a
+    run that silently landed on a different precision than the last one would be
+    very hard to account for afterwards.
+    """
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return None, "cpu: autocast disabled"
+    cap = torch.cuda.get_device_capability(device)
+    name = torch.cuda.get_device_name(device)
+    if cap >= (8, 0):
+        return torch.bfloat16, f"{name} (sm_{cap[0]}{cap[1]}): bf16 tensor cores"
+    return torch.float16, (
+        f"{name} (sm_{cap[0]}{cap[1]}): no bf16 tensor cores (they start at "
+        f"sm_80) -> fp16 tensor cores instead; bf16 is emulated and measured "
+        f"3.4x slower than fp32 on this class of GPU")
+
+
 def resolve_epoch_list(epochs_arg, tasks):
     """`--epochs` as one positive count per task, in task order.
 
@@ -2314,8 +2349,8 @@ def main():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else (
-        torch.float16 if device.type == 'cuda' else None)
+    amp_dtype, amp_why = resolve_amp_dtype(device)
+    print(f"[*] autocast dtype: {amp_dtype} -- {amp_why}")
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     tasks = [t.strip() for t in args.tasks.split(',')]
