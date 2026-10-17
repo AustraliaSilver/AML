@@ -2114,7 +2114,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "(recommended for 64x64, i.e. Tiny ImageNet) leaves it off "
                          "and switches it on if the peak memory seen by the first "
                          "step exceeds 85%% of the card. See B69g.")
-    ap.add_argument('--mask-grad', type=int, default=1, choices=[0, 1],
+    ap.add_argument('--width-mask-grad', type=int, default=1, choices=[0, 1],
                     help="whether the channel width mask carries a gradient (1=on, "
                          "the default and unchanged behaviour, 0=detached). Setting "
                          "0 removes the architecture gradient that flows through the "
@@ -2351,7 +2351,7 @@ def main():
             encoder_tail_act=args.encoder_tail_act,
             arch_prior=args.arch_prior,
             grad_checkpoint=(args.grad_checkpoint == 'on'),
-            mask_grad=(args.mask_grad == 1)
+            width_mask_grad=(args.width_mask_grad == 1)
         ).to(device)
         # `train_task` does not receive `args`, so carry the policy on the model.
         # It is read once, only to decide `auto` (see the latch in train_task).
