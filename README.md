@@ -223,6 +223,30 @@ Every other setting is the shipped default: `--ewc-lambda 0` (disabled),
 
 **A_avg = 66.05 % · BWT = −29.77 % · Forgetting = 29.77 %**
 
+> **Reproducibility — read 66.05 % as one run, not a constant.** Re-running this
+> schedule at a later commit, same seed and same flags, produced
+> **`A_avg auto` 62.75 %**. The three columns are not equally reproducible:
+
+> | column | B71 `8c16a65` | rerun `d80c764` | drift |
+> | :-- | --: | --: | --: |
+> | `A_oracle` | 85.90 % | 85.99 % | **0.09** |
+> | `A_auto` | 66.05 % | 62.75 % | **3.30** |
+> | `A_live` | 44.14 % | 48.73 % | **4.59** |
+
+> The oracle column reproduces; the two that depend on a routing decision do
+> not. Almost all of the `A_auto` movement is one cell — A[3,2] fell 57.95 % →
+> 47.31 % because its `route_acc` fell 83.26 % → 63.85 %, i.e. 1 941 CIFAR-10
+> queries crossed the cifar10/fashion decision boundary — while that same cell's
+> `A_oracle` only moved +0.36. `cudnn.benchmark = True` means a fixed `--seed`
+> does not pin the convolution algorithms, and the router's boundary is close
+> enough to those queries that rounding flips them. Two runs at the *same* commit
+> already differ by 0.96 points on A[2,2], so no code change can be held to
+> anything smaller. Full data: `REPRODUCIBILITY.md` §3Z.1.
+
+> What survives every run is the **ordering** `A_oracle ≫ A_auto ≫ A_live`, and
+> the qualitative diagnosis in §3.4a. What does not survive is the second
+> decimal. Treat the routing table below as one run's measurement too.
+
 Routing accuracy behind those cells (`route_acc`, measured on the same path that
 produced the predictions):
 
@@ -265,6 +289,13 @@ produced the predictions):
 >    `--input-norm {pooled,imagewise,none}` applies one task-agnostic rule to the
 >    whole sequence instead, and a paired run at the same schedule measures the
 >    gap. See B71 / open item 23.
+> 6. **These figures are reproducible to a few points, not to two decimals.**
+>    `A_auto` moved 66.05 → 62.75 % between two runs of the identical schedule,
+>    while `A_oracle` moved 0.09. The 19.85-point auto-to-oracle gap in point 2
+>    is therefore 23.24 points on a rerun — the same story, a wider gap. Two runs
+>    at the same commit differ by 0.96 points on A[2,2] with no code change
+>    involved, so nothing tighter than that is measurable by re-running. See the
+>    reproducibility note above and `REPRODUCIBILITY.md` §3Z.1.
 
 #### 3.4a Why the router collapses — and how the first answer was wrong
 

@@ -223,20 +223,42 @@ and a different algorithm rounds differently. The seed fixes the architecture
 sampling and the data order, but **not** the algorithm, so run-to-run
 reproduction is not bit-exact.
 
-This is not a theoretical caveat — it is measured. Two runs of the production
-schedule at the same commit, same seed, same flags:
+This is not a theoretical caveat — it is measured. Three runs of the production
+schedule, same seed, same flags; the last two at the **same** commit:
 
-| cell | run 1 | run 2 | Δ |
-| :-- | --: | --: | --: |
-| A[1,1] | 98.49 % | 98.51 % | +0.02 |
-| A[2,2] | 67.16 % | 68.12 % | **+0.96** |
+| quantity | B71 `8c16a65` | `d80c764` 09:26 | `d80c764` 11:59 | spread |
+| :-- | --: | --: | --: | --: |
+| A[1,1] auto | 98.49 % | 98.51 % | 98.37 % | 0.14 |
+| A[2,2] auto | 67.16 % | 68.12 % | 67.51 % | **0.96** |
+| A[3,2] auto | 57.95 % | *(run died)* | 47.31 % | **10.64** |
+| **A_avg auto** | **66.05 %** | *(run died)* | **62.75 %** | **3.30** |
+| A_avg oracle | 85.90 % | *(run died)* | 85.99 % | 0.09 |
+| A_avg live | 44.14 % | *(run died)* | 48.73 % | 4.59 |
 
-Training amplifies float differences: a ~1e-7 disagreement at step 0 is
-compounded over 28 epochs. So **the spread above is the run-to-run noise of
-this protocol**, and a difference of that size between two runs is not evidence
-that anything changed.
+The 09:26 run was lost to §3Z.2 before reaching task 3, which is why it has no
+`A_avg`.
+
+**The middle column is the important one: it is the same commit as the right
+column, so the 0.96 spread on A[2,2] has no code change to attribute it to.**
+Anything smaller than that is inside the noise.
 
 Two consequences worth stating plainly:
+
+* **The drift is not uniform across the three columns, and that is the whole
+  story.** `A_avg oracle` moves 0.09 points: training itself reproduces. The two
+  columns that depend on a *routing decision* move 3.3 and 4.6 points, and
+  essentially all of the `A_auto` movement is in one cell:
+
+  | cell | B71 | `d80c764` | Δ |
+  | :-- | --: | --: | --: |
+  | A[3,2] `A_oracle` | 67.16 % | 67.52 % | +0.36 |
+  | A[3,2] `route_acc` | 83.26 % | 63.85 % | **−19.41** |
+  | A[3,2] `route_hist` | `[0, 8326, 1674]` | `[0, 6385, 3615]` | 1 941 queries flipped |
+
+  The oracle cell is stable, so the CIFAR-10 representation is fine — what moved
+  is *which snapshot gets selected*. 1 941 CIFAR-10 queries sat close enough to
+  the cifar10/fashion decision boundary that a rounding difference flipped them
+  to Fashion. **The router's boundary is the fragile part, not the learner.**
 
 * **Do not verify "this change is number-neutral" by re-running training.**
   The comparison you want is already stronger and cheaper: run both forms
@@ -245,6 +267,12 @@ Two consequences worth stating plainly:
   `tests/test_grad_checkpoint.py` do, and it is bitwise.
 * **Cite the commit a number came from.** A published figure describes one run
   on one machine, not a protocol invariant.
+
+**So how precisely is `A_avg auto` reproducible?** To a few points, not to two.
+66.05 % is the measured value of one run and stays reported as such; a rerun
+landed on 62.75 %. The `oracle ≫ auto ≫ live` ordering survives every run, and
+the routing statistics in §3.1b should be read the same way — one run's
+measurement, not a stable constant.
 
 To make runs bit-reproducible instead, set `torch.backends.cudnn.benchmark =
 False`, `cudnn.deterministic = True` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
