@@ -483,7 +483,7 @@ Table~\ref{tab:cl_results} presents quantitative continual learning performance 
 
 \begin{table}[h]
 \centering
-\caption{\textbf{Zero-Replay Continual Learning Performance Across Architectures.} Evaluated sequentially on MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST without storing any exemplar images ($\text{replay}=0$). Production schedule: $5, 28, 16$ epochs, bf16. The $A_{\text{auto}}$ row predates two evaluation-path fixes and is retained as measured; see the note following this table.}
+\caption{\textbf{Zero-Replay Continual Learning Performance Across Architectures.} Evaluated sequentially on MNIST $\to$ CIFAR-10 $\to$ Fashion-MNIST without storing any exemplar images ($\text{replay}=0$). Production schedule: $5, 28, 16$ epochs, bf16, on the corrected evaluation path.}
 \label{tab:cl_results}
 \small
 \resizebox{\textwidth}{!}{%
@@ -495,24 +495,24 @@ Table~\ref{tab:cl_results} presents quantitative continual learning performance 
 \textbf{Standard ResNet-18} & $34.54\%$ & $-55.07\%$ & $55.07\%$ & $348{,}730$ & --- \\
 \textbf{Vision Transformer (ViT)} & $25.36\%$ & $-14.61\%$ & $14.61\%$ & $232{,}234$ & --- \\
 \midrule
-\textbf{AML $A_{\text{live}}$ (mutable, true rows)} & $47.49\%$ & $-58.71\%$ & $58.71\%$ & $1{,}871{,}385$ & $0$ MB \\
-\textbf{AML $A_{\text{auto}}$ (Autonomous Router)} & $\mathbf{81.96\%}$ & $\mathbf{-6.34\%}$ & $\mathbf{6.34\%}$ & $1{,}871{,}385$ & $7.12$ MB/task \\
-\textbf{AML $A_{\text{oracle}}$ (Zero-Forgetting)} & $\mathbf{86.19\%}$ & $\mathbf{+0.00\%}$ & $\mathbf{0.00\%}$ & $1{,}871{,}385$ & $7.12$ MB/task \\
+\textbf{AML $A_{\text{live}}$ (mutable, true rows)} & $44.14\%$ & $-63.07\%$ & $63.07\%$ & $1{,}871{,}385$ & $0$ MB \\
+\textbf{AML $A_{\text{auto}}$ (Autonomous Router)} & $\mathbf{66.05\%}$ & $\mathbf{-29.77\%}$ & $\mathbf{29.77\%}$ & $1{,}871{,}385$ & $7.12$ MB/task \\
+\textbf{AML $A_{\text{oracle}}$ (Zero-Forgetting)} & $\mathbf{85.90\%}$ & $\mathbf{+0.00\%}$ & $\mathbf{0.00\%}$ & $1{,}871{,}385$ & $7.12$ MB/task \\
 \bottomrule
 \end{tabular}%
 }
 \end{table}
 
-\paragraph{A note on the live baseline.} $A_{\text{live}}$ is evaluated with the true task's prototype-row range supplied (using mutable, true rows), so it is \emph{task-aware}: like $A_{\text{oracle}}$, it is told which task's read-out the image belongs to, and unlike $A_{\text{auto}}$, it is never required to infer it. The $38.70$ percentage point gap between $A_{\text{live}}$ and $A_{\text{oracle}}$ therefore strictly measures the cost of catastrophic forgetting in the mutable trunk, rather than any penalty from task ambiguity.
+\paragraph{A note on the live baseline.} $A_{\text{live}}$ is evaluated with the true task's prototype-row range supplied (using mutable, true rows), so it is \emph{task-aware}: like $A_{\text{oracle}}$, it is told which task's read-out the image belongs to, and unlike $A_{\text{auto}}$, it is never required to infer it. The $41.76$ percentage point gap between $A_{\text{live}}$ and $A_{\text{oracle}}$ therefore strictly measures the cost of catastrophic forgetting in the mutable trunk, rather than any penalty from task ambiguity.
 
-\paragraph{Status of the $A_{\text{auto}}$ and $\mathit{route\_acc}$ figures.} The $A_{\text{auto}}$ row of Table~\ref{tab:cl_results} and the routing-accuracy figures in Table~\ref{tab:cl_matrix} were measured on an evaluation path that has since been corrected, and have not been re-measured. Two defects were found by audit and fixed afterwards: (i) the ambiguous-sample retry evaluated a snapshot's weights under the \emph{predicted} domain's structure slot instead of the retried domain's, and the branch that does this runs by default and had no test reaching it; (ii) the per-sample candidate dispatch dropped the routing weight, so a sample's output depended on which other samples shared its batch. Both are fixed and now covered by tests, but the figures above predate the fixes, so we do not present them as post-fix. The post-fix measurement available at the time of writing is the paired $A/B$ run of Section~\ref{sec:input_norm_ablation}, which was executed on the corrected code path with the default router configuration: it gives $A_{\text{oracle}} = 85.90\%$ and $A_{\text{auto}} = 66.05\%$ under the default per-task input normalisation. The oracle is essentially unchanged by the fixes; it is the autonomous protocol that moves, which is consistent with both defects residing in the routing path. Re-measuring the calibrated-router configuration on the corrected path is outstanding work.
+\paragraph{These numbers replaced an earlier, higher, and wrong set.} An earlier version of this table reported $A_{\text{auto}} = 81.96\%$ with $6.34\%$ forgetting and an oracle of $86.19\%$, on the strength of a run whose evaluation path was subsequently found to contain two defects: (i) the ambiguous-sample retry evaluated a snapshot's weights under the \emph{predicted} domain's structure slot instead of the retried domain's, and the branch that does this runs by default and had no test reaching it; (ii) the per-sample candidate dispatch dropped the routing weight, so a sample's output depended on which other samples shared its batch. Both are fixed and now covered by tests. The oracle moves little ($86.19\% \to 85.90\%$) because it bypasses the router entirely, but the autonomous protocol drops by $15.91$ points, which is what one expects when the defects were in the routing path. We report the corrected figures throughout and treat the earlier ones as withdrawn rather than as an alternative reading of the same protocol.
 
 \paragraph{Elimination of Catastrophic Forgetting.}
-As shown in Table~\ref{tab:cl_results}, standard static models suffer extreme representation degradation under zero replay: Plain-18 and ResNet-18 forget over $54\%$ of acquired capabilities, with MNIST accuracy dropping from $>94\%$ to $<10\%$. AML $A_{\text{live}}$ without snapshots similarly forgets $58.71\%$. In contrast, AML Snapshot Isolation achieves \textbf{mathematically exact zero forgetting} ($BWT = +0.00\%$, Forgetting $= 0.00\%$, $A_{\text{avg}} = 86.19\%$), completely eliminating forgetting while storing only $7.12$~MB per task.
+As shown in Table~\ref{tab:cl_results}, standard static models suffer extreme representation degradation under zero replay: Plain-18 and ResNet-18 forget over $54\%$ of acquired capabilities, with MNIST accuracy dropping from $>94\%$ to $<10\%$. AML $A_{\text{live}}$ without snapshots similarly forgets $63.07\%$. In contrast, AML Snapshot Isolation achieves \textbf{mathematically exact zero forgetting} ($BWT = +0.00\%$, Forgetting $= 0.00\%$, $A_{\text{avg}} = 85.90\%$), completely eliminating forgetting while storing only $7.12$~MB per task.
 
 \begin{table}[h]
 \centering
-\caption{\textbf{Stage-by-Stage Accuracy Evolution Matrix ($A[i, j]$).} Measured under AML Task-Oracle Snapshot Retrieval ($A_{\text{oracle}}$) and Autonomous Routing ($A_{\text{auto}}$).}
+\caption{\textbf{Stage-by-Stage Accuracy Evolution Matrix ($A[i, j]$).} Measured under AML Task-Oracle Snapshot Retrieval ($A_{\text{oracle}}$) and Autonomous Routing ($A_{\text{auto}}$), on the corrected evaluation path.}
 \label{tab:cl_matrix}
 \small
 \resizebox{\textwidth}{!}{%
@@ -522,18 +522,18 @@ As shown in Table~\ref{tab:cl_results}, standard static models suffer extreme re
 \cmidrule(lr){2-4} \cmidrule(lr){5-7}
 \textbf{Trained After} & \textbf{MNIST} & \textbf{CIFAR-10} & \textbf{Fashion} & \textbf{MNIST} & \textbf{CIFAR-10} & \textbf{Fashion} \\
 \midrule
-\textbf{Stage 1 (MNIST)} & $98.54\%$ & --- & --- & $98.54\%$ & --- & --- \\
-\textbf{Stage 2 (CIFAR-10)} & $98.54\%$ & $67.92\%$ & --- & $98.54\%$ & $67.92\%$ & --- \\
-\textbf{Stage 3 (Fashion)} & $\mathbf{98.54\%}$ & $\mathbf{67.92\%}$ & $\mathbf{92.12\%}$ & $\mathbf{88.96\%}$ & $\mathbf{64.82\%}$ & $\mathbf{92.11\%}$ \\
+\textbf{Stage 1 (MNIST)} & $98.49\%$ & --- & --- & $98.49\%$ & --- & --- \\
+\textbf{Stage 2 (CIFAR-10)} & $98.49\%$ & $67.16\%$ & --- & $98.49\%$ & $67.16\%$ & --- \\
+\textbf{Stage 3 (Fashion)} & $\mathbf{98.49\%}$ & $\mathbf{67.16\%}$ & $\mathbf{92.06\%}$ & $\mathbf{48.16\%}$ & $\mathbf{57.95\%}$ & $\mathbf{92.04\%}$ \\
 \bottomrule
 \end{tabular}%
 }
 \end{table}
 
 \paragraph{Autonomous Routing Efficacy.}
-Table~\ref{tab:cl_matrix} details the stage-by-stage progression. In Stage 2, autonomous routing accuracy is $100.00\%$, matching oracle accuracy identically. In Stage 3, $A_{\text{auto}}$ achieves $81.96\%$, coming within $4.23$ points of the upper-bound oracle ($86.19\%$). 
+Table~\ref{tab:cl_matrix} details the stage-by-stage progression. In Stage 2, autonomous routing accuracy is $100.00\%$, matching oracle accuracy identically. In Stage 3 the router degrades sharply: $A_{\text{auto}}$ falls to $48.16\%$ on MNIST and $57.95\%$ on CIFAR-10 while its own-domain Fashion cell holds at $92.04\%$, giving $66.05\%$ against the oracle's $85.90\%$. The failure is concentrated entirely in the two cells that require recovering an \emph{earlier} snapshot, so it is a retrieval problem rather than a loss of per-domain accuracy: where the router picks the right snapshot, it matches the oracle exactly ($98.49\%$ on MNIST, $67.16\%$ on CIFAR-10), and where it picks the wrong one the accuracy is whatever that snapshot yields on a foreign domain. Stage-3 routing accuracy is $43.76\%$ on MNIST and $83.26\%$ on CIFAR-10, and in both cases the errors go forward, to the newest snapshot.
 
-Table~\ref{tab:cl_route_breakdown} decomposes the routing distribution, illustrating that misclassifications occur exclusively forward (MNIST images routed toward the latest Fashion snapshot), providing clear diagnostic paths for future boundary calibration.
+Table~\ref{tab:cl_route_breakdown} decomposes the routing distribution, illustrating that misclassifications occur exclusively forward (MNIST images routed toward the latest Fashion snapshot), providing clear diagnostic paths for future boundary calibration. The ordering by retention age is the informative part: MNIST, the domain seen first, is the one the newest encoder's space absorbs, and its $56.24\%$ forward-misrouting is what separates $48.16\%$ from the oracle's $98.49\%$. Fashion, the most recent domain, retains $99.98\%$ of its own queries. Section~\ref{sec:input_norm_ablation} shows that this gap widens further under task-agnostic input normalisation.
 
 \begin{table}[h]
 \centering
@@ -545,9 +545,9 @@ Table~\ref{tab:cl_route_breakdown} decomposes the routing distribution, illustra
 \toprule
 \textbf{Query Dataset} & \textbf{$A_{\text{auto}}$ Acc} & \textbf{$A_{\text{oracle}}$ Acc} & \textbf{Route Accuracy} & \textbf{Misrouting Destination} \\
 \midrule
-\textbf{MNIST (Stage 3)} & $88.96\%$ & $98.54\%$ & $89.02\%$ & $10.98\% \to$ Fashion-MNIST \\
-\textbf{CIFAR-10 (Stage 3)} & $64.82\%$ & $67.92\%$ & $95.00\%$ & $5.00\% \to$ Fashion-MNIST \\
-\textbf{Fashion-MNIST (Stage 3)} & $92.11\%$ & $92.12\%$ & $99.97\%$ & $0.03\% \to$ CIFAR-10 \\
+\textbf{MNIST (Stage 3)} & $48.16\%$ & $98.49\%$ & $43.76\%$ & $56.24\% \to$ Fashion-MNIST \\
+\textbf{CIFAR-10 (Stage 3)} & $57.95\%$ & $67.16\%$ & $83.26\%$ & $16.74\% \to$ Fashion-MNIST \\
+\textbf{Fashion-MNIST (Stage 3)} & $92.04\%$ & $92.06\%$ & $99.98\%$ & $0.02\% \to$ CIFAR-10 \\
 \bottomrule
 \end{tabular}%
 }
