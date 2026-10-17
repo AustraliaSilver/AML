@@ -116,10 +116,12 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         arch_prior: str = "staged",
         compute_cost: bool = False,
         encoder_tail_act: str = "none",
-        grad_checkpoint: bool = False
+        grad_checkpoint: bool = False,
+        mask_grad: bool = True
     ):
         super().__init__()
         self.K = K
+        self.mask_grad = mask_grad
         #: Recompute each block's activations in backward instead of keeping them
         #: (see `_call_block`). Bitwise identical, ~17 % slower when the step fits
         #: anyway, 4-5.7x faster when it spills. Mutable on purpose: the trainer's
@@ -322,6 +324,8 @@ class ConvAML_18Layer_Hybrid(nn.Module):
         d_lengths = torch.clamp(dim_fractions * self.max_dim, min=16.0)
         arange = torch.arange(self.max_dim, device=device).float().view(1, 1, self.max_dim)
         dim_masks = torch.sigmoid(10.0 * (d_lengths - arange))
+        if not self.mask_grad:
+            dim_masks = dim_masks.detach()
 
         # Mode logits for Plain, ResNet, ViT [B, max_layers, 3]
         bm_logits = (pi @ self.block_mode_prototypes.view(self.K, -1)).view(B, self.max_layers, 3)

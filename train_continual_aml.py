@@ -312,17 +312,24 @@ class TaskCentroidRouter(nn.Module):
     def update_task_centroid(self, task_idx: int, z_features: torch.Tensor):
         """Accumulate a batch into the running centroid, for TRAINING only.
 
-        Called on every step, so by the end of a 6-epoch task most of what it
-        gathered came from encoder states that no longer exist - and it
-        deliberately does NOT touch the shared covariance, because that is
+        It deliberately does NOT touch the shared covariance, because that is
         global and cannot be corrected later without keeping every intermediate
         feature around.
 
-        finalize_task_features() is the authoritative pass: it rebuilds the
-        centroid from the final encoder and is the only thing that feeds the
-        covariance. Measured: letting this blend into the final centroid put
-        routing at 82.0% overall and 64.6% on the first domain, against 100.0%
-        when the clean pass wins.
+        Nothing in the shipped trainer calls this any more. It is kept because the
+        reasoning behind not calling it is worth recording:
+
+          * per-step features come from encoder states that no longer exist by the
+            time the task ends, so a running sum describes an encoder that never
+            existed; and
+          * finalize_task_features() is the authoritative pass -- it rebuilds the
+            centroid from the final encoder and is the only thing that feeds the
+            covariance.
+
+        Re-enabling this without also making the finalize path authoritative is
+        what puts routing accuracy in the 80s with the first domain in the 60s;
+        the finalize path zeroes the accumulator first, which is what makes that
+        impossible rather than merely unintended.
         """
         self._accumulate(task_idx, z_features, into_cov=False)
 
@@ -558,9 +565,9 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
         tr, te = _DATA_CACHE[cache_key]
         tr, te = _wrap(tr), _wrap(te)
         tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
-                                         num_workers=0, pin_memory=False, drop_last=True)
+                                         num_workers=0, pin_memory=True, drop_last=True)
         el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
-                                         num_workers=0, pin_memory=False)
+                                         num_workers=0, pin_memory=True)
         return tl, el
 
     if name == "mnist":
@@ -576,9 +583,9 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             _DATA_CACHE[cache_key] = (tr, te)
             tr, te = _wrap(tr), _wrap(te)
             tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
-                                             num_workers=0, pin_memory=False, drop_last=True)
+                                             num_workers=0, pin_memory=True, drop_last=True)
             el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
-                                             num_workers=0, pin_memory=False)
+                                             num_workers=0, pin_memory=True)
             return tl, el
         else:
             tf_train = transforms.Compose(
@@ -604,9 +611,9 @@ def get_task_data(name, data_root, workers=2, aug="basic", fast_cache=True, batc
             _DATA_CACHE[cache_key] = (tr, te)
             tr, te = _wrap(tr), _wrap(te)
             tl = torch.utils.data.DataLoader(tr, batch_size=batch_size, shuffle=True,
-                                             num_workers=0, pin_memory=False, drop_last=True)
+                                             num_workers=0, pin_memory=True, drop_last=True)
             el = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False,
-                                             num_workers=0, pin_memory=False)
+                                             num_workers=0, pin_memory=True)
             return tl, el
         else:
             tf_train = transforms.Compose(
@@ -967,6 +974,63 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 deq_protos.append(pr["q"].to(device).float() * pr["scale"])
             else:
                 deq_protos.append(pr.to(device))
+    current_loaded_state = 'live'
+
+    def _load_snapshot(target_d):
+        """Put `target_d` -- 'live' or a domain index -- into the model, unless it
+        is already what is loaded.
+
+        evaluate() restores the live weights ONCE, at the end, instead of after
+        every batch. That is where the snapshot loads get saved, but it also means
+        whatever snapshot the previous batch finished on is still in the model
+        when the next batch starts, so every read of model state has to say what
+        it wants rather than assume live weights. The routing query is the read
+        that can silently be wrong: it embeds the batch with
+        `model.vision_encoder`, and with `--route-per-task 0` nothing puts the
+        live encoder back before that call.
+        """
+        nonlocal current_loaded_state
+        if current_loaded_state == target_d:
+            return
+        if target_d == 'live':
+            apply_state(dst_enc, cur_enc)
+            apply_state(dst_sel, cur_sel)
+            model.proto_weights.data.copy_(cur_protos)
+            if cur_layers is not None:
+                apply_state(dst_stem, cur_stem)
+                apply_state(dst_layers, cur_layers)
+                if cur_ln is not None:
+                    apply_state(dst_ln, cur_ln)
+            if _sheads is not None:
+                if hasattr(model, "structure_prototypes"):
+                    model.structure_prototypes.data.copy_(cur_sprotos)
+                    model.block_mode_prototypes.data.copy_(cur_bmprotos)
+                elif hasattr(model, "structure_delta"):
+                    apply_state(dst_sdelta, cur_sdelta)
+                    apply_state(dst_bhead, cur_bhead)
+            current_loaded_state = 'live'
+        else:
+            if "enc" in snaps[target_d]:
+                apply_state(dst_enc, snaps[target_d]["enc"])
+            if "sel" in snaps[target_d]:
+                apply_state(dst_sel, snaps[target_d]["sel"])
+            if deq_protos[target_d] is not None:
+                model.proto_weights.data.copy_(deq_protos[target_d])
+            if "layers" in snaps[target_d] and dst_layers is not None:
+                apply_state(dst_stem, snaps[target_d]["stem"])
+                apply_state(dst_layers, snaps[target_d]["layers"])
+                if "ln" in snaps[target_d] and dst_ln is not None:
+                    apply_state(dst_ln, snaps[target_d]["ln"])
+            if _sheads is not None and "struct_heads" in snaps[target_d]:
+                sh = snaps[target_d]["struct_heads"]
+                if hasattr(model, "structure_prototypes"):
+                    model.structure_prototypes.data.copy_(sh["sprotos"])
+                    model.block_mode_prototypes.data.copy_(sh["bmprotos"])
+                elif dst_sdelta is not None:
+                    apply_state(dst_sdelta, sh["delta"])
+                    apply_state(dst_bhead, sh["block"])
+            current_loaded_state = target_d
+
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         override = None
@@ -989,6 +1053,12 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                     apply_state(dst_enc, cur_enc)
                     dom_logits = dom_head.score_per_task(zk)[:, :len(slots)]
                 else:
+                    # No per-snapshot embedding pass here, so the encoder is
+                    # whatever the previous batch left loaded. Put the live one
+                    # back before reading it -- otherwise batch N+1's routing runs
+                    # on the last-loaded snapshot's encoder and silently changes
+                    # `A_auto`.
+                    _load_snapshot('live')
                     z = router_features(model, x)
                     # Restrict router to the domains seen so far
                     dom_logits = dom_head(z)[:, :len(slots)]      # [B,T]
@@ -1072,25 +1142,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 want_amb = has_amb and bool(need_dom[d])
                 if not idx_c.any() and not want_amb:
                     continue
-                if "enc" in snaps[d]:
-                    apply_state(dst_enc, snaps[d]["enc"])
-                if "sel" in snaps[d]:
-                    apply_state(dst_sel, snaps[d]["sel"])
-                if deq_protos[d] is not None:
-                    model.proto_weights.data.copy_(deq_protos[d])
-                if "layers" in snaps[d] and dst_layers is not None:
-                    apply_state(dst_stem, snaps[d]["stem"])
-                    apply_state(dst_layers, snaps[d]["layers"])
-                    if "ln" in snaps[d] and dst_ln is not None:
-                        apply_state(dst_ln, snaps[d]["ln"])
-                if _sheads is not None and "struct_heads" in snaps[d]:
-                    sh = snaps[d]["struct_heads"]
-                    if hasattr(model, "structure_prototypes"):
-                        model.structure_prototypes.data.copy_(sh["sprotos"])
-                        model.block_mode_prototypes.data.copy_(sh["bmprotos"])
-                    elif dst_sdelta is not None:
-                        apply_state(dst_sdelta, sh["delta"])
-                        apply_state(dst_bhead, sh["block"])
+                _load_snapshot(d)
                 if idx_c.any():
                     with torch.amp.autocast('cuda', **ac):
                         _pm = pm[idx_c] if pm is not None else pi_mask
@@ -1144,21 +1196,6 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                         best_pi[upd] = p2[upd].float()
                         best_ls[upd] = dg2["layer_soft"].float()[upd]
                         best_conf[upd] = conf2[upd]
-            apply_state(dst_enc, cur_enc)
-            apply_state(dst_sel, cur_sel)
-            model.proto_weights.data.copy_(cur_protos)
-            if cur_layers is not None:
-                apply_state(dst_stem, cur_stem)
-                apply_state(dst_layers, cur_layers)
-                if cur_ln is not None:
-                    apply_state(dst_ln, cur_ln)
-            if _sheads is not None:
-                if hasattr(model, "structure_prototypes"):
-                    model.structure_prototypes.data.copy_(cur_sprotos)
-                    model.block_mode_prototypes.data.copy_(cur_bmprotos)
-                elif hasattr(model, "structure_delta"):
-                    apply_state(dst_sdelta, cur_sdelta)
-                    apply_state(dst_bhead, cur_bhead)
             if not outs_conf and best_out is None:
                 # No snapshot produced any output for this batch: `snaps` was
                 # non-empty but every row routed to a domain with no snapshot
@@ -1166,6 +1203,7 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
                 # would read ref_o.shape[1] on None (AttributeError). Score
                 # with the live weights -- what use_snaps=False does, and the
                 # same fallback the open-set branch below takes.
+                _load_snapshot('live')
                 with torch.amp.autocast('cuda', **ac):
                     out_deg, st_deg, pi_deg, dg_deg = model(x, tau=0.1, pi_mask=pi_mask)
                 out_deg = out_deg.float()
@@ -1249,6 +1287,23 @@ def evaluate(model, loader, device, amp_dtype=None, dom_head=None, slots=None,
             pif = pi.float()
             pi_ent_sum += -(pif * torch.log(pif.clamp(min=1e-9))).sum(-1).sum().item()
             n += pif.shape[0]
+    if use_snaps and current_loaded_state != 'live':
+        apply_state(dst_enc, cur_enc)
+        apply_state(dst_sel, cur_sel)
+        model.proto_weights.data.copy_(cur_protos)
+        if cur_layers is not None:
+            apply_state(dst_stem, cur_stem)
+            apply_state(dst_layers, cur_layers)
+            if cur_ln is not None:
+                apply_state(dst_ln, cur_ln)
+        if _sheads is not None:
+            if hasattr(model, "structure_prototypes"):
+                model.structure_prototypes.data.copy_(cur_sprotos)
+                model.block_mode_prototypes.data.copy_(cur_bmprotos)
+            elif hasattr(model, "structure_delta"):
+                apply_state(dst_sdelta, cur_sdelta)
+                apply_state(dst_bhead, cur_bhead)
+        current_loaded_state = 'live'
     fp = {
         "gate": (gate_soft_sum / len(loader)).cpu(),
         "bm_res": (bm_res_sum / len(loader)).cpu(),
@@ -1837,20 +1892,17 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
                     ent_usage = -(usage * torch.log(usage.clamp(min=1e-9))).sum()
                     loss = loss + w_pi * (ent_pi - ent_usage)
 
-                # Domain-router supervision: current samples -> task_idx,
-                # replay samples carry their original task id.
-                if dom_head is not None and diag.get("z", None) is not None:
-                    if isinstance(dom_head, TaskCentroidRouter):
-                        # Centroid router accumulates running z representations without gradient degradation
-                        dom_head.update_task_centroid(task_idx, router_features(model, inputs).detach())
-                    else:
-                        task_lbl = torch.full((inputs.size(0),), task_idx,
-                                              device=device, dtype=torch.long)
-                        if re_t is not None:
-                            task_lbl[inputs.size(0) - re_t.numel():] = re_t
-                        z_norm = F.normalize(diag["z"].float(), dim=1)
-                        dom_logits = dom_head(z_norm)
-                        loss = loss + 0.3 * F.cross_entropy(dom_logits[:, :task_idx + 1], task_lbl)
+                # Domain-router supervision (legacy classifier only; TaskCentroidRouter
+                # accumulates pristine representations at task completion to avoid
+                # mixing stale intermediate encoder representations).
+                if dom_head is not None and not isinstance(dom_head, TaskCentroidRouter) and diag.get("z", None) is not None:
+                    task_lbl = torch.full((inputs.size(0),), task_idx,
+                                          device=device, dtype=torch.long)
+                    if re_t is not None:
+                        task_lbl[inputs.size(0) - re_t.numel():] = re_t
+                    z_norm = F.normalize(diag["z"].float(), dim=1)
+                    dom_logits = dom_head(z_norm)
+                    loss = loss + 0.3 * F.cross_entropy(dom_logits[:, :task_idx + 1], task_lbl)
 
                 # Dynamic-depth sparsity: pushes gates closed. With depth_target>0
                 # this is a hinge, so it can prune *at most* (1-target) of the
@@ -2062,6 +2114,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "(recommended for 64x64, i.e. Tiny ImageNet) leaves it off "
                          "and switches it on if the peak memory seen by the first "
                          "step exceeds 85%% of the card. See B69g.")
+    ap.add_argument('--mask-grad', type=int, default=1, choices=[0, 1],
+                    help="whether the channel width mask carries a gradient (1=on, "
+                         "the default and unchanged behaviour, 0=detached). Setting "
+                         "0 removes the architecture gradient that flows through the "
+                         "mask multiply: measured on the production step (32x32, "
+                         "batch 256, bf16, K=12/max_dim=48/norm=in) it saves ~23 ms "
+                         "of ~427 ms and ~29 MiB of the 536 MiB the mask costs. It "
+                         "does NOT remove that 536 MiB -- autograd still keeps the "
+                         "activations for the weight gradient; only "
+                         "--grad-checkpoint does that (measured: the masked and "
+                         "unmasked checkpointed steps differ by 1 MiB). The price is "
+                         "that width routing stops learning from the classification "
+                         "loss and is then driven only by the --depth-cost term, so "
+                         "the chosen topology changes. Default 1 keeps every "
+                         "published number; use 0 only if you want that trade.")
     ap.add_argument('--data-root', type=str, default=os.path.join(_ROOT, 'data'),
                     help='dataset root. Defaults to <repo>/data. May be an '
                          'os.pathsep-separated list (";" on Windows, ":" on '
@@ -2283,7 +2350,8 @@ def main():
             norm_type=args.norm,
             encoder_tail_act=args.encoder_tail_act,
             arch_prior=args.arch_prior,
-            grad_checkpoint=(args.grad_checkpoint == 'on')
+            grad_checkpoint=(args.grad_checkpoint == 'on'),
+            mask_grad=(args.mask_grad == 1)
         ).to(device)
         # `train_task` does not receive `args`, so carry the policy on the model.
         # It is read once, only to decide `auto` (see the latch in train_task).
@@ -2371,6 +2439,18 @@ def main():
                    inorm=inorm_map[name])
 
         # Freeze this domain's structure into its slot & pristine router centroid
+        # NB: the batch size here is load-bearing for the published numbers, and
+        # it is deliberately left at the get_task_data default. Both consumers of
+        # this loader are batch-size sensitive:
+        #   * collect_structure_slot averages PER-BATCH means and divides by the
+        #     batch count, and the loader has drop_last=True, so changing the
+        #     batch size changes which samples are dropped -- CIFAR-10 train drops
+        #     80 of them at 256 and 336 at 512 -- and therefore changes the slot,
+        #     which is the structure override every eval-time forward uses;
+        #   * finalize_task_features sums into the centroid/covariance, so the
+        #     result moves at the last-bit level with the summation order.
+        # If you want a different batch size here, it needs a measured A/B and a
+        # re-baseline of the A_* tables, exactly like any other protocol change.
         tl_fit, el_self = get_task_data(name, args.data_root, inorm=inorm_map[name])
         # The router's centroid and second moment are estimated on the TRAIN
         # split by default. They used to be estimated on `el_self`, the TEST
@@ -2393,16 +2473,22 @@ def main():
 
         # Finalize domain centroid router for this task
         if isinstance(dom_head, TaskCentroidRouter):
-            # Rebuild the centroid from scratch over the clean eval split, with
-            # the encoder in its FINAL state.
+            # Rebuild the centroid from scratch over the FIT split, with the
+            # encoder in its FINAL state. `router_fit` is the TRAIN split unless
+            # --router-fit-split test says otherwise (see above), which is what
+            # keeps this off the test images the router is later asked to route.
             #
             # This has to override what training accumulated. train_task() calls
             # update_task_centroid on every step, so the running sum mixes
             # features from encoder states that no longer exist - by the end of
             # a 6-epoch task that is 79% of the samples. The snapshot the router
             # is queried with is the final one, so a blended centroid describes
-            # an encoder that never existed: measured routing fell from 100.0%
-            # to 82.0% overall and to 64.6% on the first domain.
+            # an encoder that never existed.
+            #
+            # The zero_() below is what makes that guarantee real rather than
+            # intended: train_task() no longer feeds the running centroid at all,
+            # so the zeros are defensive, and if they are ever dropped the
+            # per-step path must not be reintroduced without them.
             #
             # The shared covariance is fed here and ONLY here: it is global, so
             # mid-training contributions could not be removed afterwards without

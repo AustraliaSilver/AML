@@ -175,5 +175,118 @@ class TestEvaluateRestoresLiveWeights(unittest.TestCase):
                          "the fixture must actually differ from the snapshot")
 
 
+class TestRoutingUsesLiveEncoder(unittest.TestCase):
+    """The routing query must embed every batch with the LIVE encoder.
+
+    `evaluate` restores the live weights ONCE, at the end, instead of after every
+    batch -- that is where the snapshot-load saving comes from. The consequence
+    is that whatever snapshot the previous batch finished on is still in the model
+    when the next batch starts, so a read of model state has to ask for what it
+    wants instead of assuming live weights.
+
+    The routing query is that read: `router_features` embeds the batch with
+    `model.vision_encoder`. With `--route-per-task 1` the per-snapshot embedding
+    loop restores the live encoder immediately afterwards, so the next batch is
+    fine. With `--route-per-task 0` nothing restores it, and the router scored
+    batch N+1 against the last-loaded snapshot's encoder -- a silent change to
+    `A_auto` that no accuracy assertion would catch, because the snapshot is a
+    perfectly working model.
+
+    The three tests above cannot see this: they all pass `dom_truth=0`, which
+    pins `d_pred` to the oracle and never runs the router at all.
+    """
+
+    def _two_batch_setup(self):
+        from mgn.blocks import ConvAML_18Layer_Hybrid
+        torch.manual_seed(1)
+        m = ConvAML_18Layer_Hybrid(K=4, max_layers=18, max_dim=8, num_classes=10,
+                                   norm_type="in", encoder_tail_act="none").eval()
+        x = torch.randn(4, 3, 32, 32)
+        y = torch.randint(0, 10, (4,))
+        loader = [(x, y), (x.clone(), y.clone())]      # two batches, on purpose
+
+        with torch.no_grad():                          # snapshot != live
+            for p in m.parameters():
+                p.add_(torch.randn_like(p) * 0.05)
+        snaps = [{
+            "enc": {k: v.detach().clone() for k, v in m.vision_encoder.state_dict().items()},
+            "sel": {k: v.detach().clone() for k, v in m.prototype_selector.state_dict().items()},
+            "stem": {k: v.detach().clone() for k, v in m.stem.state_dict().items()},
+            "layers": {k: v.detach().clone() for k, v in m.layers.state_dict().items()},
+            "ln": {k: v.detach().clone() for k, v in m.ln.state_dict().items()},
+            "struct_heads": {"sprotos": m.structure_prototypes.detach().clone(),
+                             "bmprotos": m.block_mode_prototypes.detach().clone()},
+            "protos": m.proto_weights.detach().clone(),
+        }]
+        with torch.no_grad():
+            for p in m.parameters():
+                p.mul_(0.5)
+        with torch.no_grad():
+            _, st, _, _ = m(x, tau=0.1)
+        slots = [{"gate": torch.ones(m.max_layers),
+                  "bm_mode": st.block_mode[0].clone(),
+                  "bm_res": st.block_mode[0, :, 1].clone()}]
+
+        class _Head(nn.Module):
+            def __init__(self, n=1):
+                super().__init__()
+                self.l = nn.Linear(m.latent_dim, n)
+
+            def forward(self, z):
+                return self.l(z)
+
+        return m, loader, snaps, slots, _Head
+
+    def test_route_per_task_0_embeds_every_batch_with_live_encoder(self):
+        import train_continual_aml as T
+        m, loader, snaps, slots, _Head = self._two_batch_setup()
+        live = {k: v.detach().clone()
+                for k, v in m.vision_encoder.state_dict().items()}
+        snap_enc = snaps[0]["enc"]
+        self.assertFalse(
+            any(torch.equal(live[k], snap_enc[k]) for k in live),
+            "fixture must differ: the snapshot's encoder is not the live one")
+
+        seen = []
+        orig = T.router_features
+
+        def spy(model, x):
+            seen.append({k: v.detach().clone()
+                         for k, v in model.vision_encoder.state_dict().items()})
+            return orig(model, x)
+
+        T.router_features = spy
+        try:
+            T.evaluate(m, loader, torch.device("cpu"), dom_head=_Head(), slots=slots,
+                       snaps=snaps, route_tau=None, dom_truth=None,
+                       route_per_task=False)
+        finally:
+            T.router_features = orig
+
+        self.assertEqual(len(seen), len(loader),
+                         "expected exactly one routing query per batch")
+        for i, w in enumerate(seen):
+            for k, v in w.items():
+                self.assertTrue(
+                    torch.equal(v, live[k]),
+                    f"batch {i}: routing embedded with a non-live encoder ({k})")
+
+    def test_route_per_task_0_matches_route_per_task_1_accuracy(self):
+        """Both arms must route the same way, so the accuracies have to agree.
+
+        `route_per_task` is a *how you embed the query* flag; it is not allowed to
+        decide the predictions. If the live-encoder restore were missing, the two
+        arms would embed batch 2 under different weights and drift apart.
+        """
+        outs = []
+        for rpt in (True, False):
+            m, loader, snaps, slots, _Head = self._two_batch_setup()
+            acc, _ = evaluate(m, loader, torch.device("cpu"), dom_head=_Head(),
+                              slots=slots, snaps=snaps, route_tau=None,
+                              dom_truth=None, route_per_task=rpt)
+            outs.append(acc)
+        self.assertEqual(outs[0], outs[1])
+
+
 if __name__ == "__main__":
     unittest.main()
