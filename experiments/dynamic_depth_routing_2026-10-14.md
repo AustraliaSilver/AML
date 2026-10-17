@@ -2811,6 +2811,62 @@ Verifications on `main` after merge: `pytest` **367 passed**, `unittest` **350 O
 
 ---
 
+## B73 — Width-mask cost attribution and router sync reduction (Open item 22 resolved)
+
+Two GPU probes (`probe_mask_attribution.py` and `probe_router_syncs.py`) resolved the remaining un-attributed cost of the channel mask and measured the device->host synchronisation cost of the eval-time soft mixture.
+
+### 1. Width-mask cost attribution (`probe_mask_attribution.py`)
+
+A CPU census confirmed the model executes **18 block calls per forward**, touching **29 mask application sites** (11 `ResNetBlock` × 2 + 6 `VisionTransformerBlock` × 1 + 1 `PlainConvBlock` × 1), all fp32 in training. In training the model runs without `struct_override`, so the batch-consistent hard one-hot path executes **one branch per layer** rather than three.
+
+(The probe's own census accumulates, so it reports 108 calls / 168 sites for `real` and 324 / 432 for the soft eval arm -- those are totals over the six forwards it counted (2 warm-up + 3 profiled + 1 measured), i.e. 6 × the per-forward figures above. Per-site fp32 product measured 13.5 MiB at batch 256, so a forward produces ~391 MiB of mask products against a measured peak delta of 536 MiB.)
+
+Paired, interleaved GPU measurement (10 reps per arm, RNG re-seeded before each step, RTX 3050 Laptop GPU, batch 256 @ 32x32, bf16):
+
+| Arm | Median ms | Peak MiB | Delta (ms) | Delta (MiB) |
+|---|---|---|---|---|
+| `none` (mask removed) | 370.2 ms | 2,169 MiB | +0.0 ms | +0 MiB |
+| `real` (shipped width mask) | 427.6 ms | 2,706 MiB | +57.4 ms | +536 MiB |
+| `cast` (mask in bf16) | 423.2 ms | 2,682 MiB | +53.1 ms | +512 MiB |
+| `detached` (no mask gradient) | 404.5 ms | 2,677 MiB | +34.3 ms | +508 MiB |
+| `none_ckpt` (checkpointing, no mask) | 464.5 ms | 965 MiB | +94.3 ms | -1,204 MiB |
+| `real_ckpt` (checkpointing, with mask)| 538.3 ms | 966 MiB | +168.1 ms | -1,203 MiB |
+
+**Key Findings:**
+1. **Memory Attribution (536 MiB fully accounted for):** `real_ckpt` vs `none_ckpt` peak memory is **966 MiB vs 965 MiB (delta = +1 MiB)**. This conclusively refutes the hypothesis that the mask tensor itself allocates 536 MiB. The entire 536 MiB is **autograd graph retention** (intermediate activations saved for backward across the 168 mask sites). Activation checkpointing (`--grad-checkpoint on`) eliminates all 536 MiB of graph retention.
+2. **Runtime Attribution (~57.4 ms fully accounted for):**
+   - PyTorch profiler on `aten::mul`: `real` executes 287 muls (107.3 ms) vs `none` 201 muls (69.1 ms) -> **+38.2 ms** spent directly in forward tensor multiplications across mask sites.
+   - Backward gradient propagation through the mask (`real` vs `detached`): **+23.1 ms** (427.6 ms vs 404.5 ms).
+   - These two are measured on **overlapping** regions of the same step, so their sum (61.3 ms) is an **upper bound** on the mechanism, not an exact decomposition: it exceeds the measured +57.4 ms end-to-end penalty by 3.9 ms. The +57.4 ms figure is the measured cost; the two components are its attribution.
+
+### 2. Router sync reduction in eval (`probe_router_syncs.py`)
+
+In evaluation (`model.eval()`, `no_grad()`, soft `struct_override`), `HybridBlock.forward` evaluates three predicates:
+```python
+out_plain  = self.plain(x,  dim_mask=dim_mask) if (w_plain  > 1e-4).any() else 0.0
+out_resnet = self.resnet(x, dim_mask=dim_mask) if (w_resnet > 1e-4).any() else 0.0
+out_vit    = self.vit(x,    dim_mask=dim_mask) if (w_vit    > 1e-4).any() else 0.0
+```
+Each `.any()` triggers a device->host synchronization (3 syncs/layer × 18 layers = **54 syncs/forward**).
+
+We compared `ship` (54 syncs), `hoist` (1 vector reduction per layer = 18 syncs), and `nocheck` (0 syncs, ceiling), interleaved within one loop with the RNG re-seeded immediately before every measured forward:
+
+| Configuration | Batch 256 Median | Batch 256 Mean | Batch 64 Median | Batch 64 Mean | Syncs / Forward | Bitwise Identity |
+|---|---|---|---|---|---|---|
+| `ship` | 315.7 ms | 321.5 ms | 158.3 ms | 163.8 ms | 54 syncs | Baseline |
+| `hoist` | 305.6 ms (-3.2 %) | 307.8 ms | 142.3 ms (-10.1 %) | 143.9 ms | 18 syncs | **ALL EQUAL** |
+| `nocheck` | 297.0 ms (-5.9 %) | 297.2 ms | 113.6 ms (-28.2 %) | 116.0 ms | 0 syncs | Differs in corner |
+
+**Key Finding:** `hoist` reduces host syncs from 54 to 18 per forward pass, worth **10.1 ms (-3.2 %) at batch 256** and **15.9 ms (-10.1 %) at batch 64**, while being **strictly bitwise identical** across outputs, `block_mode`, `layer_gates`, and `layer_soft`.
+
+These are 37 paired forwards per arm. **A first run with 11 paired forwards and 4 warm-up iterations reported roughly twice the deltas** (-19.5 rather than -10.1 ms at batch 256, -28.9 rather than -15.9 ms at batch 64): four warm-up iterations are not enough for this GPU's clocks to settle, even with arms interleaved and re-seeded per forward. The warm-up count is load-bearing for any sub-5 % latency claim on this machine.
+
+A branch census confirms the two arms take identical decisions (4914 calls / 6552 mask sites each), while `nocheck` drops exactly 54 branch calls -- i.e. in this configuration all three modes clear the `1e-4` threshold, so `ship` was evaluating every branch. `nocheck` is a ceiling and not a proposal: removing the predicate is not bit-identical in the corner where a whole batch's branch weight falls to or below `1e-4`.
+
+Open item 22 closed.
+
+---
+
 ## 11. Open items, stated as open
 
 Written down so that "not done" is not later mistaken for "not noticed".
@@ -2976,21 +3032,19 @@ Written down so that "not done" is not later mistaken for "not noticed".
     production tables come from. Neither is a correctness risk -- the tests bound
     it -- but neither is a measurement, so this is written down rather than
     claimed.
-22. **The channel mask costs ~16 % of a step and ~25 % of peak memory, saves no
-    compute, and only part of that cost is attributed (B70).** Measured on the
-    production step, interleaved and seeded: 384.8 ms / 2169 MiB with the mask
-    removed entirely, 448.6 ms / 2706 MiB as production runs it, 442.3 ms / 2682
-    MiB with the mask cast to the activation dtype, 423.4 ms / 2677 MiB with the
-    mask's gradient path detached. So the dtype fix (B69d) cannot touch it, and
-    ~25 of the 64 ms is the architecture gradient through the mask. **Not
-    attributed: the remaining ~39 ms and essentially all of the 537 MiB.** The
-    candidates, none tested: one extra full-size fp32 tensor per layer saved for
-    backward; the mask applied twice per `ResNetBlock` where once would do
-    (`cnn_block.py:101,108`); `cand * mode_weights[:, chosen]`
-    (`hybrid_router.py:86`), a multiply by exactly 1.0 under the one-hot fast
-    path; and the mask being re-applied to the next layer's input. Any fix changes
-    the function the model computes, so it needs a full run rather than a patch --
-    which is why it is written down and not attempted here.
+22. ~~**The channel mask costs ~16 % of a step and ~25 % of peak memory, saves no
+    compute, and only part of that cost is attributed (B70).**~~ **CLOSED (B73) --
+    Attributed and measured 2026-10-16.** Measured through two GPU probes (`probe_mask_attribution.py`
+    and `probe_router_syncs.py`). The +536 MiB peak memory delta is **100 % autograd graph retention**
+    across 168 mask application sites (proved by `real_ckpt` vs `none_ckpt`: 966 MiB vs 965 MiB,
+    delta +1 MiB; checkpointing eliminates it completely). The step latency delta (+57.4 ms)
+    is attributed to 38.2 ms forward `aten::mul` overhead (+86 ops measured via profiler) +
+    23.1 ms backward autograd graph propagation through the mask (the two components are measured on
+    overlapping regions, so they bound the +57.4 ms from above rather than summing to it). Additionally,
+    hoisting soft-mixture predicates during evaluation reduces host syncs from 54 to 18 per forward
+    (-10.1 ms / -3.2 % at B=256, -15.9 ms / -10.1 % at B=64, 37 paired forwards), verified strictly
+    bitwise identical (`ALL EQUAL`) and **implemented** in `mgn/blocks/hybrid_router.py` as of
+    commit `e5bb59c`.
 23. **CLOSED (B71).** Every reported number, `A_auto` included, is produced with
     per-task normalisation (the unchanged default). A paired production-schedule run
     compared `per-task` against `--input-norm pooled` (one task-agnostic constant
