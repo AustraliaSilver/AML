@@ -2002,12 +2002,14 @@ def train_task(model, name, epochs, freeze_epochs, device, amp_dtype,
             if isolator is not None:
                 isolator.restore()
 
-            # --grad-checkpoint auto: decide from the peak this run has reached.
-            # `max_memory_allocated` is the peak since process start, so it is an
-            # upper bound on the step's own peak -- which biases the decision
-            # towards switching checkpointing on, the safe direction. The latch is
-            # on the model, so this fires once per run, not once per step. Turning
-            # it on mid-run cannot change any result: checkpointing is bitwise
+            # --grad-checkpoint auto: decide from the peak this task has reached.
+            # `max_memory_allocated` is the peak since the counter was last reset,
+            # so it is an upper bound on the step's own peak -- which biases the
+            # decision towards switching checkpointing on, the safe direction. The
+            # latch is on the model and main() re-arms it once per task (a
+            # resolution change mid-sequence otherwise locks in the first task's
+            # answer), so this fires once per task, not once per step. Turning it
+            # on mid-run cannot change any result: checkpointing is bitwise
             # identical, verified across three chained steps from a single seed
             # (see tests/test_grad_checkpoint.py).
             if (getattr(model, '_grad_ckpt_mode', 'off') == 'auto'
@@ -2147,8 +2149,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "9737 MiB -> 1858 ms / 3594 MiB fitting; 32x32 batch 256 = "
                          "448 -> 524 ms with peak 2706 -> 982 MiB. 'auto' "
                          "(recommended for 64x64, i.e. Tiny ImageNet) leaves it off "
-                         "and switches it on if the peak memory seen by the first "
-                         "step exceeds 85%% of the card. See B69g.")
+                         "and switches it on if the peak seen by the first step of a "
+                         "TASK exceeds 85%% of the card - re-evaluated per task, so a "
+                         "sequence that starts at 32x32 and ends at 64x64 does not "
+                         "inherit the first task's answer. One-way once enabled. "
+                         "See B69g.")
     ap.add_argument('--width-mask-grad', type=int, default=1, choices=[0, 1],
                     help="whether the channel width mask carries a gradient (1=on, "
                          "the default and unchanged behaviour, 0=detached). Setting "
@@ -2431,6 +2436,34 @@ def main():
 
     for i, name in enumerate(tasks):
         print(f"\n===== TASK {i+1}/{T}: {name} =====", flush=True)
+        # --grad-checkpoint auto has to be re-armed per TASK, not once per run.
+        #
+        # The decision reads `torch.cuda.max_memory_allocated`, the peak since
+        # process start, and the latch lives on the model, so with a run-level
+        # latch `auto` decides from the FIRST task and never revises it. That is
+        # wrong precisely where `auto` is recommended. Option E runs
+        # 32x32 -> 32x32 -> 64x64: the first task fits in 2520 MiB of a 6144 MiB
+        # card, the third needs 9889 MiB. With a run-level latch the third task
+        # inherits "off" and the run dies of CUDA OOM about an hour in, after the
+        # first two tasks have already been trained and thrown away.
+        #
+        # Re-arming here, together with resetting the peak counter, makes the
+        # decision reflect the task about to run. It is a one-way latch in
+        # practice: the branch in train_task only ever sets `grad_checkpoint` to
+        # True, so once a big task turns it on it stays on for the rest of the
+        # run. That bias is the safe direction and costs ~17% on a later 32x32
+        # task.
+        #
+        # Safe to change mid-run: checkpointing is bitwise identical (see
+        # tests/test_grad_checkpoint.py), so no result depends on when it turns
+        # on. The first step of each task therefore still runs unchecked, which
+        # is known to survive here -- measured: a tinyimagenet-only run on a
+        # 6 GiB card completes with peak 8789 MiB reported before the switch.
+        if (getattr(model, '_grad_ckpt_mode', 'off') == 'auto'
+                and getattr(model, 'grad_checkpoint', None) is not None
+                and torch.cuda.is_available()):
+            model._grad_ckpt_decided = False
+            torch.cuda.reset_peak_memory_stats()
         if i > 0 and args.freeze_trunk:
             n_frozen, n_kept = freeze_trunk_(model)
             print(f"  [freeze-trunk] frozen {n_frozen/1e6:.2f}M trunk params, "

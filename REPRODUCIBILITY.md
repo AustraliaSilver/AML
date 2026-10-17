@@ -191,6 +191,7 @@ python train_continual_aml.py \
   --epochs 20,30,10 \
   --replay-per-class 0 --norm in --encoder-tail-act none \
   --arch-lr 3e-3 --depth-cost 0.02 \
+  --grad-checkpoint auto \
   --data-root data
 ```
 
@@ -201,10 +202,27 @@ keeps its native resolution (its class count and input size come from
 datasets can live in separate mounts; a Kaggle 2xT4 walkthrough is in
 `notebooks/kaggle_continual_aml.ipynb`.
 
+> **Add `--grad-checkpoint auto` on any card under ~12 GiB.** The last note in
+> this section used to quote ~12.5 s/step for Tiny ImageNet, and that was the
+> *spilling* figure: at 64×64 batch 256 with 200 classes the step peaks at
+> **9889 MiB**, so on a 6 GiB card it either crawls or dies. Measured on an
+> RTX 3050 Laptop (6 GiB), median of 9 seeded steps:
+
+> | 64×64, batch 256, 200 classes | ms/step | peak |
+> | :-- | --: | --: |
+> | no checkpoint | 6697 | 9889 MiB |
+> | `--grad-checkpoint on` | **1746** | **3643 MiB** |
+
+> Checkpointing is bitwise identical (`--grad-checkpoint`'s help, verified in
+> `tests/test_grad_checkpoint.py`), so adding it changes no result — it only
+> makes the sequence runnable, and 3.8× faster because the step stops thrashing.
+> Steady-state trainer timing including the router and `--depth-cost 0.02` is
+> **1.75 s/step** at 64×64 and ~0.45 s/step at 32×32, so budget ~3.3 hours for
+> `20,30,10` rather than the many hours the old figure implied.
+
 > This sequence is **not** part of the paper's protocol and its numbers are not
 > reported anywhere in this repository yet. The matrices in §3 remain the
-> MNIST/CIFAR-10/Fashion run. Tiny ImageNet at 64x64 dominates the runtime
-> (~12.5 s/step on an RTX 3050 Laptop), so budget hours, not minutes.
+> MNIST/CIFAR-10/Fashion run.
 
 ---
 
