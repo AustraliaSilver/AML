@@ -21,9 +21,10 @@ Read §3 before quoting any number here. Specifically:
 
 | what | state |
 | :-- | :-- |
-| `A_oracle` at `--epochs 5,28,16` | **measured**: 86.73 % `A_avg`, **zero** forgetting — §3.1a |
-| `A_auto` at the same schedule | **measured**: 81.96 % `A_avg`, 6.34 % forgetting, 4.23 points below the oracle — §3.1a |
-| `A_auto` input-norm A/B (B71) | per-task **66.05 %** is the upper bound (default `--input-norm per-task`); `--input-norm pooled` measures **40.46 %** (−25.59 pts). Oracle unchanged (85.90 → 86.61 %), confirming the gap is the router under task-agnostic norm, not the model. §3.1a, open item 23 |
+| `A_oracle` at `--epochs 5,28,16` | **measured**: 85.90 % `A_avg`, **zero** forgetting — B71, on the corrected evaluation path (§3.1b) |
+| `A_auto` at the same schedule | **measured**: 66.05 % `A_avg`, 29.77 % forgetting, 19.85 points below the oracle — B71, on the corrected evaluation path (§3.1b) |
+| earlier `A_auto` 81.96 % / `A_oracle` 86.19 % | **withdrawn** — those came from a run whose evaluation path contained two routing defects (B46/B47), both since fixed and tested. The oracle barely moved (86.19 → 85.90, it bypasses the router) but `A_auto` dropped 15.91 points. Do not cite the 81.96 % / 6.34 % pair or the 4.23-point gap. |
+| `A_auto` input-norm A/B (B71) | per-task **66.05 %** is the upper bound (default `--input-norm per-task`); `--input-norm pooled` measures **40.46 %** (−25.59 pts). Oracle unchanged (85.90 → 86.61 %), confirming the gap is the router under task-agnostic norm, not the model. Open item 23, closed |
 | router metric | **changed** to `mahalanobis-task` with `--router-logdet-weight 0.5` and `--router-fit-split train` (was one pooled covariance fitted on the test split) |
 | `--norm` | **`in`** (InstanceNorm), was `bn` |
 | `--replay-per-class` | **0** by default, was 400 — the default run is now the zero-replay run the docs describe |
@@ -182,21 +183,21 @@ Every other setting is the shipped default: `--ewc-lambda 0` (disabled),
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
-| after MNIST | **98.54 %** | — | — |
-| after CIFAR-10 | **98.54 %** | **67.92 %** | — |
-| after Fashion | **98.54 %** | **67.92 %** | **92.12 %** |
+| after MNIST | **98.49 %** | — | — |
+| after CIFAR-10 | **98.49 %** | **67.16 %** | — |
+| after Fashion | **98.49 %** | **67.16 %** | **92.06 %** |
 
-**A_avg = 86.19 % · BWT = +0.00 % · Forgetting = 0.00 %**
+**A_avg = 85.90 % · BWT = +0.00 % · Forgetting = 0.00 %**
 
 **`A_live` — standard mutable weights, no snapshot, but given the true task's prototype rows (task-aware)**
 
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
-| after MNIST | 98.57 % | — | — |
-| after CIFAR-10 | 36.52 % | 68.84 % | — |
-| after Fashion | 23.78 % | 26.21 % | 92.47 % |
+| after MNIST | 98.52 % | — | — |
+| after CIFAR-10 | 23.85 % | 68.89 % | — |
+| after Fashion | 19.92 % | 20.19 % | 92.30 % |
 
-**A_avg = 47.49 % · BWT = −58.71 % · Forgetting = 58.71 %**
+**A_avg = 44.14 % · BWT = −63.07 % · Forgetting = 63.07 %**
 
 > **Protocol note (added 2026-10-15).** `A_live` is evaluated with
 > `pi_mask` set to the **true** task's prototype-row range, so it is told
@@ -204,45 +205,53 @@ Every other setting is the shipped default: `--ewc-lambda 0` (disabled),
 > therefore differ in two ways at once — snapshot retention *and* task
 > identity — so the `A_auto`/`A_live` gap is not a like-for-like test of
 > the router. The like-for-like comparisons are `A_auto` vs `A_oracle`
-> (both snapshot-based, both given a task identity; 4.23 points on this
+> (both snapshot-based, both given a task identity; 19.85 points on this
 > run) and `A_live`'s own forgetting under continuous fine-tuning.
 
 **`A_auto` — autonomous router, no task identity**
 
+> Measured on the **corrected evaluation path** (B71, commit `8c16a65`). An
+> earlier run gave `A_avg` 81.96 % here; that run's evaluation path contained
+> two routing defects (B46/B47), since fixed and tested, and its figures are
+> **withdrawn** — see §3.1b for the side-by-side.
+
 | after \ eval on | MNIST | CIFAR-10 | Fashion |
 | :-- | --: | --: | --: |
-| after MNIST | 98.54 % | — | — |
-| after CIFAR-10 | **98.54 %** | **67.92 %** | — |
-| after Fashion | 88.96 % | 64.82 % | 92.11 % |
+| after MNIST | 98.49 % | — | — |
+| after CIFAR-10 | **98.49 %** | **67.16 %** | — |
+| after Fashion | 48.16 % | 57.95 % | **92.04 %** |
 
-**A_avg = 81.96 % · BWT = −6.34 % · Forgetting = 6.34 %**
+**A_avg = 66.05 % · BWT = −29.77 % · Forgetting = 29.77 %**
 
 Routing accuracy behind those cells (`route_acc`, measured on the same path that
 produced the predictions):
 
 | cell | A_auto | A_oracle | route_acc | where the mistakes go |
 | :-- | --: | --: | --: | :-- |
-| A[1,1] | 98.54 % | 98.54 % | 100.00 % | — |
-| A[2,1] | 98.54 % | 98.54 % | 100.00 % | — |
-| A[2,2] | 67.92 % | 67.92 % | 100.00 % | — |
-| A[3,1] | 88.96 % | 98.54 % | 89.02 % | 10.98 % → Fashion |
-| A[3,2] | 64.82 % | 67.92 % | 95.00 % | 5.00 % → Fashion |
-| A[3,3] | 92.11 % | 92.12 % | 99.97 % | — |
+| A[1,1] | 98.49 % | 98.49 % | 100.00 % | — |
+| A[2,1] | 98.49 % | 98.49 % | 100.00 % | — |
+| A[2,2] | 67.16 % | 67.16 % | 100.00 % | — |
+| A[3,1] | 48.16 % | 98.49 % | 43.76 % | 56.24 % → Fashion |
+| A[3,2] | 57.95 % | 67.16 % | 83.26 % | 16.74 % → Fashion |
+| A[3,3] | 92.04 % | 92.06 % | 99.98 % | — |
 
 > **What this run shows.**
 >
-> 1. **Zero-replay storage beats standard continual learning by 38.7 points.**
->    `A_oracle` 86.19 % with **exactly zero** forgetting against `A_live` 47.49 %
->    with 58.71 % forgetting, storing 7.12 MB per task and **no exemplars**.
-> 2. **The autonomous router now nearly closes the gap: 4.23 points.**
->    `A_auto` is 81.96 % against the oracle's 86.19 %, and its forgetting is
->    6.34 % rather than the 54.43 % of an earlier run the same day. The entire
->    residual is the 11 % of MNIST images the router sends to Fashion after the
->    third task; every other cell is at the oracle or within 3 points of it.
-> 3. **The remaining errors have a direction.** All misrouting at stage 3 goes
->    *forward* to Fashion, never backward — the newest encoder's space is the
->    one the router finds most accommodating. That is a diagnosis to hand to the
->    next iteration rather than a mystery.
+> 1. **Zero-replay storage beats standard continual learning by 41.76 points.**
+>    `A_oracle` 85.90 % with **exactly zero** forgetting against `A_live` 44.14 %
+>    with 63.07 % forgetting, storing 7.12 MB per task and **no exemplars**.
+> 2. **The autonomous protocol is a retrieval problem, not an accuracy problem.**
+>    `A_auto` is 66.05 % against the oracle's 85.90 %, and the whole 19.85-point
+>    gap sits in the two cells that must recover an *earlier* snapshot. Where the
+>    router picks the right snapshot it matches the oracle exactly — A[1,1],
+>    A[2,1] and A[2,2] are at the oracle to the digit. Where it picks wrong the
+>    cell gets whatever that snapshot yields on a foreign domain.
+> 3. **The errors have a direction and are ordered by retention age.** Every
+>    misrouting at stage 3 goes *forward* to Fashion, never backward, and it
+>    concentrates on the oldest domain: MNIST loses 56.24 % of its queries,
+>    CIFAR-10 16.74 %, while Fashion keeps 99.98 % of its own. The newest
+>    encoder's space absorbs what came before, in the order the domains were
+>    trained. That is a diagnosis to hand to the next iteration.
 > 4. **These router statistics are fitted on the TRAIN split.** An earlier run
 >    fitted them on the test split; §3.4a explains why that is a leak and what
 >    it was doing to the numbers.
@@ -251,7 +260,7 @@ produced the predictions):
 >    normalises its images with the domain's *own* mean/std
 >    (`mgn.datasets.TASK_SPECS`), because the loader is built per task. The
 >    oracle and live protocols are entitled to that; the autonomous one is not,
->    and is scored on images prepared with it anyway. So 81.96 % is an **upper
+>    and is scored on images prepared with it anyway. So 66.05 % is an **upper
 >    bound** on what a deployment without task labels sees.
 >    `--input-norm {pooled,imagewise,none}` applies one task-agnostic rule to the
 >    whole sequence instead, and a paired run at the same schedule measures the
@@ -316,26 +325,35 @@ exemplars**: these are second moments, not images.
 > The 93.96 % at stage 2 in the superseded run was measured with test-fitted
 > router statistics. Treat it as an optimistic upper bound. The numbers above
 > are the honest ones, and the end-to-end confirmation is §3.1a: with this metric
-> and this fitting split, `route_acc` is 100.00 % at every stage-2 cell and
-> 89.02 / 95.00 / 99.97 % at stage 3, and `A_auto` reaches 81.96 % against the
-> oracle's 86.19 %.
+> and this fitting split, `route_acc` is 100.00 % at every stage-2 cell. At
+> stage 3 the figures below are from the run that B46/B47 later invalidated
+> (43.76 / 83.26 / 99.98 % on the corrected path, `A_auto` 66.05 % against the
+> oracle's 85.90 %); the metric and fitting split are unchanged by the fixes,
+> which is why this paragraph's conclusion still stands while its numbers move.
 
 ### 3.1b Earlier runs — superseded, kept so the progress is visible
 
-| protocol | 2026-10-14 | 2026-10-15 (shared cov, **test-fitted**) | 2026-10-15 (final) |
-| :-- | --: | --: | --: |
-| `A_oracle` `A_avg` | 85.99 % | 86.73 % | 86.19 % |
-| `A_oracle` forgetting | 0.00 % | 0.00 % | **0.00 %** |
-| `A_live` `A_avg` | 46.58 % | 48.61 % | 47.49 % |
-| `A_live` forgetting | 59.23 % | 57.80 % | 58.71 % |
-| `A_auto` `A_avg` | 48.05 % | 50.31 % | **81.96 %** |
-| `A_auto` forgetting | 48.07 % | 54.43 % | **6.34 %** |
-| `A_auto` − `A_oracle` | −37.94 | −36.42 | **−4.23** |
-| worst `route_acc` | 8.01 % (`A[2,1]`) | 5.94 % (`A[3,1]`) | **89.02 %** |
+| protocol | 2026-10-14 | 2026-10-15 (shared cov, **test-fitted**) | 2026-10-15 (final, **pre-fix**) | **2026-10-16 (B71, post-fix)** |
+| :-- | --: | --: | --: | --: |
+| `A_oracle` `A_avg` | 85.99 % | 86.73 % | 86.19 % | **85.90 %** |
+| `A_oracle` forgetting | 0.00 % | 0.00 % | 0.00 % | **0.00 %** |
+| `A_live` `A_avg` | 46.58 % | 48.61 % | 47.49 % | **44.14 %** |
+| `A_live` forgetting | 59.23 % | 57.80 % | 58.71 % | **63.07 %** |
+| `A_auto` `A_avg` | 48.05 % | 50.31 % | ~~81.96 %~~ | **66.05 %** |
+| `A_auto` forgetting | 48.07 % | 54.43 % | ~~6.34 %~~ | **29.77 %** |
+| `A_auto` − `A_oracle` | −37.94 | −36.42 | ~~−4.23~~ | **−19.85** |
+| worst `route_acc` | 8.01 % (`A[2,1]`) | 5.94 % (`A[3,1]`) | ~~89.02 %~~ | **43.76 %** (`A[3,1]`) |
 
 The 2026-10-14 run reached **8.01 %** on MNIST after CIFAR-10 against an oracle
 of 97.94 %; the middle column is the run whose router was fitted on the test
-split, which is not a legitimate protocol (§3.4a). Cite the final column.
+split, which is not a legitimate protocol (§3.4a). **Cite the last column.**
+
+The fourth column is the same protocol on the corrected evaluation path, and it
+replaces the third rather than being an alternative reading of it: two
+evaluation defects (B46/B47) were found by audit, fixed, and are now tested, and
+the run that produced the third column predates them. The oracle moves only
+0.29 points because it bypasses the router entirely; `A_auto` moves 15.91, which
+is what one expects when both defects sat in the routing path.
 
 > **Caveat added 2026-10-15 (audit B46/B47) — the final column was measured on a
 > pre-fix evaluation path.** Two evaluation defects were found and fixed after

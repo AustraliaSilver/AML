@@ -208,6 +208,81 @@ datasets can live in separate mounts; a Kaggle 2xT4 walkthrough is in
 
 ---
 
+## 3Z. Two things that break a long run on a laptop
+
+Both were hit and diagnosed during the 2026-10-16 verification run of the
+production schedule. Neither is a property of the model; both would otherwise
+be re-learned the expensive way.
+
+### 3Z.1 A fixed `--seed` does NOT make a run reproducible
+
+`train_continual_aml.py` sets `torch.backends.cudnn.benchmark = True`, so cuDNN
+picks convolution algorithms **by timing them at run time**. The choice can
+differ between two runs on the same machine (load, thermals, driver state),
+and a different algorithm rounds differently. The seed fixes the architecture
+sampling and the data order, but **not** the algorithm, so run-to-run
+reproduction is not bit-exact.
+
+This is not a theoretical caveat — it is measured. Two runs of the production
+schedule at the same commit, same seed, same flags:
+
+| cell | run 1 | run 2 | Δ |
+| :-- | --: | --: | --: |
+| A[1,1] | 98.49 % | 98.51 % | +0.02 |
+| A[2,2] | 67.16 % | 68.12 % | **+0.96** |
+
+Training amplifies float differences: a ~1e-7 disagreement at step 0 is
+compounded over 28 epochs. So **the spread above is the run-to-run noise of
+this protocol**, and a difference of that size between two runs is not evidence
+that anything changed.
+
+Two consequences worth stating plainly:
+
+* **Do not verify "this change is number-neutral" by re-running training.**
+  The comparison you want is already stronger and cheaper: run both forms
+  **inside one process**, where cuDNN's algorithm choice is shared. That is what
+  `benchmarks/capture_router_identity.py` and the tests in
+  `tests/test_grad_checkpoint.py` do, and it is bitwise.
+* **Cite the commit a number came from.** A published figure describes one run
+  on one machine, not a protocol invariant.
+
+To make runs bit-reproducible instead, set `torch.backends.cudnn.benchmark =
+False`, `cudnn.deterministic = True` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+and accept the slowdown. That is not the default here because the throughput
+loss is real and nothing in the shipped protocol depends on bit-exact replay.
+
+### 3Z.2 The machine sleeps and takes the run with it
+
+A verification run died after ~88 minutes with an **empty stderr** and no exit
+code. The log showed the stall directly — one step logged at `39.1 s`, the next
+at `5363.0 s` — and the System event log confirmed it: `Kernel-Power 506` at
+10:25:23 local (entering Modern Standby) and `507` at 11:53:28 local (exiting,
+reason "Power Button"). Windows terminates background process trees on the way
+into and out of Modern Standby.
+
+An empty stderr is the tell: a Python crash or OOM writes something. Silence
+plus a vanished process means something outside the process ended it.
+
+To run anything longer than a few minutes:
+
+* **Keep the laptop lid open.** Closing it suspends the hardware regardless of
+  any power request.
+* Hold a system-awake request in the *training* thread. The request is
+  per-process, so a side-car guardian does not cover the trainer:
+
+  ```python
+  import ctypes
+  ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+  ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+  ```
+
+* Launch detached so a terminal or harness restart cannot orphan it. On Windows
+  `Win32_Process.Create` leaves the child parented to `WmiPrvSE`, which
+  survives the session. Note that `ReturnValue = 0` means the spawn was
+  *accepted*, not that the process survived — check that the log is growing.
+
+---
+
 ## 4. Architecture Specifications
 
 - **Total Layers**: 18 dynamic blocks (`HybridBlock`).
