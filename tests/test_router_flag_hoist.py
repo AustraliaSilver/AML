@@ -212,5 +212,203 @@ class TestModelForwardEquivalence(unittest.TestCase):
                             f"gradient of {k} differs")
 
 
+class TestSoftTailPredicateHoist(unittest.TestCase):
+    """The soft-mixture branch predicates: one transfer instead of three.
+
+    The soft tail of `HybridBlock.forward` -- the path taken when `all_hard` is
+    False, i.e. evaluation under per-domain SOFT slots -- gated each branch on
+    `(w > 1e-4).any()`. Each of those is a CUDA tensor read by a Python `if`, so
+    three of them per layer is 54 device->host syncs per 18-layer forward, each
+    draining the launch queue. They now come from one `.any(dim=0).tolist()`.
+
+    As with the flag hoist above, the whole claim is that this is a latency
+    change and nothing else, so these tests pin the three things that could make
+    it more than that: the decisions must be identical (including the corner
+    where a branch is inactive, which is the only case where the two forms could
+    differ in *how many* branches run), the outputs must be bitwise equal, and
+    the number of transfers must actually drop.
+    """
+
+    SHIPPED = HybridBlock.forward
+
+    def _soft_tail_reference(self, x, mode_weights, dim_mask):
+        """The pre-hoist body, verbatim, used as the equivalence oracle."""
+        w_plain = mode_weights[:, 0].view(-1, 1, 1, 1)
+        w_resnet = mode_weights[:, 1].view(-1, 1, 1, 1)
+        w_vit = mode_weights[:, 2].view(-1, 1, 1, 1)
+        out_plain = self.plain(x, dim_mask=dim_mask) if (w_plain > 1e-4).any() else 0.0
+        out_resnet = self.resnet(x, dim_mask=dim_mask) if (w_resnet > 1e-4).any() else 0.0
+        out_vit = self.vit(x, dim_mask=dim_mask) if (w_vit > 1e-4).any() else 0.0
+        return w_plain * out_plain + w_resnet * out_resnet + w_vit * out_vit
+
+    def _with_reference_tail(self, fn):
+        """Run `fn` with the pre-hoist soft tail installed."""
+        def reference_forward(self, blk_x, mode_weights=None, dim_mask=None,
+                              flags=None):
+            if mode_weights is None or mode_weights.ndim != 2:
+                return TestSoftTailPredicateHoist.SHIPPED(
+                    self, blk_x, mode_weights, dim_mask, flags)
+            if flags is not None and flags[0]:
+                return TestSoftTailPredicateHoist.SHIPPED(
+                    self, blk_x, mode_weights, dim_mask, flags)
+            return TestSoftTailPredicateHoist._soft_tail_reference(
+                self, blk_x, mode_weights, dim_mask)
+        return reference_forward
+
+    def _model(self, seed=5, layers=4):
+        torch.manual_seed(seed)
+        return ConvAML_18Layer_Hybrid(
+            K=4, latent_dim=32, max_layers=layers, max_dim=8, num_classes=4,
+            num_heads=2, norm_type="gn1", encoder_tail_act="none").eval()
+
+    def _soft_override(self, n, layers, device, gates=0.9, mode=(0.5, 0.4, 0.1)):
+        g = torch.full((n, layers), gates, device=device)
+        b = torch.tensor(mode, device=device).expand(n, layers, 3)
+        return (g.contiguous(), b.contiguous())
+
+    # Cover the activation patterns that can actually occur. `block_mode` is a
+    # softmax slot, so every row sums to 1 and at least one entry is >= 1/3: a
+    # row with NO branch above the threshold is not reachable from the trainer or
+    # from `evaluate`.
+    #
+    # It is deliberately absent from this list. In that state both forms skip
+    # every branch and return `w_plain * 0.0 + ...`, i.e. a [B, 1, 1, 1] tensor
+    # rather than [B, C, H, W] -- the mixture has no branch to supply a shape.
+    # That is pre-existing behaviour of the shipped tail and the hoist does not
+    # change it, but it means the comparison cannot be run there, so it is
+    # excluded instead of quietly asserted.
+    CASES = {
+        "all_active": (0.5, 0.4, 0.1),
+        "plain_only": (0.9, 1e-6, 1e-6),
+        "resnet_only": (1e-6, 0.9, 1e-6),
+        "vit_only": (1e-6, 1e-6, 0.9),
+        "plain_and_vit": (0.45, 1e-6, 0.45),
+        "at_threshold": (1e-4, 1e-4, 0.9),
+        "just_below": (9.9e-5, 9.9e-5, 0.9),
+    }
+
+    def test_block_mode_rows_are_normalised(self):
+        """The precondition the case list above relies on, asserted rather than assumed.
+
+        `evaluate` overrides `block_mode` with per-domain softmax slots, so a row
+        that left every branch below 1e-4 would break the tail's shape. Pin the
+        invariant that rules it out.
+        """
+        model = self._model()
+        x = torch.randn(6, 3, 32, 32)
+        ov = self._soft_override(6, model.max_layers, x.device)
+        with torch.no_grad():
+            _, struct, _, _ = model(x, tau=0.1, struct_override=ov)
+        bm = struct.block_mode
+        self.assertTrue(torch.allclose(
+            bm.sum(-1), torch.ones_like(bm.sum(-1)), atol=1e-5),
+            "block_mode rows must sum to 1")
+        self.assertTrue(bool((bm.max(dim=-1).values > 1e-4).all()),
+                        "every row must have at least one live branch")
+
+    def _capture(self, tail_forward, mode, n=6, layers=4):
+        model = self._model(layers=layers)
+        x = torch.randn(n, 3, 32, 32)
+        ov = self._soft_override(n, layers, x.device, mode=mode)
+        HybridBlock.forward = tail_forward
+        try:
+            with torch.no_grad():
+                out, struct, _, diag = model(x, tau=0.1, struct_override=ov)
+        finally:
+            HybridBlock.forward = TestSoftTailPredicateHoist.SHIPPED
+        return (out.detach().clone(), struct.block_mode.detach().clone(),
+                struct.layer_gates.detach().clone(),
+                diag["layer_soft"].detach().clone())
+
+    def test_bitwise_equal_to_the_pre_hoist_tail(self):
+        """Every activation pattern must produce identical tensors."""
+        ref = self._with_reference_tail(None)
+        for name, mode in TestSoftTailPredicateHoist.CASES.items():
+            new = self._capture(TestSoftTailPredicateHoist.SHIPPED, mode)
+            old = self._capture(ref, mode)
+            for a, b, tag in zip(new, old, ("output", "block_mode",
+                                            "layer_gates", "layer_soft")):
+                self.assertTrue(torch.equal(a, b),
+                                f"{name}: {tag} differs from the pre-hoist tail")
+
+    def test_the_soft_tail_is_actually_reached(self):
+        """Guards the test above from passing vacuously.
+
+        With a soft override `all_hard` is False, so the model must fall through
+        to the mixture rather than take the single-branch fast path.
+        """
+        model = self._model()
+        x = torch.randn(6, 3, 32, 32)
+        ov = self._soft_override(6, model.max_layers, x.device)
+        with torch.no_grad():
+            _, struct, _, _ = model(x, tau=0.1, struct_override=ov)
+        mx = struct.block_mode.max(dim=-1).values
+        self.assertFalse(bool((mx > 0.99).all()),
+                         "override must not be one-hot, or the soft tail is skipped")
+
+    def test_transfer_count_drops_from_three_to_one_in_the_tail(self):
+        """The saving is the whole point, so assert it rather than describe it.
+
+        The reference here replaces only the soft-mixture body and reaches it
+        directly, so it never runs the `(all_hard, same_mode)` transfer that
+        precedes it: its 3 are the 3 branch predicates and nothing else. The
+        shipped forward does pay that flags transfer when the caller does not
+        supply `flags`, hence 2 rather than 1 there. Production does supply them
+        -- the caller hoists all 18 layers' triples in one transfer -- which is
+        the case pinned at the bottom.
+        """
+        block = HybridBlock(in_channels=8, out_channels=8, num_heads=2,
+                            norm_type="gn1").eval()
+        x = torch.randn(4, 8, 4, 4)
+        dim_mask = torch.ones(4, 8, 1, 1)
+        mw = torch.tensor([[0.5, 0.4, 0.1]] * 4)
+
+        def count_transfers(fn, **kw):
+            """Count device->host syncs.
+
+            Two different spellings of the same thing have to be counted: the
+            pre-hoist predicates are `(w > 1e-4).any()` consumed by a Python
+            `if`, which syncs through `Tensor.__bool__`, while the hoisted form
+            is a single `.tolist()`. Counting only one of them would make the
+            comparison meaningless.
+            """
+            calls = {"n": 0}
+            real_tolist = torch.Tensor.tolist
+            real_bool = torch.Tensor.__bool__
+
+            def counting_tolist(t):
+                calls["n"] += 1
+                return real_tolist(t)
+
+            def counting_bool(t):
+                calls["n"] += 1
+                return real_bool(t)
+
+            torch.Tensor.tolist = counting_tolist
+            torch.Tensor.__bool__ = counting_bool
+            HybridBlock.forward = fn
+            try:
+                with torch.no_grad():
+                    fn(block, x, mode_weights=mw, dim_mask=dim_mask, **kw)
+            finally:
+                torch.Tensor.tolist = real_tolist
+                torch.Tensor.__bool__ = real_bool
+                HybridBlock.forward = TestSoftTailPredicateHoist.SHIPPED
+            return calls["n"]
+
+        shipped = TestSoftTailPredicateHoist.SHIPPED
+        ref = self._with_reference_tail(None)
+
+        self.assertEqual(count_transfers(ref), 3,
+                         "pre-hoist tail: one transfer per branch predicate")
+        self.assertEqual(count_transfers(shipped), 2,
+                         "shipped, flags not supplied: flags transfer + 1 tail")
+        self.assertEqual(count_transfers(shipped, flags=(False, True, 0)), 1,
+                         "production shape: flags hoisted by the caller, so one "
+                         "transfer per layer")
+        self.assertEqual(count_transfers(ref, flags=(False, True, 0)), 3,
+                         "pre-hoist tail still pays 3 even with flags supplied")
+
+
 if __name__ == "__main__":
     unittest.main()

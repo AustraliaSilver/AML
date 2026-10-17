@@ -135,9 +135,27 @@ class HybridBlock(BaseDynamicBlock):
         w_resnet = mode_weights[:, 1].view(-1, 1, 1, 1)
         w_vit = mode_weights[:, 2].view(-1, 1, 1, 1)
 
-        out_plain = self.plain(x, dim_mask=dim_mask) if (w_plain > 1e-4).any() else 0.0
-        out_resnet = self.resnet(x, dim_mask=dim_mask) if (w_resnet > 1e-4).any() else 0.0
-        out_vit = self.vit(x, dim_mask=dim_mask) if (w_vit > 1e-4).any() else 0.0
+        # ONE host transfer serves all three predicates. Written as three separate
+        # `(w > 1e-4).any()` expressions this was 3 device->host syncs per layer,
+        # each draining the CUDA launch queue: 54 per 18-layer forward. The
+        # reduction is the same computation -- `any` over the batch axis of the
+        # [B, 3] slice -- so it makes the same three decisions; only the number
+        # of transfers changes, 54 -> 18.
+        #
+        # Bit-identity is verified, not assumed: see
+        # tests/test_router_flag_hoist.py::TestSoftTailPredicateHoist, which
+        # compares this path against the three-scalar form on the output tensor
+        # together with block_mode, layer_gates and layer_soft.
+        #
+        # `.any()` cannot be applied to the [B, 1, 1, 1] views above directly,
+        # because that would reduce the three branches together instead of
+        # per-branch.
+        active = (mode_weights > 1e-4).any(dim=0).tolist()
+        a_plain, a_resnet, a_vit = active
+
+        out_plain = self.plain(x, dim_mask=dim_mask) if a_plain else 0.0
+        out_resnet = self.resnet(x, dim_mask=dim_mask) if a_resnet else 0.0
+        out_vit = self.vit(x, dim_mask=dim_mask) if a_vit else 0.0
 
         return w_plain * out_plain + w_resnet * out_resnet + w_vit * out_vit
 
