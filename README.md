@@ -790,6 +790,77 @@ RTX 3050 Laptop GPU, `torch.cuda.Event`, 50 iterations:
 | GroupNorm (32, 64, 8, 8) | backward | 0.280 ms (ATen) | **0.023 ms** | **12.01×** |
 | Batched GEMM (32, 128, 128, 128) | forward (A·B + b) | 0.413 ms (tiled SMEM) | **0.215 ms (tensor core)** | **1.92×** |
 
+### `torch.compile` — measured, and deliberately not enabled
+
+Inductor is the obvious answer to what the step profiler shows: `aten::to` runs a
+few hundred times per step, each one a dtype boundary under autocast. It
+delivers — and it is still wrong for this model, for three independent reasons.
+
+RTX 3050 (sm_86, `torch 2.5.1+cu124`), 18-layer AML, batch 256, 32×32,
+`--norm in`, bf16 autocast, median of 9 seeded steps:
+
+| | eager | `torch.compile` | |
+| :-- | --: | --: | :-- |
+| ms/step | ~409–415 | **~175–177** | **~2.3×** |
+| peak allocated | 2704 MiB | **1864 MiB** | **−31 %** |
+| `aten::to`/step | 452–599 | **34–145** | −76…−93 % |
+
+The `aten::to` counts are ranges because the count belongs to the *sampled
+architecture*, not to the model: `pi` decides `delta`, `delta` decides
+`dim_masks`, and `dim_masks` decides how many channels are live, hence how many
+dtype boundaries get crossed. Quote the ratio, not the count.
+
+What disqualifies it:
+
+1. **It changes which architecture is trained.** The forward draws from the RNG
+   — `gumbel_softmax` over the prototype logits, `gumbel_softmax` over the
+   per-layer mode logits, and a `0.05 * randn` depth perturbation. A fixed
+   `--seed` pins those exactly in eager (verified bitwise), but not through
+   `torch.compile`. Compiled and warmed with the same seed, the sampled `pi`
+   still differs by ~0.99 on a 1.0 scale, and argmax agreement lands at
+   9–17 % against the 10 % expected for 10 classes: chance.
+2. **It is not bitwise even with the architecture held fixed.** Under
+   `model.eval()` this model uses no RNG at all, and even then **0 of 126**
+   parameter gradients match bitwise — worst off by 20–24 % of the gradient
+   scale, logits by ~5 %. Inductor fuses and reorders reductions, and 18 layers
+   of that accumulates.
+3. **The autograd graph differs structurally, not just numerically.** The
+   compiled path produces gradients for parameters the eager path leaves
+   untouched — `block_mode_prototypes`, `vision_encoder.0.weight`. In eval mode
+   `block_mode` is `one_hot(argmax)`, and `argmax` is not differentiable, so
+   eager has no gradient path there at all. The set of updated tensors would
+   differ, so the *optimisation* differs, not only its rounding.
+
+Point 2 also rules out the obvious rescue — hoist the sampler out of the compiled
+region and compile only the fixed-architecture part. The hook already exists
+(`struct_override`), but it unpacks only `(layer_gates, block_mode)` and leaves
+`dim_masks`, the per-layer channel width, derived from `pi`. Measured: hold
+`struct_override` fixed and change only the seed, and the output still moves
+(`max|diff|` 5.8–6.2, argmax agreement 22 %). Hoisting it properly would mean
+adding `pi` to `hybrid_18.py`'s forward signature, and point 2 would still fail.
+
+The compiled model *is* deterministic — its own argmax agreement reproduced at
+97.3 % across two runs. It is stable, just not the same function.
+
+```bash
+python -u benchmarks/compile_bitwise_gate.py          # the three tests
+python -u benchmarks/compile_bitwise_gate.py --speed  # + the table above
+```
+
+Exit code 0 requires compiled to be bitwise identical to eager. It is not, so a
+non-zero exit is the expected result here and does not mean the run broke.
+
+### A PyTorch bug this surfaced on Windows
+
+Inductor's `codecache.write_atomic` writes a temp file and then calls
+`tmp_path.rename(path)`. `Path.rename` is `os.rename`, which **raises** when the
+destination already exists on Windows and silently overwrites on POSIX, so the
+second write of one cache key dies with `FileExistsError: [WinError 183]`. A
+function named for an atomic write should use `os.replace`, which overwrites
+atomically on both platforms. The benchmark patches that one line. It fixes the
+write rather than disabling `shape_padding` or another Inductor pass on purpose:
+turning those off would dodge the crash while changing the very thing under test.
+
 ### Environment diagnostics
 
 ```bash
