@@ -121,7 +121,7 @@ class ContinualTrainer:
             
             for x, y in train_loader:
                 x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 
                 with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
                     # 1. Primary task loss

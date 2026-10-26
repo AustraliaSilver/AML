@@ -140,7 +140,7 @@ def run_academic_benchmark():
                 
                 for x, y in loaders[current_task]["train"]:
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     
                     with torch.autocast(device_type=device.type, enabled=use_amp):
                         logits, alphas = model(x, task=current_task, tau=tau)

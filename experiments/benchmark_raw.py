@@ -80,7 +80,7 @@ def run_benchmark(dataset_name, seeds=3, quick=False):
         for epoch in range(epochs):
             gen.train()
             for xb, yb in loader:
-                trainer.optimizer.zero_grad()
+                trainer.optimizer.zero_grad(set_to_none=True)
                 model = gen(xb, tau=0.4)
                 logits = exec_(xb, model)
                 l2 = sum(p.pow(2).sum() for p in model.weights.values()) * 1e-5
