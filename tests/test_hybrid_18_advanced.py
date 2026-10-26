@@ -68,7 +68,7 @@ def test_proto_isolator_zero_drift_assertion():
 
     # Multiple aggressive optimizer steps on Task 1
     for _ in range(5):
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
         x1 = torch.randn(4, 3, 32, 32)
         y1 = torch.tensor([4, 5, 6, 7])
         out1, _, _, _ = model(x1)

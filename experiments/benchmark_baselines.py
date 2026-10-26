@@ -193,7 +193,7 @@ def train_torch(model, train_x, train_y, test_x, test_y, epochs=50, lr=1e-3, bat
         losses = []
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             logits = model(xb)
             loss_fn(logits, yb).backward()
             opt.step()

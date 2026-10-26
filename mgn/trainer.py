@@ -158,7 +158,7 @@ class MetaTrainer:
                 x_batch = self.preprocess_fn(x_batch)
             y_batch = y_batch.to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             if val_iter is not None:
                 try:
