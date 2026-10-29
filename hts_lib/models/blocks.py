@@ -1,7 +1,9 @@
+import functools
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+@functools.lru_cache(maxsize=128)
 def _valid_groups(num_channels: int, preferred: int, cap: int) -> int:
     """`preferred` if it divides `num_channels`, else the largest divisor <= cap.
 
