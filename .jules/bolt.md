@@ -1,0 +1,3 @@
+## 2024-11-01 - Inline Import Overhead in Forward Passes
+**Learning:** Python inline imports (e.g., `try: from module import X except: pass`) inside high-frequency functions like `forward` passes cause significant performance overhead. If the import fails (e.g. falling back because a CUDA module is missing), the overhead is ~4ms per call. Even if successful, it costs ~2ms per 1000 calls.
+**Action:** Move feature-flag imports to the module level and cache their availability in a boolean flag (e.g., `_HAS_DYNAMIC_CONV = True/False`). Check this flag in the forward pass instead of using an inline `try-except` import block.

@@ -25,6 +25,12 @@ class HtSLowRankAdapter(nn.Module):
 
 import torch.nn as nn
 
+try:
+    from mgn.accel import _C
+    _HAS_C = True
+except Exception:
+    _HAS_C = False
+
 class HtSDualResidualBasis(nn.Module):
     """
     Dual-Residual Basis System for Multi-Stage Dynamic Weight Synthesis.
@@ -68,14 +74,10 @@ class HtSDualResidualBasis(nn.Module):
         def _synthesize(b_priv, d_out, d_in):
             b_flat = b_priv.view(self.K, -1)
             if use_tc and alpha.is_cuda:
-                try:
-                    from mgn.accel import _C
-                    if hasattr(_C, "batched_hyper_linear_tc"):
-                        # [1, B, K] x [1, K, N] -> [1, B, N]
-                        res = _C.batched_hyper_linear_tc(alpha.unsqueeze(0), b_flat.unsqueeze(0))
-                        return res.squeeze(0).view(B, d_out, d_in, 3, 3)
-                except Exception:
-                    pass
+                if _HAS_C and hasattr(_C, "batched_hyper_linear_tc"):
+                    # [1, B, K] x [1, K, N] -> [1, B, N]
+                    res = _C.batched_hyper_linear_tc(alpha.unsqueeze(0), b_flat.unsqueeze(0))
+                    return res.squeeze(0).view(B, d_out, d_in, 3, 3)
             return torch.mm(alpha, b_flat).view(B, d_out, d_in, 3, 3)
 
         if name == 'b1':

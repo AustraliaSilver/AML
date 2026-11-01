@@ -1,6 +1,13 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Performance Optimization: Cache dynamic conv2d import at module level
+# Inline imports (especially failed ones) inside forward passes cause significant overhead.
+try:
+    from mgn.accel.functions import native_dynamic_conv2d
+    _HAS_DYNAMIC_CONV = True
+except Exception:
+    _HAS_DYNAMIC_CONV = False
 
 def _valid_groups(num_channels: int, preferred: int, cap: int) -> int:
     """`preferred` if it divides `num_channels`, else the largest divisor <= cap.
@@ -75,10 +82,9 @@ class HtSResidualBlock(nn.Module):
         res = F.gelu(self.gn1(x))
         
         if self.stride == 1:
-            try:
-                from mgn.accel.functions import native_dynamic_conv2d
+            if _HAS_DYNAMIC_CONV:
                 out = native_dynamic_conv2d(res, kernel)
-            except Exception:
+            else:
                 x_r = res.reshape(1, B * self.in_d, H, W)
                 k_r = kernel.reshape(B * self.out_d, self.in_d, 3, 3)
                 out = F.conv2d(x_r, k_r, stride=1, padding=1, groups=B)

@@ -11,6 +11,11 @@ fused CUDA kernels in mgn.accel._C cover the full-pipeline case instead
 import torch
 import torch.nn.functional as F
 
+try:
+    from mgn.accel import _C
+    _HAS_C = True
+except Exception:
+    _HAS_C = False
 
 def fused_dynamic_conv2d(X, prototypes, pi, w_offset, b_offset):
     """
@@ -39,7 +44,8 @@ class NativeDynamicConv2dFunction(torch.autograd.Function):
         ctx.has_bias = (bias is not None)
         ctx.dims = (B, C_in, C_out, H, W)
 
-        from mgn.accel import _C
+        if not _HAS_C:
+            raise RuntimeError("mgn.accel._C is not available")
         out = _C.dynamic_conv2d_fwd(x, w, bias)
         return out
 
@@ -48,7 +54,8 @@ class NativeDynamicConv2dFunction(torch.autograd.Function):
         x, w = ctx.saved_tensors
         B, C_in, C_out, H, W = ctx.dims
 
-        from mgn.accel import _C
+        if not _HAS_C:
+            raise RuntimeError("mgn.accel._C is not available")
         d_in, d_w, d_b = _C.dynamic_conv2d_bwd(
             grad_output.contiguous(),
             x.contiguous(),
@@ -66,12 +73,8 @@ def native_dynamic_conv2d(x, w, bias=None):
     Falls back gracefully to grouped convolution if CUDA or native _C is unavailable.
     """
     if x.is_cuda and w.is_cuda:
-        try:
-            from mgn.accel import _C
-            if hasattr(_C, "dynamic_conv2d_fwd") and hasattr(_C, "dynamic_conv2d_bwd"):
-                return NativeDynamicConv2dFunction.apply(x, w, bias)
-        except Exception:
-            pass
+        if _HAS_C and hasattr(_C, "dynamic_conv2d_fwd") and hasattr(_C, "dynamic_conv2d_bwd"):
+            return NativeDynamicConv2dFunction.apply(x, w, bias)
 
     B, C_in, H, W = x.shape
     C_out = w.shape[1]
