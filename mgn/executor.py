@@ -235,7 +235,7 @@ class TaskNetwork(nn.Module):
                 if i == 0:
                     h = h_active
                 else:
-                    h = gate_c * h_active + (1.0 - gate_c) * h_expand
+                    h = torch.lerp(h_expand, h_active, gate_c)
 
             # Adaptive pooling at the end (4x4 = 16 spatial elements matching 16 * max_dim head)
             h_pool = F.adaptive_avg_pool2d(h, (4, 4)).reshape(batch, -1)

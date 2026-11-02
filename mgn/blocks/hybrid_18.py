@@ -492,7 +492,7 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                     h_act = _call_block(layer, h[active], w_mode[active],
                                         d_mask[active], None, ckpt_on)
                     g = gate_c[active]
-                    upd = g * h_act + (1.0 - g) * h[active]
+                    upd = torch.lerp(h[active], h_act, g)
                     # Under autocast the blend promotes to fp32 while `h` is
                     # still bf16; widen the carrier first or the scatter raises
                     # a dtype mismatch. Widening (not casting down) matches what
@@ -503,7 +503,7 @@ class ConvAML_18Layer_Hybrid(nn.Module):
                 else:
                     h_cand = _call_block(layer, h, w_mode, d_mask,
                                          layer_flags[i], ckpt_on)
-                    h_new = gate_c * h_cand + (1.0 - gate_c) * h
+                    h_new = torch.lerp(h, h_cand, gate_c)
                     n_executed += 1
             h = h_new
 
