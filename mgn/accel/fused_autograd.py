@@ -225,7 +225,7 @@ def pipeline_backward(ctx, grad_output, maxpool_bwd, norm_mode):
             if is0:
                 out_pre = ha
             else:
-                out_pre = lgv * ha + (1.0 - lgv) * he
+                out_pre = torch.lerp(he, ha, lgv)
         else:
             hp = F.relu(xhat1) * dmv          # conv2 input for _conv_bwd
 
