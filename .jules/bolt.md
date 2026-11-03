@@ -1,0 +1,3 @@
+## 2024-03-24 - [Avoid broadcasting for large pairwise distances using addmm]
+**Learning:** In `mgn.generator.DistanceRouter`, the PyTorch expression `torch.sum((z.unsqueeze(1) - keys.unsqueeze(0))**2, dim=-1)` allocates an intermediate tensor of shape `[batch_size, num_prototypes, latent_dim]`. For large batches or dense latent spaces, this causes a major memory and performance bottleneck due to broadcasting overhead. Using `torch.cdist` can be slightly slower than expected in some environments.
+**Action:** Expand $(z-k)^2 = z^2 - 2zk + k^2$ and use `torch.addmm` to map this to BLAS matrix multiplication: `torch.addmm(z_sq + k_sq, z, keys.t(), alpha=-2.0, beta=1.0)`. This skips the large tensor allocation and executes significantly faster.
