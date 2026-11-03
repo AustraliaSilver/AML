@@ -92,8 +92,11 @@ class DistanceRouter(nn.Module):
         nn.init.kaiming_uniform_(self.keys, a=math.sqrt(5))
         self.scale = nn.Parameter(torch.tensor([1.0]))
     def forward(self, z):
-        diff = z.unsqueeze(1) - self.keys.unsqueeze(0)
-        sq_dist = torch.sum(diff ** 2, dim=-1)
+        # (z - k)^2 = z^2 - 2zk + k^2
+        # Expanding this avoids a [B, K, D] intermediate tensor broadcasting.
+        z_sq = torch.sum(z**2, dim=-1, keepdim=True)
+        k_sq = torch.sum(self.keys**2, dim=-1).unsqueeze(0)
+        sq_dist = torch.addmm(z_sq + k_sq, z, self.keys.t(), alpha=-2.0, beta=1.0)
         return -sq_dist * F.softplus(self.scale)
 
 class ModelGenerator(nn.Module):
